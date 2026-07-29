@@ -5,16 +5,17 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use tracing::{error, info};
 use winit::application::ApplicationHandler;
-use winit::event::{MouseScrollDelta, WindowEvent};
+use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes};
 
+use arboard::Clipboard;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
 use zeroterm_mux::TabManager;
-use zeroterm_render::Renderer;
+use zeroterm_render::{Renderer, Selection};
 
 enum PtyCommand {
     Write(Vec<u8>),
@@ -32,6 +33,11 @@ struct App {
     pty_tx: Option<Sender<PtyCommand>>,
     modifiers: ModifiersState,
     scroll_offset: usize,
+    // Selection state
+    selection: Option<Selection>,
+    selecting: bool,
+    mouse_pos: (f32, f32),
+    clipboard: Option<Clipboard>,
 }
 
 #[allow(dead_code)]
@@ -46,6 +52,10 @@ impl App {
             pty_tx: None,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
+            selection: None,
+            selecting: false,
+            mouse_pos: (0.0, 0.0),
+            clipboard: Clipboard::new().ok(),
         }
     }
 
@@ -143,7 +153,7 @@ impl App {
 
     fn render(&mut self) -> Result<()> {
         if let (Some(renderer), Some(parser)) = (&mut self.renderer, &self.parser) {
-            renderer.render(parser.screen(), self.scroll_offset)?;
+            renderer.render(parser.screen(), self.scroll_offset, self.selection)?;
         }
         Ok(())
     }
@@ -178,6 +188,112 @@ impl App {
 
     fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    // Selection methods
+    fn screen_to_cell(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        if let (Some(renderer), Some(parser)) = (&self.renderer, &self.parser) {
+            let cell_size = renderer.cell_size();
+            let cell_w = cell_size[0];
+            let cell_h = cell_size[1];
+            let screen = parser.screen();
+            let buffer = screen.buffer();
+            let visible_rows = buffer.len();
+            let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+            let col = (x / cell_w).floor() as usize;
+            let row = (y / cell_h).floor() as usize;
+
+            if row < visible_rows && col < cols {
+                // Account for scrollback offset
+                let scrollback = screen.scrollback().len();
+                let total_rows = scrollback + visible_rows;
+                let end = total_rows.saturating_sub(self.scroll_offset);
+                let start = end.saturating_sub(visible_rows);
+                let global_row = start + row;
+                Some((global_row, col))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn start_selection(&mut self, x: f32, y: f32) {
+        if let Some((row, col)) = self.screen_to_cell(x, y) {
+            self.selection = Some(Selection {
+                start_row: row,
+                start_col: col,
+                end_row: row,
+                end_col: col,
+                active: true,
+            });
+            self.selecting = true;
+        }
+    }
+
+    fn update_selection(&mut self, x: f32, y: f32) {
+        if self.selecting {
+            if let Some((row, col)) = self.screen_to_cell(x, y) {
+                if let Some(sel) = &mut self.selection {
+                    sel.end_row = row;
+                    sel.end_col = col;
+                }
+            }
+        }
+    }
+
+    fn end_selection(&mut self) {
+        self.selecting = false;
+    }
+
+    fn copy_selection(&mut self) {
+        if let (Some(sel), Some(parser), Some(clipboard)) =
+            (&self.selection, &self.parser, &mut self.clipboard)
+        {
+            let screen = parser.screen();
+            let scrollback = screen.scrollback();
+            let buffer = screen.buffer();
+            let visible_rows = buffer.len();
+            let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+            let (start_row, start_col, end_row, end_col) = if sel.start_row < sel.end_row
+                || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
+            {
+                (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
+            } else {
+                (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
+            };
+
+            let mut text = String::new();
+            let total_scrollback = scrollback.len();
+            let total_rows = total_scrollback + visible_rows;
+
+            for r in start_row..=end_row.min(total_rows - 1) {
+                let line = if r < total_scrollback {
+                    &scrollback[total_scrollback - 1 - r]
+                } else {
+                    &buffer[r - total_scrollback]
+                };
+
+                let line_start = if r == start_row { start_col } else { 0 };
+                let line_end = if r == end_row { end_col + 1 } else { cols };
+
+                for c in line_start..line_end.min(line.len()) {
+                    text.push(line[c].ch);
+                }
+                if r < end_row {
+                    text.push('\n');
+                }
+            }
+
+            let _ = clipboard.set_text(text.trim_end());
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
     }
 }
 
@@ -330,6 +446,26 @@ impl ApplicationHandler for App {
                                 KeyCode::Space => vec![0x00],
                                 _ => vec![],
                             },
+                            // Ctrl+Shift+C: Copy selection
+                            _ if ctrl && self.modifiers.shift_key() && !alt => match code {
+                                KeyCode::KeyC => {
+                                    self.copy_selection();
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                    vec![]
+                                }
+                                // Ctrl+Shift+V: Paste from clipboard
+                                KeyCode::KeyV => {
+                                    if let Some(clipboard) = &mut self.clipboard {
+                                        if let Ok(text) = clipboard.get_text() {
+                                            self.write_pty(text.as_bytes());
+                                        }
+                                    }
+                                    vec![]
+                                }
+                                _ => vec![],
+                            },
                             _ => vec![],
                         };
                         if !seq.is_empty() {
@@ -360,6 +496,30 @@ impl ApplicationHandler for App {
                     error!("Render error: {}", e);
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x as f32, position.y as f32);
+                if self.selecting {
+                    self.update_selection(position.x as f32, position.y as f32);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
+                (winit::event::ElementState::Pressed, MouseButton::Left) => {
+                    self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                (winit::event::ElementState::Released, MouseButton::Left) => {
+                    self.end_selection();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                _ => {}
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
                     MouseScrollDelta::LineDelta(_, y) => {

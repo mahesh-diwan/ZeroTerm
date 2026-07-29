@@ -113,5 +113,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // Selection highlight — invert colors
+    if (input.attrs & 0x200u) != 0u {
+        color = mix(fg, bg, 0.3);
+    }
+
     return color;
 }

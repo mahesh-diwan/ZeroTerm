@@ -13,6 +13,39 @@ use winit::window::Window;
 use zeroterm_core::cell::Cell;
 use zeroterm_core::screen::Screen as CoreScreen;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Selection {
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+    pub active: bool,
+}
+
+impl Selection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        if !self.active {
+            return false;
+        }
+        let (sr, sc, er, ec) = if self.start_row < self.end_row
+            || (self.start_row == self.end_row && self.start_col <= self.end_col)
+        {
+            (self.start_row, self.start_col, self.end_row, self.end_col)
+        } else {
+            (self.end_row, self.end_col, self.start_row, self.start_col)
+        };
+        (row > sr || (row == sr && col >= sc)) && (row < er || (row == er && col <= ec))
+    }
+}
+
 const ATLAS_SIZE: u32 = 1024;
 
 #[repr(C)]
@@ -327,6 +360,7 @@ pub struct Renderer {
     prev_buffer: Option<Vec<Vec<Cell>>>,
     vertex_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
+    selection: Option<Selection>,
 }
 
 impl Renderer {
@@ -540,7 +574,12 @@ impl Renderer {
             prev_buffer: None,
             vertex_buffer_capacity,
             dirty_cells: Vec::new(),
+            selection: None,
         })
+    }
+
+    pub fn cell_size(&self) -> [f32; 2] {
+        self.cell_size
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -580,7 +619,7 @@ impl Renderer {
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
-    pub fn render(&mut self, screen: &CoreScreen, scroll_offset: usize) -> Result<()> {
+    pub fn render(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -628,9 +667,9 @@ impl Renderer {
             }
         }
 
-        // Build and upload vertices for dirty cells only
+// Build and upload vertices for dirty cells only
         if !self.dirty_cells.is_empty() {
-            self.build_and_upload_dirty_vertices(screen, scroll_offset)?;
+            self.build_and_upload_dirty_vertices(screen, scroll_offset, selection)?;
         }
 
         // Update uniforms
@@ -695,7 +734,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn build_and_upload_dirty_vertices(&mut self, screen: &CoreScreen, scroll_offset: usize) -> Result<()> {
+    fn build_and_upload_dirty_vertices(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
         let buffer = screen.buffer();
         let visible_rows = buffer.len();
         let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
@@ -764,16 +803,15 @@ impl Renderer {
                     zeroterm_core::cell::CursorShape::Bar => {
                         // Set bit 8 (0x100) for bar cursor rendering in shader
                         let mut a = cell.attrs;
-                        // We'll encode bar cursor by setting a custom flag in the attrs
-                        // Since we can't add a new field, we'll use the attrs encoding in the shader
-                        // For now, just set the reverse bit as a marker and handle in shader
-                        // Actually, let's add a new bit to the attrs u32 encoding
                         (fg, bg, a)
                     }
                 }
             } else {
                 (fg, bg, cell.attrs)
             };
+
+            // Check if this cell is selected
+            let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
 
             let attrs = ((attrs.bold as u32) << 0)
                 | ((attrs.italic as u32) << 1)
@@ -784,7 +822,9 @@ impl Renderer {
                 | ((attrs.reverse as u32) << 6)
                 | ((attrs.invisible as u32) << 7)
                 // Bar cursor flag - bit 8 (0x100)
-                | (if cursor_visible && is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 });
+                | (if cursor_visible && is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
+                // Selection flag - bit 9 (0x200)
+                | (if is_selected { 0x200u32 } else { 0 });
 
             let fg_color = [
                 fg.r as f32 / 255.0,

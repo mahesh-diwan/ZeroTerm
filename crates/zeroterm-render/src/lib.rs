@@ -2,7 +2,7 @@
 
 pub mod renderer;
 
-pub use renderer::Renderer;
+pub use renderer::{Renderer, Selection};
 
 pub struct RenderConfig {
     pub font_size: f32,
