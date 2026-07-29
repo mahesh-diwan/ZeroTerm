@@ -66,12 +66,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     // Bold — slightly brighter
     if (input.attrs & 0x1u) != 0u {
-        fg.rgb = min(fg.rgb * 1.2, vec3<f32>(1.0));
+        fg.r = min(fg.r * 1.2, 1.0);
+        fg.g = min(fg.g * 1.2, 1.0);
+        fg.b = min(fg.b * 1.2, 1.0);
     }
 
     // Dim — darker
     if (input.attrs & 0x10u) != 0u {
-        fg.rgb = fg.rgb * 0.7;
+        fg.r = fg.r * 0.7;
+        fg.g = fg.g * 0.7;
+        fg.b = fg.b * 0.7;
     }
 
     // Invisible

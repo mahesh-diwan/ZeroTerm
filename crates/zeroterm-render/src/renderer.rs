@@ -21,7 +21,7 @@ struct Uniforms {
     cell_size: [f32; 2],
     cursor_pos: [f32; 2],
     cursor_visible: u32,
-    _padding: [u32; 2],
+    _padding: [u32; 3],
 }
 
 #[repr(C)]
@@ -393,7 +393,7 @@ impl Renderer {
             cell_size: [cell_width, cell_height],
             cursor_pos: [0.0, 0.0],
             cursor_visible: 0,
-            _padding: [0, 0],
+            _padding: [0, 0, 0],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
@@ -550,7 +550,7 @@ impl Renderer {
             cell_size: self.cell_size,
             cursor_pos: [0.0, 0.0],
             cursor_visible: 0,
-            _padding: [0, 0],
+            _padding: [0, 0, 0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -577,7 +577,7 @@ impl Renderer {
                 cursor.row as f32 * self.cell_size[1],
             ],
             cursor_visible: if cursor.visible { 1 } else { 0 },
-            _padding: [0, 0],
+            _padding: [0, 0, 0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -693,7 +693,7 @@ impl Renderer {
                             // Bar cursor: render as a vertical bar
                             // We'll use a special attribute flag
                             (fg, bg, {
-                                let mut a = cell.attrs.clone();
+                                let a = cell.attrs.clone();
                                 // Encode bar cursor in attrs - use bit 4 (dim was there, we'll repurpose)
                                 // Actually, let's just render the whole cell as cursor
                                 a
