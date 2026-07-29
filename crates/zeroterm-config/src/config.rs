@@ -1,6 +1,8 @@
 //! Config parsing and management
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -18,6 +20,48 @@ impl Default for Config {
             shell: ShellConfig::default(),
             window: WindowConfig::default(),
         }
+    }
+}
+
+impl Config {
+    pub fn load(path: Option<&Path>) -> Result<Self, anyhow::Error> {
+        let config_path = if let Some(p) = path {
+            p.to_path_buf()
+        } else {
+            Self::default_config_path()
+        };
+
+        if config_path.exists() {
+            let contents = fs::read_to_string(&config_path)?;
+            let config: Config = toml::from_str(&contents)?;
+            Ok(config)
+        } else {
+            Ok(Config::default())
+        }
+    }
+
+    fn default_config_path() -> PathBuf {
+        if let Some(config_dir) = dirs::config_dir() {
+            config_dir.join("zeroterm").join("config.toml")
+        } else {
+            PathBuf::from("config.toml")
+        }
+    }
+
+    pub fn save(&self, path: Option<&Path>) -> Result<(), anyhow::Error> {
+        let config_path = if let Some(p) = path {
+            p.to_path_buf()
+        } else {
+            Self::default_config_path()
+        };
+
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let contents = toml::to_string_pretty(self)?;
+        fs::write(config_path, contents)?;
+        Ok(())
     }
 }
 

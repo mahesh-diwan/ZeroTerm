@@ -4,5 +4,7 @@ pub mod config;
 pub mod gui;
 pub mod lua;
 
+pub use config::Config;
+
 #[cfg(test)]
 mod tests;

@@ -11,6 +11,7 @@ use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes};
 
 use arboard::Clipboard;
+use zeroterm_config::Config;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
@@ -62,36 +63,37 @@ impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         info!("Initializing ZeroTerm");
 
+        // Load config
+        let config = Config::load(None).unwrap_or_default();
+
         let window_attrs = WindowAttributes::default()
             .with_title("ZeroTerm")
-            .with_inner_size(winit::dpi::LogicalSize::new(1200, 800))
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                config.window.width,
+                config.window.height,
+            ))
             .with_resizable(true);
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
 
-        let font_size = 14.0;
+        let font_size = config.font.size;
         let renderer = pollster::block_on(Renderer::new(window.clone(), font_size))?;
 
         let size = window.inner_size();
         let cell_w = font_size * 0.6;
-        let cell_h = font_size * 1.2;
+        let cell_h = font_size * config.font.line_height;
         let cols = (size.width as f32 / cell_w) as usize;
         let rows = (size.height as f32 / cell_h) as usize;
 
         let parser = Parser::new(cols, rows);
 
-        // Detect default shell
-        let shell = if std::path::Path::new("/bin/zsh").exists() {
-            "/bin/zsh"
-        } else if std::path::Path::new("/bin/bash").exists() {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        };
+        // Detect default shell from config
+        let shell = config.shell.program.clone();
+        let shell_args: Vec<&str> = config.shell.args.iter().map(|s| s.as_str()).collect();
 
         // Spawn PTY — resize BEFORE moving into thread
         let mut backend = PortablePtyBackend::new()?;
-        let mut process = backend.spawn(shell, &[], None)?;
+        let mut process = backend.spawn(&shell, &shell_args, None)?;
         process.resize(PtySize { cols, rows })?;
 
         // Channels: output_tx→pty_rx (PTY→main), pty_tx→input_rx (main→PTY)
