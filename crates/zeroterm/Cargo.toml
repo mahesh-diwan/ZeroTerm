@@ -1,0 +1,23 @@
+[package]
+name = "zeroterm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "ZeroTerm - GPU-accelerated terminal emulator"
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+portable-pty = { workspace = true }
+pollster = "0.4"
+zeroterm-core = { path = "../zeroterm-core" }
+zeroterm-render = { path = "../zeroterm-render" }
+zeroterm-mux = { path = "../zeroterm-mux" }
+zeroterm-config = { path = "../zeroterm-config" }
+
+[dev-dependencies]
+criterion = { workspace = true }

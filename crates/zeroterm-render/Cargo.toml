@@ -1,0 +1,21 @@
+[package]
+name = "zeroterm-render"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "wgpu renderer, glyph atlas, font handling for ZeroTerm"
+
+[dependencies]
+tokio = { workspace = true, features = ["full", "tracing"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+swash = { workspace = true }
+bytemuck = "1"
+log = "0.4"
+zeroterm-core = { path = "../zeroterm-core" }
+
+[dev-dependencies]
+criterion = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "zeroterm-ai"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local AI integration (Ollama/LM Studio) for ZeroTerm"
+
+[dependencies]
+tokio = { workspace = true, features = ["full", "tracing"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+zeroterm-core = { path = "../zeroterm-core" }
+
+[dev-dependencies]
+criterion = { workspace = true }

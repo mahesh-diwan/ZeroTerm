@@ -1,0 +1,17 @@
+[package]
+name = "zeroterm-mux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Tabs, splits, session management for ZeroTerm"
+
+[dependencies]
+tokio = { workspace = true, features = ["full", "tracing"] }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+zeroterm-core = { path = "../zeroterm-core" }
+
+[dev-dependencies]
+criterion = { workspace = true }
