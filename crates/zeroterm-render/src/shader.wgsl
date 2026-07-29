@@ -105,5 +105,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // Bar cursor — vertical line at cell-local x
+    if (input.attrs & 0x100u) != 0u {
+        let local_x = input.cell_size.x;
+        if local_x >= 0.0 && local_x <= 0.15 {
+            color = fg;
+        }
+    }
+
     return color;
 }

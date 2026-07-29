@@ -761,7 +761,15 @@ impl Renderer {
                         a.underline = zeroterm_core::cell::UnderlineStyle::Single;
                         (fg, bg, a)
                     }
-                    zeroterm_core::cell::CursorShape::Bar => (fg, bg, cell.attrs),
+                    zeroterm_core::cell::CursorShape::Bar => {
+                        // Set bit 8 (0x100) for bar cursor rendering in shader
+                        let mut a = cell.attrs;
+                        // We'll encode bar cursor by setting a custom flag in the attrs
+                        // Since we can't add a new field, we'll use the attrs encoding in the shader
+                        // For now, just set the reverse bit as a marker and handle in shader
+                        // Actually, let's add a new bit to the attrs u32 encoding
+                        (fg, bg, a)
+                    }
                 }
             } else {
                 (fg, bg, cell.attrs)
@@ -774,7 +782,9 @@ impl Renderer {
                 | ((attrs.dim as u32) << 4)
                 | ((attrs.blink as u32) << 5)
                 | ((attrs.reverse as u32) << 6)
-                | ((attrs.invisible as u32) << 7);
+                | ((attrs.invisible as u32) << 7)
+                // Bar cursor flag - bit 8 (0x100)
+                | (if cursor_visible && is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 });
 
             let fg_color = [
                 fg.r as f32 / 255.0,
