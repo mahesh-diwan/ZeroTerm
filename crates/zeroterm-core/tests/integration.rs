@@ -495,8 +495,9 @@ fn test_reverse_video_via_screen() {
     p.parse(b"X");
     p.screen_mut().set_reverse_video(false);
     let cell = p.screen().cell(0, 0).unwrap();
-    assert_eq!(cell.fg, Color::DEFAULT_BG);
-    assert_eq!(cell.bg, Color::DEFAULT_FG);
+    // cells store original colors; renderer handles the swap
+    assert_eq!(cell.fg, Color::DEFAULT_FG);
+    assert_eq!(cell.bg, Color::DEFAULT_BG);
 }
 
 #[test]

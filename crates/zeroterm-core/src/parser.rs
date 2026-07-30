@@ -470,6 +470,13 @@ impl Parser {
             ('h', false, "") => self.handle_mode(true),    // SM
             ('l', false, "") => self.handle_mode(false),   // RM
 
+            // Scroll region
+            ('r', false, "") => {
+                let top = self.csi.get(0, 0) as usize;
+                let bottom = self.csi.get(1, 0) as usize;
+                self.screen.set_scroll_region(top, bottom);
+            } // DECSTBM
+
             // Reports
             ('n', false, "") => self.handle_dsr(), // DSR
             ('c', false, "") | ('c', true, "") => self.screen.identify(), // DA
@@ -658,10 +665,11 @@ impl Parser {
             if let Some(semicolon) = payload.find(';') {
                 let base64_data = &payload[semicolon + 1..];
                 if !base64_data.is_empty() {
-                    if let Some(decoded) = decode_base64(base64_data) {
-                        if let Ok(text) = String::from_utf8(decoded) {
-                            self.clipboard_text = Some(text);
+                    match decode_base64(base64_data) {
+                        Ok(data) => {
+                            self.clipboard_text = Some(String::from_utf8_lossy(&data).to_string());
                         }
+                        Err(_) => (), // silently ignore malformed base64
                     }
                 }
             }
@@ -695,7 +703,7 @@ impl Parser {
         if action != 'T' || data_part.is_empty() || width == 0 || height == 0 {
             return;
         }
-        if let Some(decoded) = decode_base64(data_part) {
+        if let Ok(decoded) = decode_base64(data_part) {
             let id = self.screen.place_image(decoded.clone(), width, height);
             self.pending_images.push(ImageFragment {
                 id,
@@ -803,7 +811,7 @@ impl Parser {
     }
 }
 
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
+fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
     let input = input.trim_end_matches('=');
     let mut output = Vec::with_capacity(input.len() * 3 / 4 + 4);
     let mut buf: u32 = 0;
@@ -825,5 +833,5 @@ fn decode_base64(input: &str) -> Option<Vec<u8>> {
             buf &= (1 << bits) - 1;
         }
     }
-    Some(output)
+    Ok(output)
 }

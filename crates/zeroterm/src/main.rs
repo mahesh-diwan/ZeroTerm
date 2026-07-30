@@ -20,7 +20,6 @@ use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
 use zeroterm_mux::tab::Tab;
-use zeroterm_mux::TabManager;
 use zeroterm_render::{Renderer, Selection};
 use zeroterm_sync::daemon::SyncDaemon;
 
@@ -152,7 +151,7 @@ struct App {
     panes: HashMap<usize, PaneState>,
     active_pane: usize,
     next_pane_id: usize,
-    tab_manager: TabManager,
+    tabs: Vec<Tab>,
     modifiers: ModifiersState,
     scroll_offset: usize,
     font_size: f32,
@@ -181,7 +180,7 @@ impl App {
             panes: HashMap::new(),
             active_pane: 0,
             next_pane_id: 1,
-            tab_manager: TabManager::new(),
+            tabs: Vec::new(),
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
             font_size: 14.0,
@@ -356,7 +355,7 @@ impl App {
             );
             self.active_pane = id;
             self.scroll_offset = 0;
-            self.tab_manager.add_tab(Tab::new(id));
+            self.tabs.push(Tab::new(id));
         }
         Ok(())
     }
@@ -368,7 +367,7 @@ impl App {
         if let Some(pane) = self.panes.remove(&self.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Kill);
         }
-        self.tab_manager.remove_tab(self.active_pane);
+        self.tabs.retain(|t| t.id != self.active_pane);
         let first = *self.panes.keys().next().unwrap_or(&0);
         self.active_pane = first;
         self.scroll_offset = 0;
@@ -465,7 +464,7 @@ impl App {
             );
             self.active_pane = id;
             self.scroll_offset = 0;
-            self.tab_manager.add_tab(Tab::new(id));
+            self.tabs.push(Tab::new(id));
         }
         Ok(())
     }

@@ -20,6 +20,38 @@ impl LuaEngine {
         };
 
         let lua = Lua::new();
+
+        // Sandbox: remove dangerous globals
+        let globals = lua.globals();
+        let _ = globals.raw_remove("io");
+        let _ = globals.raw_remove("load");
+        let _ = globals.raw_remove("loadfile");
+        let _ = globals.raw_remove("dofile");
+        let _ = globals.raw_remove("require");
+        let _ = globals.raw_remove("package");
+        let _ = globals.raw_remove("debug");
+        // Safe os: only clock and time
+        let safe_os = lua.create_table()?;
+        safe_os.set(
+            "clock",
+            lua.create_function(|_, ()| {
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64())
+            })?,
+        )?;
+        safe_os.set(
+            "time",
+            lua.create_function(|_, ()| {
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs())
+            })?,
+        )?;
+        globals.set("os", safe_os)?;
+
         let overrides = lua.create_table()?;
 
         let ov = overrides.clone();

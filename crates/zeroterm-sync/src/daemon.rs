@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::crypto::CryptoKey;
 
@@ -14,6 +14,9 @@ pub struct SyncDaemon {
 
 impl SyncDaemon {
     pub fn new(server_url: String) -> Self {
+        if server_url.starts_with("http://") {
+            warn!("sync daemon: using insecure HTTP instead of HTTPS");
+        }
         Self {
             server_url,
             key: CryptoKey::generate(),

@@ -53,8 +53,8 @@ impl SshSession {
             .channel_session()
             .context("failed to open SSH channel")?;
         channel
-            .exec("bash -l")
-            .context("failed to exec bash on SSH channel")?;
+            .exec(&std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()))
+            .context("failed to exec shell on SSH channel")?;
 
         self.session = Some(session);
         self.channel = Some(channel);

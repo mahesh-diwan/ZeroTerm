@@ -6,13 +6,10 @@ license = "MIT"
 description = "VT parser, screen buffer, cell model for ZeroTerm"
 
 [dependencies]
-tokio = { workspace = true, features = ["full", "tracing"] }
-tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 unicode-width = { workspace = true }
-unicode-segmentation = { workspace = true }
 portable-pty = { workspace = true }
 
 [dev-dependencies]

@@ -53,6 +53,8 @@ pub struct Screen {
     newline_mode: bool,
     keyboard_action_mode: bool,
     reverse_video: bool,
+    scroll_top: usize,
+    scroll_bottom: usize,
     auto_repeat: bool,
     mouse_tracking: bool,
     tabs: Vec<bool>,
@@ -96,6 +98,8 @@ impl Screen {
             newline_mode: false,
             keyboard_action_mode: false,
             reverse_video: false,
+            scroll_top: 0,
+            scroll_bottom: 0,
             auto_repeat: true,
             mouse_tracking: false,
             tabs,
@@ -213,10 +217,6 @@ impl Screen {
         cell.bg = self.bg;
         cell.attrs = self.attrs;
 
-        if self.reverse_video {
-            std::mem::swap(&mut cell.fg, &mut cell.bg);
-        }
-
         let cursor_row = self.cursor.row;
         let cursor_col = self.cursor.col;
 
@@ -315,15 +315,34 @@ impl Screen {
     }
 
     fn scroll_top(&self) -> usize {
-        if self.origin_mode {
+        if self.scroll_top == 0 && self.scroll_bottom == 0 {
             0
         } else {
-            0
+            self.scroll_top
         }
     }
 
     fn scroll_bottom(&self) -> usize {
-        self.size.rows - 1
+        if self.scroll_top == 0 && self.scroll_bottom == 0 {
+            self.size.rows - 1
+        } else {
+            self.scroll_bottom
+        }
+    }
+
+    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+        if top == 0 && bottom == 0 {
+            self.scroll_top = 0;
+            self.scroll_bottom = 0; // means full screen
+        } else {
+            self.scroll_top = top.saturating_sub(1).min(self.size.rows.saturating_sub(1));
+            self.scroll_bottom = bottom
+                .saturating_sub(1)
+                .min(self.size.rows.saturating_sub(1));
+            if self.scroll_top > self.scroll_bottom {
+                self.scroll_bottom = self.scroll_top;
+            }
+        }
     }
 
     pub fn scroll_up(&mut self, n: usize) {

@@ -9,7 +9,6 @@ description = "ZeroTerm - GPU-accelerated terminal emulator"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["fmt", "json", "env-filter"] }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }
 portable-pty = { workspace = true }
@@ -21,9 +20,11 @@ zeroterm-mux = { path = "../zeroterm-mux" }
 zeroterm-config = { path = "../zeroterm-config" }
 zeroterm-ai = { path = "../zeroterm-ai" }
 zeroterm-sync = { path = "../zeroterm-sync" }
-zeroterm-ssh = { path = "../zeroterm-ssh" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 notify = { version = "7", features = ["macos_kqueue"] }
+
+[target.'cfg(unix)'.dependencies]
+zeroterm-ssh = { path = "../zeroterm-ssh" }
 
 [dev-dependencies]
 criterion = { workspace = true }

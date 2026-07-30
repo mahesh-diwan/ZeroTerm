@@ -6,8 +6,6 @@ license = "MIT"
 description = "wgpu renderer, glyph atlas, font handling for ZeroTerm"
 
 [dependencies]
-tokio = { workspace = true, features = ["full", "tracing"] }
-tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 winit = { workspace = true }
