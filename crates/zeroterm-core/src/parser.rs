@@ -19,6 +19,23 @@ enum ParserState {
     SosPmApcString,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MouseTrackingMode {
+    #[default]
+    Off,
+    Normal,
+    ButtonEvents,
+    AnyEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageFragment {
+    pub id: u32,
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Default)]
 struct CsiParams {
     params: Vec<Option<i64>>,
@@ -69,6 +86,10 @@ pub struct Parser {
     after_newline: bool,
     command_buf: String,
     collecting_command: bool,
+    mouse_tracking: MouseTrackingMode,
+    bracketed_paste: bool,
+    pub pending_images: Vec<ImageFragment>,
+    apc_buffer: String,
 }
 
 impl Parser {
@@ -82,6 +103,10 @@ impl Parser {
             after_newline: false,
             command_buf: String::new(),
             collecting_command: false,
+            mouse_tracking: MouseTrackingMode::Off,
+            bracketed_paste: false,
+            pending_images: Vec::new(),
+            apc_buffer: String::new(),
         }
     }
 
@@ -101,6 +126,14 @@ impl Parser {
 
     pub fn set_exit_code(&mut self, code: i32) {
         self.screen.set_block_exit_code(code);
+    }
+
+    pub fn mouse_tracking(&self) -> MouseTrackingMode {
+        self.mouse_tracking
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     fn handle_byte(&mut self, byte: u8) {
@@ -313,9 +346,13 @@ impl Parser {
     }
 
     fn handle_dcs_passthrough(&mut self, byte: u8) {
-        if byte == 0x1B {
-            // Check for ST
-            self.state = ParserState::Ground;
+        match byte {
+            0x1B => {
+                let buffer = std::mem::take(&mut self.dcs_buffer);
+                self.handle_dcs_string(&buffer);
+                self.state = ParserState::Ground;
+            }
+            _ => self.dcs_buffer.push(byte as char),
         }
     }
 
@@ -326,8 +363,14 @@ impl Parser {
     }
 
     fn handle_sos_pm_apc(&mut self, byte: u8) {
-        if byte == 0x1B {
-            self.state = ParserState::Ground;
+        match byte {
+            0x1B => {
+                let buffer = std::mem::take(&mut self.apc_buffer);
+                self.handle_apc(&buffer);
+                self.state = ParserState::Ground;
+            }
+            0x20..=0x7E => self.apc_buffer.push(byte as char),
+            _ => {}
         }
     }
 
@@ -539,19 +582,55 @@ impl Parser {
     }
 
     fn handle_dec_mode(&mut self, set: bool) {
-        let param = self.csi.get(0, 0);
-        match param {
-            1 => self.screen.set_cursor_keys_mode(set),    // DECCKM
-            3 => self.screen.set_columns_132(set),         // DECCOLM
-            5 => self.screen.set_reverse_video(set),       // DECSCNM
-            6 => self.screen.set_origin_mode(set),         // DECOM
-            7 => self.screen.set_autowrap(set),            // DECAWM
-            8 => self.screen.set_auto_repeat(set),         // DECARM
-            9 => self.screen.set_mouse_tracking(set),      // DECTCEM
-            25 => self.screen.set_cursor_visible(set),     // DECTCEM
-            47 => self.screen.set_alternate_screen(set),   // DECSM
-            1049 => self.screen.set_alternate_screen(set), // DECSM
-            _ => {}
+        // ponytail: always Off on deselect, fine-grained tracking if needed
+        for i in 0..self.csi.param_count() {
+            let param = self.csi.get(i, 0);
+            match param {
+                1 => self.screen.set_cursor_keys_mode(set),
+                3 => self.screen.set_columns_132(set),
+                5 => self.screen.set_reverse_video(set),
+                6 => self.screen.set_origin_mode(set),
+                7 => self.screen.set_autowrap(set),
+                8 => self.screen.set_auto_repeat(set),
+                9 => self.screen.set_mouse_tracking(set),
+                25 => self.screen.set_cursor_visible(set),
+                47 => self.screen.set_alternate_screen(set),
+                1000 => {
+                    self.mouse_tracking = if set {
+                        MouseTrackingMode::Normal
+                    } else {
+                        MouseTrackingMode::Off
+                    };
+                    self.screen.set_mouse_tracking(set);
+                }
+                1001 => {
+                    self.mouse_tracking = if set {
+                        MouseTrackingMode::ButtonEvents
+                    } else {
+                        MouseTrackingMode::Off
+                    };
+                    self.screen.set_mouse_tracking(set);
+                }
+                1002 => {
+                    self.mouse_tracking = if set {
+                        MouseTrackingMode::AnyEvent
+                    } else {
+                        MouseTrackingMode::Off
+                    };
+                    self.screen.set_mouse_tracking(set);
+                }
+                1003 => {
+                    self.mouse_tracking = if set {
+                        MouseTrackingMode::AnyEvent
+                    } else {
+                        MouseTrackingMode::Off
+                    };
+                    self.screen.set_mouse_tracking(set);
+                }
+                2004 => self.bracketed_paste = set,
+                1049 => self.screen.set_alternate_screen(set),
+                _ => {}
+            }
         }
     }
 
@@ -576,4 +655,159 @@ impl Parser {
             // Clipboard - ignored for now
         }
     }
+
+    fn handle_apc(&mut self, apc: &str) {
+        if let Some(payload) = apc.strip_prefix('G') {
+            self.handle_kitty(payload);
+        }
+    }
+
+    fn handle_kitty(&mut self, payload: &str) {
+        let (kv_part, data_part) = match payload.split_once(';') {
+            Some((k, d)) => (k, d),
+            None => (payload, ""),
+        };
+        let mut action = 'T';
+        let mut width = 0u32;
+        let mut height = 0u32;
+        for pair in kv_part.split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "a" => action = v.chars().next().unwrap_or('T'),
+                    "s" => width = v.parse().unwrap_or(0),
+                    "v" => height = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        if action != 'T' || data_part.is_empty() || width == 0 || height == 0 {
+            return;
+        }
+        if let Some(decoded) = decode_base64(data_part) {
+            let id = self.screen.place_image(decoded.clone(), width, height);
+            self.pending_images.push(ImageFragment {
+                id,
+                data: decoded,
+                width,
+                height,
+            });
+        }
+    }
+
+    fn handle_dcs_string(&mut self, data: &str) {
+        if data.starts_with("q") || data.starts_with("0;1;q") {
+            self.handle_sixel(data);
+        }
+    }
+
+    fn handle_sixel(&mut self, data: &str) {
+        let palette: [(u8, u8, u8); 256] = [(0, 0, 0); 256];
+        let mut pal_idx: u8 = 0;
+        let mut pixels: Vec<Vec<u32>> = Vec::new();
+        let mut x: u32 = 0;
+        let mut y: u32 = 0;
+        let mut max_x: u32 = 0;
+        // ponytail: bare-bones stair-step parser, skips palette init cmds
+        for ch in data.chars() {
+            match ch {
+                '#' => {
+                    pal_idx = 0;
+                }
+                'P' => {
+                    pal_idx = 0;
+                }
+                ';' | ':' | '$' => {
+                    if ch == '$' {
+                        x = 0;
+                        y += 6;
+                    }
+                }
+                '-' => {
+                    x = 0;
+                    y += 6;
+                }
+                c if ('?'..='~').contains(&c) => {
+                    let sixel = (c as u8) - 63;
+                    for bit in 0..6 {
+                        if (sixel >> bit) & 1 != 0 {
+                            let py = y + bit;
+                            while pixels.len() <= py as usize {
+                                pixels.push(Vec::new());
+                            }
+                            let row = &mut pixels[py as usize];
+                            while row.len() <= x as usize {
+                                row.push(0);
+                            }
+                            let (r, g, b) = palette[pal_idx as usize];
+                            row[x as usize] =
+                                0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                        }
+                    }
+                    x += 1;
+                    if x > max_x {
+                        max_x = x;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let height = pixels.len() as u32;
+        let width = max_x;
+        if width == 0 || height == 0 {
+            return;
+        }
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(row) = pixels.get(y as usize) {
+                    if let Some(&pixel) = row.get(x as usize) {
+                        rgba.push(((pixel >> 16) & 0xFF) as u8);
+                        rgba.push(((pixel >> 8) & 0xFF) as u8);
+                        rgba.push((pixel & 0xFF) as u8);
+                        rgba.push(0xFF);
+                    } else {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                } else {
+                    rgba.extend_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        let id = self.screen.place_image(rgba.clone(), width, height);
+        self.pending_images.push(ImageFragment {
+            id,
+            data: rgba,
+            width,
+            height,
+        });
+    }
+
+    pub fn take_pending_images(&mut self) -> Vec<ImageFragment> {
+        std::mem::take(&mut self.pending_images)
+    }
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let input = input.trim_end_matches('=');
+    let mut output = Vec::with_capacity(input.len() * 3 / 4 + 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for ch in input.chars() {
+        let val = match ch {
+            'A'..='Z' => ch as u32 - 65,
+            'a'..='z' => ch as u32 - 71,
+            '0'..='9' => ch as u32 + 4,
+            '+' => 62,
+            '/' => 63,
+            _ => continue,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
 }

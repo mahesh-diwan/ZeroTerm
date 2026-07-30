@@ -19,6 +19,9 @@ var atlas_texture: texture_2d<f32>;
 @group(1) @binding(1)
 var atlas_sampler: sampler;
 
+@group(1) @binding(2)
+var image_texture: texture_2d<f32>;
+
 struct CellData {
     glyph_uv_min: vec2<f32>,
     glyph_uv_max: vec2<f32>,
@@ -123,6 +126,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     if (input.attrs & 0x200u) != 0u {
         color = mix(fg, bg, 0.3);
+    }
+
+    if (input.attrs & 0x400u) != 0u {
+        let img_sample = textureSample(image_texture, atlas_sampler, input.cell_size);
+        if img_sample.a > 0.0 {
+            color = img_sample;
+        }
     }
 
     return color;

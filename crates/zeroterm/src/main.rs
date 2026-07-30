@@ -15,6 +15,7 @@ use winit::window::{Window, WindowAttributes};
 
 use zeroterm_ai::client::AiClient;
 use zeroterm_config::Config;
+use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
@@ -165,6 +166,7 @@ struct App {
     sync_daemon: Option<SyncDaemon>,
     config_changed: Arc<AtomicBool>,
     config: Option<Config>,
+    opacity: f64,
 }
 
 #[allow(dead_code)]
@@ -190,6 +192,7 @@ impl App {
             sync_daemon: None,
             config_changed: Arc::new(AtomicBool::new(false)),
             config: None,
+            opacity: 1.0,
         }
     }
 
@@ -227,7 +230,8 @@ impl App {
 
         let font_size = config.font.size;
         self.font_size = font_size;
-        let renderer = pollster::block_on(Renderer::new(window.clone(), font_size))?;
+        self.opacity = config.window.opacity;
+        let renderer = pollster::block_on(Renderer::new(window.clone(), font_size, self.opacity))?;
 
         let size = window.inner_size();
         let cell_w = font_size * 0.6;
@@ -241,6 +245,7 @@ impl App {
         self.shell_args = shell_args.clone();
 
         let (pty_rx, pty_tx) = spawn_pty_process(&shell, &shell_args, cols, rows)?;
+        let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
 
         let parser = Parser::new(cols, rows);
         let mut panes = HashMap::new();
@@ -518,6 +523,7 @@ impl App {
             self.config_changed.store(false, Ordering::SeqCst);
             if let Some(config) = &mut self.config {
                 config.reload(None).ok();
+                self.opacity = config.window.opacity;
                 if let Some(renderer) = &mut self.renderer {
                     renderer.reload_config(config);
                 }
@@ -672,6 +678,18 @@ impl App {
     fn clear_selection(&mut self) {
         self.selection = None;
     }
+
+    fn cycle_opacity(&mut self) {
+        const STEPS: [f64; 3] = [1.0, 0.85, 0.7];
+        let idx = STEPS
+            .iter()
+            .position(|o| (*o - self.opacity).abs() < 0.01)
+            .unwrap_or(0);
+        self.opacity = STEPS[(idx + 1) % STEPS.len()];
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_opacity(self.opacity);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -749,6 +767,10 @@ impl ApplicationHandler for App {
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyI {
                             self.ai_explain();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyO {
+                            self.cycle_opacity();
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyS {
@@ -905,7 +927,17 @@ impl ApplicationHandler for App {
                                 KeyCode::KeyV => {
                                     if let Some(clipboard) = &mut self.clipboard {
                                         if let Ok(text) = clipboard.get_text() {
-                                            self.write_pty(text.as_bytes());
+                                            let bracketed = self
+                                                .active_pane()
+                                                .map_or(false, |p| p.parser.bracketed_paste());
+                                            if bracketed {
+                                                let mut data = b"\x1b[200~".to_vec();
+                                                data.extend_from_slice(text.as_bytes());
+                                                data.extend_from_slice(b"\x1b[201~");
+                                                self.write_pty(&data);
+                                            } else {
+                                                self.write_pty(text.as_bytes());
+                                            }
                                         }
                                     }
                                     vec![]
@@ -943,6 +975,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
+                let mouse_tracking = self
+                    .active_pane()
+                    .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
+                if mouse_tracking == MouseTrackingMode::AnyEvent && !self.selecting {
+                    if let Some((row, col)) =
+                        self.screen_to_cell(position.x as f32, position.y as f32)
+                    {
+                        let mods = (if self.modifiers.shift_key() { 4 } else { 0 })
+                            | (if self.modifiers.control_key() { 8 } else { 0 })
+                            | (if self.modifiers.alt_key() { 16 } else { 0 });
+                        self.write_pty(
+                            format!("\x1b[<{};{};{}M", col + 1, row + 1, 35 + mods).as_bytes(),
+                        );
+                    }
+                }
                 if self.selecting {
                     self.update_selection(position.x as f32, position.y as f32);
                     if let Some(window) = &self.window {
@@ -950,21 +997,45 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => match (state, button) {
-                (winit::event::ElementState::Pressed, MouseButton::Left) => {
-                    self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+            WindowEvent::MouseInput { state, button, .. } => {
+                let mouse_tracking = self
+                    .active_pane()
+                    .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
+                if mouse_tracking != MouseTrackingMode::Off {
+                    let button_id = match button {
+                        MouseButton::Left => 0,
+                        MouseButton::Middle => 1,
+                        MouseButton::Right => 2,
+                        _ => 0,
+                    };
+                    if let Some((row, col)) =
+                        self.screen_to_cell(self.mouse_pos.0, self.mouse_pos.1)
+                    {
+                        let mods = (if self.modifiers.shift_key() { 4 } else { 0 })
+                            | (if self.modifiers.control_key() { 8 } else { 0 })
+                            | (if self.modifiers.alt_key() { 16 } else { 0 });
+                        let cb = 32 + button_id + mods;
+                        let final_byte = if state == winit::event::ElementState::Pressed {
+                            'M'
+                        } else {
+                            'm'
+                        };
+                        self.write_pty(
+                            format!("\x1b[<{};{};{}{}", col + 1, row + 1, cb, final_byte)
+                                .as_bytes(),
+                        );
+                    }
+                } else if button == MouseButton::Left {
+                    if state == winit::event::ElementState::Pressed {
+                        self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+                    } else {
+                        self.end_selection();
+                    }
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
-                (winit::event::ElementState::Released, MouseButton::Left) => {
-                    self.end_selection();
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
-                _ => {}
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
                     MouseScrollDelta::LineDelta(_, y) => {

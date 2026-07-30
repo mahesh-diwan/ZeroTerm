@@ -47,6 +47,8 @@ impl Selection {
 
 const ATLAS_SIZE: u32 = 1024;
 
+const ATTR_HAS_IMAGE: u32 = 0x400;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Uniforms {
@@ -365,10 +367,15 @@ pub struct Renderer {
     cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
     clear_color: [f64; 3],
+    opacity: f64,
+    atlas_bind_group_layout: wgpu::BindGroupLayout,
+    image_texture: Option<wgpu::Texture>,
+    image_view: Option<wgpu::TextureView>,
+    has_image: bool,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_size: f32) -> Result<Self> {
+    pub async fn new(window: Arc<Window>, font_size: f32, opacity: f64) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -407,13 +414,19 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
+        let alpha_mode = if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else {
+            surface_caps.alpha_modes[0]
+        };
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -505,7 +518,7 @@ impl Renderer {
             ],
         });
 
-        // Atlas bind group layout
+        // Atlas bind group layout with image texture binding
         let atlas_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Atlas Bind Group Layout"),
@@ -526,8 +539,37 @@ impl Renderer {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
+
+        // Placeholder 1x1 texture for image_texture binding
+        let placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Placeholder Image Texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let placeholder_view = placeholder_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &placeholder_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &[0u8; 4],
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
 
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Atlas Bind Group"),
@@ -540,6 +582,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&glyph_atlas.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
                 },
             ],
         });
@@ -612,12 +658,17 @@ impl Renderer {
             quad_vertex_buffer,
             uniform_buffer,
             uniform_bind_group,
+            atlas_bind_group_layout,
             atlas_bind_group,
             glyph_atlas,
             cell_size: [cell_width, cell_height],
             cell_buffer_capacity,
             dirty_cells: Vec::new(),
             clear_color: [0.117, 0.117, 0.117],
+            opacity,
+            image_texture: Some(placeholder_tex),
+            image_view: Some(placeholder_view),
+            has_image: false,
         })
     }
 
@@ -637,6 +688,7 @@ impl Renderer {
         self.size = PhysicalSize::new(width, height);
         self.config.width = width;
         self.config.height = height;
+        self.config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
         self.surface.configure(&self.device, &self.config);
 
         if needs_resize {
@@ -696,7 +748,9 @@ impl Renderer {
             }
         }
 
-// Build and upload vertices for dirty cells only
+        self.update_image_from_screen(screen);
+
+        // Build and upload vertices for dirty cells only
         if !self.dirty_cells.is_empty() {
             self.update_cell_data(screen, scroll_offset, selection)?;
         }
@@ -736,7 +790,7 @@ impl Renderer {
                             r: self.clear_color[0],
                             g: self.clear_color[1],
                             b: self.clear_color[2],
-                            a: 1.0,
+                            a: self.opacity,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -777,6 +831,7 @@ impl Renderer {
         let end = total_rows.saturating_sub(scroll_offset);
         let start = end.saturating_sub(visible_rows);
 
+        let mut batch = vec![CellData::zeroed(); visible_rows * cols];
         for &(dirty_row, dirty_col) in &self.dirty_cells {
             if dirty_row >= visible_rows || dirty_col >= cols {
                 continue;
@@ -815,7 +870,7 @@ impl Renderer {
 
             let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
 
-            let attrs = ((cell_attrs.bold as u32) << 0)
+            let mut attrs = ((cell_attrs.bold as u32) << 0)
                 | ((cell_attrs.italic as u32) << 1)
                 | (((cell_attrs.underline != zeroterm_core::cell::UnderlineStyle::None) as u32) << 2)
                 | ((cell_attrs.strikethrough as u32) << 3)
@@ -825,6 +880,9 @@ impl Renderer {
                 | ((cell_attrs.invisible as u32) << 7)
                 | (if is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
                 | (if is_selected { 0x200u32 } else { 0 });
+            if screen.image_cells().contains_key(&(combined_idx, dirty_col)) {
+                attrs |= ATTR_HAS_IMAGE;
+            }
 
             let fg_color = [fg.r as f32 / 255.0, fg.g as f32 / 255.0, fg.b as f32 / 255.0, 1.0];
             let bg_color = [bg.r as f32 / 255.0, bg.g as f32 / 255.0, bg.b as f32 / 255.0, 1.0];
@@ -833,7 +891,7 @@ impl Renderer {
                 .glyph_atlas
                 .get_or_insert_glyph(cell.ch, &self.device, &self.queue);
 
-            let cell_data = CellData {
+            batch[dirty_row * cols + dirty_col] = CellData {
                 glyph_uv_min: [u0, v0],
                 glyph_uv_max: [u1, v1],
                 glyph_size: [gw, gh],
@@ -843,10 +901,9 @@ impl Renderer {
                 attrs,
                 _pad1: [0; 3],
             };
-
-            let offset = ((dirty_row * cols + dirty_col) * std::mem::size_of::<CellData>()) as wgpu::BufferAddress;
-            self.queue.write_buffer(&self.cell_buffer, offset, bytemuck::bytes_of(&cell_data));
         }
+
+        self.queue.write_buffer(&self.cell_buffer, 0, bytemuck::cast_slice(&batch));
 
         Ok(())
     }
@@ -855,6 +912,62 @@ impl Renderer {
         if let Some((r, g, b)) = Self::parse_hex_color(&config.colors.background) {
             self.clear_color = [r, g, b];
         }
+        self.opacity = config.window.opacity;
+    }
+
+    pub fn set_opacity(&mut self, opacity: f64) {
+        self.opacity = opacity;
+    }
+
+    // ponytail: uploads only the latest image; multi-image needs texture array
+    fn update_image_from_screen(&mut self, screen: &CoreScreen) {
+        let reg = screen.image_registry();
+        if reg.is_empty() || self.has_image {
+            return;
+        }
+        let img = match reg.values().last() {
+            Some(i) => i,
+            None => return,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Kitty Image Texture"),
+            size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            &img.rgba_data,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
+            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+        );
+        let new_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Atlas Bind Group"),
+            layout: &self.atlas_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.glyph_atlas.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.glyph_atlas.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+            ],
+        });
+        self.image_texture = Some(texture);
+        self.image_view = Some(view);
+        self.atlas_bind_group = new_bind_group;
+        self.has_image = true;
     }
 
     fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {

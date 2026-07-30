@@ -1,7 +1,7 @@
 //! Screen buffer with scrollback, cursor, and rendering support
 
 use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct CommandBlock {
@@ -23,6 +23,14 @@ pub struct Size {
 pub struct Point {
     pub row: usize,
     pub col: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub rgba_data: Vec<u8>,
 }
 
 pub struct Screen {
@@ -56,6 +64,9 @@ pub struct Screen {
     blocks: Vec<CommandBlock>,
     block_id_counter: usize,
     current_block_command: String,
+    pub image_registry: HashMap<u32, ImageData>,
+    pub image_cells: HashMap<(usize, usize), u32>,
+    next_image_id: u32,
 }
 
 impl Screen {
@@ -96,6 +107,9 @@ impl Screen {
             blocks: Vec::new(),
             block_id_counter: 0,
             current_block_command: String::new(),
+            image_registry: HashMap::new(),
+            image_cells: HashMap::new(),
+            next_image_id: 0,
         }
     }
 
@@ -741,5 +755,31 @@ impl Screen {
         if let Some(block) = self.blocks.last_mut() {
             block.exit_code = Some(code);
         }
+    }
+
+    pub fn place_image(&mut self, rgba_data: Vec<u8>, width: u32, height: u32) -> u32 {
+        let id = self.next_image_id;
+        self.next_image_id += 1;
+        self.image_registry.insert(
+            id,
+            ImageData {
+                id,
+                width,
+                height,
+                rgba_data,
+            },
+        );
+        let cursor_row = self.cursor.row;
+        let cursor_col = self.cursor.col;
+        self.image_cells.insert((cursor_row, cursor_col), id);
+        id
+    }
+
+    pub fn image_registry(&self) -> &HashMap<u32, ImageData> {
+        &self.image_registry
+    }
+
+    pub fn image_cells(&self) -> &HashMap<(usize, usize), u32> {
+        &self.image_cells
     }
 }

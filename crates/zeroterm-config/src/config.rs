@@ -126,6 +126,11 @@ impl Config {
                         self.window.height = v;
                     }
                 }
+                "opacity" | "window.opacity" => {
+                    if let Ok(v) = value.parse::<f64>() {
+                        self.window.opacity = v;
+                    }
+                }
                 "ai_endpoint" | "ai.endpoint" => self.ai.endpoint = value,
                 "ssh_host" | "ssh.host" => self.ssh.host = value,
                 "ssh_user" | "ssh.user" => self.ssh.user = value,
@@ -237,6 +242,7 @@ impl Default for ShellConfig {
 pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
+    pub opacity: f64,
 }
 
 impl Default for WindowConfig {
@@ -244,6 +250,7 @@ impl Default for WindowConfig {
         Self {
             width: 1200,
             height: 800,
+            opacity: 1.0,
         }
     }
 }
