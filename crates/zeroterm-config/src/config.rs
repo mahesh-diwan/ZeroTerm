@@ -102,7 +102,7 @@ impl Config {
     pub fn apply_overrides(&mut self, overrides: HashMap<String, String>) {
         for (key, value) in overrides {
             match key.as_str() {
-                "font_family" | "font.family" => self.font.family = value,
+                "font_family" | "font.family" => self.font.family = Some(value),
                 "font_size" | "font.size" => {
                     if let Ok(v) = value.parse::<f32>() {
                         self.font.size = v;
@@ -190,7 +190,7 @@ impl Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FontConfig {
-    pub family: String,
+    pub family: Option<String>,
     pub size: f32,
     pub line_height: f32,
     pub path: Option<String>,
@@ -199,7 +199,7 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "JetBrains Mono".to_string(),
+            family: None,
             size: 14.0,
             line_height: 1.2,
             path: None,

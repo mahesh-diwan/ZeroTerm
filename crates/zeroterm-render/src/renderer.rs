@@ -54,11 +54,8 @@ const ATTR_HAS_IMAGE: u32 = 0x400;
 struct Uniforms {
     screen_size: [f32; 2],
     cell_size: [f32; 2],
-    cursor_pos: [f32; 2],
-    cursor_visible: u32,
     cols: u32,
     rows: u32,
-    _padding: [u32; 1],
 }
 
 #[repr(C)]
@@ -97,7 +94,6 @@ struct GlyphInfo {
     height: u32,
 }
 
-#[allow(dead_code)]
 struct GlyphAtlas {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -111,11 +107,12 @@ struct GlyphAtlas {
     font_size: f32,
     cell_width: f32,
     cell_height: f32,
+    font_path: Option<String>,
 }
 
 impl GlyphAtlas {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, font_size: f32, font_path: Option<String>) -> Result<Self> {
-        let font_data = Self::load_font(font_path)?;
+        let font_data = Self::load_font(font_path.clone())?;
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Glyph Atlas"),
@@ -139,7 +136,7 @@ impl GlyphAtlas {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -171,6 +168,7 @@ impl GlyphAtlas {
             sampler,
             glyph_cache: HashMap::new(),
             font_data,
+            font_path,
             scale_context: ScaleContext::new(),
             cursor_x: 0,
             cursor_y: 0,
@@ -280,13 +278,8 @@ impl GlyphAtlas {
 
         // Check if we've run out of space
         if self.cursor_y + h > ATLAS_SIZE {
-            log::warn!("Glyph atlas full, dropping glyph");
-            return GlyphInfo {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-            };
+            log::warn!("Glyph atlas full, clearing");
+            self.clear_atlas(queue);
         }
 
         let info = GlyphInfo {
@@ -351,6 +344,40 @@ impl GlyphAtlas {
         // 1x1 transparent pixel — alpha=0, bg shows through
         (0.0, 0.0, 1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32, 0.0, 0.0)
     }
+
+    fn clear_atlas(&mut self, queue: &wgpu::Queue) {
+        let clear = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &clear,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(ATLAS_SIZE * 4),
+                rows_per_image: Some(ATLAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.row_height = 0;
+        self.glyph_cache.clear();
+    }
+
+    fn repack_ascii(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.clear_atlas(queue);
+        for ch in 32u8..=126 {
+            self.get_or_insert_glyph(ch as char, device, queue);
+        }
+    }
 }
 
 pub struct Renderer {
@@ -367,6 +394,8 @@ pub struct Renderer {
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
+    cell_width: f32,
+    cell_height: f32,
     cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
     clear_color: [f64; 3],
@@ -375,6 +404,7 @@ pub struct Renderer {
     image_texture: Option<wgpu::Texture>,
     image_view: Option<wgpu::TextureView>,
     has_image: bool,
+    pending_images: Vec<(u32, Vec<u8>, u32, u32)>,
 }
 
 impl Renderer {
@@ -451,11 +481,8 @@ impl Renderer {
         let uniforms = Uniforms {
             screen_size: [size.width as f32, size.height as f32],
             cell_size: [cell_width, cell_height],
-            cursor_pos: [0.0, 0.0],
-            cursor_visible: 0,
             cols,
             rows,
-            _padding: [0],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
@@ -665,6 +692,8 @@ impl Renderer {
             atlas_bind_group,
             glyph_atlas,
             cell_size: [cell_width, cell_height],
+            cell_width,
+            cell_height,
             cell_buffer_capacity,
             dirty_cells: Vec::new(),
             clear_color: [0.117, 0.117, 0.117],
@@ -672,6 +701,7 @@ impl Renderer {
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
             has_image: false,
+            pending_images: Vec::new(),
         })
     }
 
@@ -722,20 +752,27 @@ impl Renderer {
 
         let uniforms = Uniforms {
             screen_size: [width as f32, height as f32],
-            cell_size: self.cell_size,
-            cursor_pos: [0.0, 0.0],
-            cursor_visible: 0,
+            cell_size: [self.cell_width, self.cell_height],
             cols: new_cols as u32,
             rows: new_rows as u32,
-            _padding: [0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
     pub fn render(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
+        let frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("Surface error: {}", e);
+                return Ok(());
+            }
+        };
+        let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -759,18 +796,11 @@ impl Renderer {
         }
 
         // Update uniforms
-        let cursor = screen.cursor();
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
-            cell_size: self.cell_size,
-            cursor_pos: [
-                cursor.col as f32 * self.cell_size[0],
-                cursor.row as f32 * self.cell_size[1],
-            ],
-            cursor_visible: if cursor.visible { 1 } else { 0 },
+            cell_size: [self.cell_width, self.cell_height],
             cols: cols as u32,
             rows: visible_rows as u32,
-            _padding: [0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -813,7 +843,7 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        frame.present();
 
         Ok(())
     }
@@ -922,19 +952,19 @@ impl Renderer {
         self.opacity = opacity;
     }
 
-    // ponytail: uploads only the latest image; multi-image needs texture array
     fn update_image_from_screen(&mut self, screen: &CoreScreen) {
         let reg = screen.image_registry();
         if reg.is_empty() || self.has_image {
             return;
         }
-        let img = match reg.values().last() {
-            Some(i) => i,
-            None => return,
-        };
+        self.pending_images.clear();
+        for img in reg.values() {
+            self.pending_images.push((0, img.rgba_data.clone(), img.width, img.height));
+        }
+        let (_, ref rgba, width, height) = self.pending_images.last().unwrap();
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Kitty Image Texture"),
-            size: wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -945,9 +975,9 @@ impl Renderer {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.queue.write_texture(
             wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            &img.rgba_data,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(img.width * 4), rows_per_image: Some(img.height) },
-            wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+            rgba,
+            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(*height) },
+            wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
         );
         let new_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Atlas Bind Group"),
@@ -971,6 +1001,14 @@ impl Renderer {
         self.image_view = Some(view);
         self.atlas_bind_group = new_bind_group;
         self.has_image = true;
+    }
+
+    pub fn reload_font(&mut self, font_path: Option<String>) {
+        self.glyph_atlas.font_path = font_path.clone();
+        if let Ok(data) = GlyphAtlas::load_font(font_path) {
+            self.glyph_atlas.font_data = data;
+            self.glyph_atlas.repack_ascii(&self.device, &self.queue);
+        }
     }
 
     fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {

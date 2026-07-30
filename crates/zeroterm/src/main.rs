@@ -11,7 +11,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowAttributes};
+use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use zeroterm_ai::client::AiClient;
 use zeroterm_config::Config;
@@ -167,6 +167,9 @@ struct App {
     config_changed: Arc<AtomicBool>,
     config: Option<Config>,
     opacity: f64,
+    sync_tick: u32,
+    cursor_visible: bool,
+    font_path: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -193,6 +196,9 @@ impl App {
             config_changed: Arc::new(AtomicBool::new(false)),
             config: None,
             opacity: 1.0,
+            sync_tick: 0,
+            cursor_visible: true,
+            font_path: None,
         }
     }
 
@@ -208,7 +214,11 @@ impl App {
         if let Some(pane) = self.active_pane() {
             let title = pane.parser.screen().title();
             if let Some(window) = &self.window {
-                window.set_title(title);
+                if title.is_empty() {
+                    window.set_title("ZeroTerm v0.2.0");
+                } else {
+                    window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
+                }
             }
         }
     }
@@ -219,7 +229,7 @@ impl App {
         let config = Config::load(None).unwrap_or_default();
 
         let window_attrs = WindowAttributes::default()
-            .with_title("ZeroTerm")
+            .with_title("ZeroTerm v0.2.0")
             .with_inner_size(winit::dpi::LogicalSize::new(
                 config.window.width,
                 config.window.height,
@@ -237,6 +247,7 @@ impl App {
             self.opacity,
             config.font.path.clone(),
         ))?;
+        self.font_path = config.font.path.clone();
 
         let size = window.inner_size();
         let cell_w = font_size * 0.6;
@@ -260,7 +271,7 @@ impl App {
                 parser,
                 pty_rx,
                 pty_tx,
-                title: "ZeroTerm".into(),
+                title: "ZeroTerm v0.2.0".into(),
             },
         );
 
@@ -340,7 +351,7 @@ impl App {
                     parser,
                     pty_rx,
                     pty_tx,
-                    title: "ZeroTerm".into(),
+                    title: "ZeroTerm v0.2.0".into(),
                 },
             );
             self.active_pane = id;
@@ -503,6 +514,7 @@ impl App {
         let active = self.active_pane;
         let mut title_changed = None;
         let mut dead_panes = Vec::new();
+        let pane_count = self.panes.len();
         for (&id, pane) in &mut self.panes {
             loop {
                 match pane.pty_rx.try_recv() {
@@ -510,7 +522,9 @@ impl App {
                         pane.parser.parse(&data);
                         if let Some(text) = pane.parser.take_clipboard_text() {
                             if let Some(clipboard) = &mut self.clipboard {
-                                let _ = clipboard.set_text(text);
+                                if let Err(e) = clipboard.set_text(text) {
+                                    warn!("clipboard error: {}", e);
+                                }
                             }
                         }
                         if id == active {
@@ -524,7 +538,12 @@ impl App {
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        pane.parser.parse(b"\r\n[Process exited]\r\n");
+                        if pane_count <= 1 {
+                            pane.parser
+                                .parse(b"\r\n[Process exited] - exit to quit\r\n");
+                        } else {
+                            pane.parser.parse(b"\r\n[Process exited]\r\n");
+                        }
                         dead_panes.push(id);
                         break;
                     }
@@ -533,13 +552,29 @@ impl App {
         }
         for id in &dead_panes {
             warn!("Pane {} process exited", id);
+            if self.panes.len() > 1 {
+                self.panes.remove(id);
+                if self.active_pane == *id {
+                    self.active_pane = *self.panes.keys().next().unwrap_or(&0);
+                }
+            }
         }
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {
-                window.set_title(&title);
+                window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
             }
         }
         got_data
+    }
+
+    fn periodic_sync(&mut self) {
+        self.sync_tick += 1;
+        if self.sync_tick >= 300 {
+            self.sync_tick = 0;
+            if let Some(sync) = &self.sync_daemon {
+                sync.mark_dirty();
+            }
+        }
     }
 
     fn render(&mut self) -> Result<()> {
@@ -548,6 +583,7 @@ impl App {
             if let Some(config) = &mut self.config {
                 config.reload(None).ok();
                 self.opacity = config.window.opacity;
+                self.font_path = config.font.path.clone();
                 if let Some(renderer) = &mut self.renderer {
                     renderer.reload_config(config);
                 }
@@ -991,6 +1027,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.periodic_sync();
                 self.drain_pty();
 
                 if let Err(e) = self.render() {
@@ -1002,6 +1039,13 @@ impl ApplicationHandler for App {
                 let mouse_tracking = self
                     .active_pane()
                     .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
+                if let Some(window) = &self.window {
+                    if mouse_tracking != MouseTrackingMode::Off {
+                        window.set_cursor(CursorIcon::Crosshair);
+                    } else {
+                        window.set_cursor(CursorIcon::Text);
+                    }
+                }
                 if mouse_tracking == MouseTrackingMode::AnyEvent && !self.selecting {
                     if let Some((row, col)) =
                         self.screen_to_cell(position.x as f32, position.y as f32)
@@ -1100,7 +1144,7 @@ fn main() -> Result<()> {
     info!("Starting ZeroTerm v0.1.0");
 
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
