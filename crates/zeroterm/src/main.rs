@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
 use anyhow::Result;
 use arboard::Clipboard;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -231,7 +231,12 @@ impl App {
         let font_size = config.font.size;
         self.font_size = font_size;
         self.opacity = config.window.opacity;
-        let renderer = pollster::block_on(Renderer::new(window.clone(), font_size, self.opacity))?;
+        let renderer = pollster::block_on(Renderer::new(
+            window.clone(),
+            font_size,
+            self.opacity,
+            config.font.path.clone(),
+        ))?;
 
         let size = window.inner_size();
         let cell_w = font_size * 0.6;
@@ -497,18 +502,37 @@ impl App {
         let mut got_data = false;
         let active = self.active_pane;
         let mut title_changed = None;
+        let mut dead_panes = Vec::new();
         for (&id, pane) in &mut self.panes {
-            while let Ok(data) = pane.pty_rx.try_recv() {
-                pane.parser.parse(&data);
-                if id == active {
-                    let new_title = pane.parser.screen().title().to_string();
-                    if new_title != pane.title {
-                        pane.title = new_title.clone();
-                        title_changed = Some(new_title);
+            loop {
+                match pane.pty_rx.try_recv() {
+                    Ok(data) => {
+                        pane.parser.parse(&data);
+                        if let Some(text) = pane.parser.take_clipboard_text() {
+                            if let Some(clipboard) = &mut self.clipboard {
+                                let _ = clipboard.set_text(text);
+                            }
+                        }
+                        if id == active {
+                            let new_title = pane.parser.screen().title().to_string();
+                            if new_title != pane.title {
+                                pane.title = new_title.clone();
+                                title_changed = Some(new_title);
+                            }
+                        }
+                        got_data = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        pane.parser.parse(b"\r\n[Process exited]\r\n");
+                        dead_panes.push(id);
+                        break;
                     }
                 }
-                got_data = true;
             }
+        }
+        for id in &dead_panes {
+            warn!("Pane {} process exited", id);
         }
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {

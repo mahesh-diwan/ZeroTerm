@@ -113,6 +113,7 @@ impl Config {
                         self.font.line_height = v;
                     }
                 }
+                "font_path" | "font.path" => self.font.path = Some(value.to_string()),
                 "foreground" | "colors.foreground" => self.colors.foreground = value,
                 "background" | "colors.background" => self.colors.background = value,
                 "shell" | "shell.program" => self.shell.program = value,
@@ -192,6 +193,7 @@ pub struct FontConfig {
     pub family: String,
     pub size: f32,
     pub line_height: f32,
+    pub path: Option<String>,
 }
 
 impl Default for FontConfig {
@@ -200,6 +202,7 @@ impl Default for FontConfig {
             family: "JetBrains Mono".to_string(),
             size: 14.0,
             line_height: 1.2,
+            path: None,
         }
     }
 }

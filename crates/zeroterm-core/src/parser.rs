@@ -90,6 +90,7 @@ pub struct Parser {
     bracketed_paste: bool,
     pub pending_images: Vec<ImageFragment>,
     apc_buffer: String,
+    clipboard_text: Option<String>,
 }
 
 impl Parser {
@@ -107,6 +108,7 @@ impl Parser {
             bracketed_paste: false,
             pending_images: Vec::new(),
             apc_buffer: String::new(),
+            clipboard_text: None,
         }
     }
 
@@ -652,7 +654,17 @@ impl Parser {
         } else if osc.starts_with("8;") {
             // Hyperlink - ignored for now
         } else if osc.starts_with("52;") {
-            // Clipboard - ignored for now
+            let payload = &osc[3..];
+            if let Some(semicolon) = payload.find(';') {
+                let base64_data = &payload[semicolon + 1..];
+                if !base64_data.is_empty() {
+                    if let Some(decoded) = decode_base64(base64_data) {
+                        if let Ok(text) = String::from_utf8(decoded) {
+                            self.clipboard_text = Some(text);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -784,6 +796,10 @@ impl Parser {
 
     pub fn take_pending_images(&mut self) -> Vec<ImageFragment> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    pub fn take_clipboard_text(&mut self) -> Option<String> {
+        self.clipboard_text.take()
     }
 }
 

@@ -114,8 +114,8 @@ struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, font_size: f32) -> Result<Self> {
-        let font_data = Self::load_font()?;
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, font_size: f32, font_path: Option<String>) -> Result<Self> {
+        let font_data = Self::load_font(font_path)?;
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Glyph Atlas"),
@@ -206,7 +206,10 @@ impl GlyphAtlas {
         Ok(atlas)
     }
 
-    fn load_font() -> Result<Vec<u8>> {
+    fn load_font(font_path: Option<String>) -> Result<Vec<u8>> {
+        if let Some(path) = font_path {
+            return std::fs::read(&path).map_err(|_| anyhow::anyhow!("Font not found: {}", path));
+        }
         let paths = [
             "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
@@ -375,7 +378,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_size: f32, opacity: f64) -> Result<Self> {
+    pub async fn new(window: Arc<Window>, font_size: f32, opacity: f64, font_path: Option<String>) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -439,7 +442,7 @@ impl Renderer {
         });
 
         // Create glyph atlas first to get actual cell metrics from font
-        let glyph_atlas = GlyphAtlas::new(&device, &queue, font_size)?;
+        let glyph_atlas = GlyphAtlas::new(&device, &queue, font_size, font_path)?;
         let (cell_width, cell_height) = glyph_atlas.cell_metrics();
 
         // Uniform buffer
