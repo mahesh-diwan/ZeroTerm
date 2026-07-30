@@ -161,8 +161,8 @@ impl GlyphAtlas {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
@@ -874,21 +874,17 @@ impl Renderer {
                 1.0,
             ];
 
-            let (u0, v0, u1, v1, glyph_w, glyph_h) = self
+            let (u0, v0, u1, v1, _, _) = self
                 .glyph_atlas
                 .get_or_insert_glyph(cell.ch, &self.device, &self.queue);
-
-            // Center glyph in cell
-            let glyph_x = x + (cell_w - glyph_w) / 2.0;
-            let glyph_y = y + (cell_h - glyph_h);  // bottom-align
 
             let base_offset = (dirty_row * cols + dirty_col) * 6;
             let vertex_start = dirty_vertices.len();
             dirty_offsets.push((base_offset, vertex_start, 6));
 
-            // Two triangles per cell (6 vertices) — glyph-sized quad centered in cell
+            // Two triangles per cell (6 vertices) — full-cell quad, UV maps glyph subrect
             dirty_vertices.push(Vertex {
-                position: [glyph_x, glyph_y],
+                position: [x, y],
                 tex_coord: [u0, v0],
                 color: fg_color,
                 bg_color,
@@ -896,7 +892,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [glyph_x + glyph_w, glyph_y],
+                position: [x + cell_w, y],
                 tex_coord: [u1, v0],
                 color: fg_color,
                 bg_color,
@@ -904,7 +900,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [glyph_x, glyph_y + glyph_h],
+                position: [x, y + cell_h],
                 tex_coord: [u0, v1],
                 color: fg_color,
                 bg_color,
@@ -912,7 +908,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [glyph_x + glyph_w, glyph_y],
+                position: [x + cell_w, y],
                 tex_coord: [u1, v0],
                 color: fg_color,
                 bg_color,
@@ -920,7 +916,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [glyph_x + glyph_w, glyph_y + glyph_h],
+                position: [x + cell_w, y + cell_h],
                 tex_coord: [u1, v1],
                 color: fg_color,
                 bg_color,
@@ -928,7 +924,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [glyph_x, glyph_y + glyph_h],
+                position: [x, y + cell_h],
                 tex_coord: [u0, v1],
                 color: fg_color,
                 bg_color,

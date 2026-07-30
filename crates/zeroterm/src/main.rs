@@ -539,7 +539,12 @@ impl ApplicationHandler for App {
                         }
                     }
                     MouseScrollDelta::PixelDelta(pos) => {
-                        let lines = (pos.y as f32 / 20.0).round() as usize;
+                        let cell_h = self
+                            .renderer
+                            .as_ref()
+                            .map(|r| r.cell_size()[1])
+                            .unwrap_or(20.0);
+                        let lines = (pos.y as f32 / cell_h).round() as usize;
                         if pos.y > 0.0 {
                             self.scroll_up(lines.max(1));
                         } else {
