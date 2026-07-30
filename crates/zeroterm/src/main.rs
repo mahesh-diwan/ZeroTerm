@@ -34,6 +34,7 @@ struct App {
     pty_tx: Option<Sender<PtyCommand>>,
     modifiers: ModifiersState,
     scroll_offset: usize,
+    font_size: f32,
     // Selection state
     selection: Option<Selection>,
     selecting: bool,
@@ -53,6 +54,7 @@ impl App {
             pty_tx: None,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
+            font_size: 14.0,
             selection: None,
             selecting: false,
             mouse_pos: (0.0, 0.0),
@@ -77,6 +79,7 @@ impl App {
         let window = Arc::new(event_loop.create_window(window_attrs)?);
 
         let font_size = config.font.size;
+        self.font_size = font_size;
         let renderer = pollster::block_on(Renderer::new(window.clone(), font_size))?;
 
         let size = window.inner_size();
@@ -324,9 +327,13 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                let font_size = 14.0;
-                let cell_w = font_size * 0.6;
-                let cell_h = font_size * 1.2;
+                let cell_size = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.cell_size())
+                    .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
+                let cell_w = cell_size[0];
+                let cell_h = cell_size[1];
                 let cols = (size.width as f32 / cell_w) as usize;
                 let rows = (size.height as f32 / cell_h) as usize;
 

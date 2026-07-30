@@ -3,7 +3,8 @@ struct Uniforms {
     cell_size: vec2<f32>,
     cursor_pos: vec2<f32>,
     cursor_visible: u32,
-    _padding: vec2<u32>,
+    cols: u32,
+    rows: u32,
 }
 
 @group(0) @binding(0)

@@ -55,7 +55,9 @@ struct Uniforms {
     cell_size: [f32; 2],
     cursor_pos: [f32; 2],
     cursor_visible: u32,
-    _padding: [u32; 3],
+    cols: u32,
+    rows: u32,
+    _padding: [u32; 1],
 }
 
 #[repr(C)]
@@ -131,6 +133,8 @@ struct GlyphAtlas {
     cursor_y: u32,
     row_height: u32,
     font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
 }
 
 impl GlyphAtlas {
@@ -196,7 +200,27 @@ impl GlyphAtlas {
             cursor_y: 0,
             row_height: 0,
             font_size,
+            cell_width: font_size * 0.5,
+            cell_height: font_size * 1.2,
         };
+
+        // Compute cell metrics from font
+        if let Some(font) = FontRef::from_index(&atlas.font_data, 0) {
+            let metrics = font.metrics(&[]);
+            let scale = atlas.font_size / metrics.units_per_em as f32;
+            let ascent = metrics.ascent * scale;
+            let descent = metrics.descent * scale;
+            let leading = metrics.leading * scale;
+            atlas.cell_height = (ascent + descent + leading).ceil();
+            let mut scaler = atlas.scale_context.builder(font).size(atlas.font_size).build();
+            let charmap = font.charmap();
+            if let Some(img) = Render::new(&[Source::Outline])
+                .format(swash::zeno::Format::Alpha)
+                .render(&mut scaler, charmap.map(0x57u32))
+            {
+                atlas.cell_width = img.placement.width as f32;
+            }
+        }
 
         // Pre-pack ASCII printable characters
         for ch in 32u8..=126 {
@@ -227,10 +251,11 @@ impl GlyphAtlas {
         ch: char,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> (f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, f32, f32) {
         let key = ch as u32;
         if let Some(info) = self.glyph_cache.get(&key) {
-            return self.info_to_uv(info);
+            let uv = self.info_to_uv(info);
+            return (uv.0, uv.1, uv.2, uv.3, info.width as f32, info.height as f32);
         }
 
         let font = match FontRef::from_index(&self.font_data, 0) {
@@ -251,7 +276,8 @@ impl GlyphAtlas {
             Some(img) if img.placement.width > 0 && img.placement.height > 0 => {
                 let info = self.pack_glyph(&img, device, queue);
                 self.glyph_cache.insert(key, info);
-                self.info_to_uv(&info)
+                let uv = self.info_to_uv(&info);
+                (uv.0, uv.1, uv.2, uv.3, info.width as f32, info.height as f32)
             }
             _ => self.fallback_uv(),
         }
@@ -338,9 +364,13 @@ impl GlyphAtlas {
         (u0, v0, u1, v1)
     }
 
-    fn fallback_uv(&self) -> (f32, f32, f32, f32) {
+    fn cell_metrics(&self) -> (f32, f32) {
+        (self.cell_width, self.cell_height)
+    }
+
+    fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32) {
         // 1x1 transparent pixel — alpha=0, bg shows through
-        (0.0, 0.0, 1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32)
+        (0.0, 0.0, 1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32, 0.0, 0.0)
     }
 }
 
@@ -421,15 +451,21 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
+        // Create glyph atlas first to get actual cell metrics from font
+        let glyph_atlas = GlyphAtlas::new(&device, &queue, font_size)?;
+        let (cell_width, cell_height) = glyph_atlas.cell_metrics();
+
         // Uniform buffer
-        let cell_width = font_size * 0.6;
-        let cell_height = font_size * 1.2;
+        let cols = (size.width as f32 / cell_width).ceil() as u32;
+        let rows = (size.height as f32 / cell_height).ceil() as u32;
         let uniforms = Uniforms {
             screen_size: [size.width as f32, size.height as f32],
             cell_size: [cell_width, cell_height],
             cursor_pos: [0.0, 0.0],
             cursor_visible: 0,
-            _padding: [0, 0, 0],
+            cols,
+            rows,
+            _padding: [0],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
@@ -460,9 +496,6 @@ impl Renderer {
                 resource: uniform_buffer.as_entire_binding(),
             }],
         });
-
-        // Create glyph atlas
-        let glyph_atlas = GlyphAtlas::new(&device, &queue, font_size)?;
 
         // Atlas bind group layout
         let atlas_bind_group_layout =
@@ -546,9 +579,7 @@ impl Renderer {
         });
 
         // Vertex buffer - pre-allocate for full screen (cols * rows * 6 vertices per cell)
-        let cols = (size.width as f32 / cell_width).ceil() as usize;
-        let rows = (size.height as f32 / cell_height).ceil() as usize;
-        let vertex_buffer_capacity = cols * rows * 6;
+        let vertex_buffer_capacity = (cols as usize) * (rows as usize) * 6;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Vertex Buffer"),
             size: (std::mem::size_of::<Vertex>() * vertex_buffer_capacity) as u64,
@@ -613,7 +644,9 @@ impl Renderer {
             cell_size: self.cell_size,
             cursor_pos: [0.0, 0.0],
             cursor_visible: 0,
-            _padding: [0, 0, 0],
+            cols: new_cols as u32,
+            rows: new_rows as u32,
+            _padding: [0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -682,7 +715,9 @@ impl Renderer {
                 cursor.row as f32 * self.cell_size[1],
             ],
             cursor_visible: if cursor.visible { 1 } else { 0 },
-            _padding: [0, 0, 0],
+            cols: cols as u32,
+            rows: visible_rows as u32,
+            _padding: [0],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -839,17 +874,21 @@ impl Renderer {
                 1.0,
             ];
 
-            let (u0, v0, u1, v1) = self
+            let (u0, v0, u1, v1, glyph_w, glyph_h) = self
                 .glyph_atlas
                 .get_or_insert_glyph(cell.ch, &self.device, &self.queue);
+
+            // Center glyph in cell
+            let glyph_x = x + (cell_w - glyph_w) / 2.0;
+            let glyph_y = y + (cell_h - glyph_h);  // bottom-align
 
             let base_offset = (dirty_row * cols + dirty_col) * 6;
             let vertex_start = dirty_vertices.len();
             dirty_offsets.push((base_offset, vertex_start, 6));
 
-            // Two triangles per cell (6 vertices)
+            // Two triangles per cell (6 vertices) — glyph-sized quad centered in cell
             dirty_vertices.push(Vertex {
-                position: [x, y],
+                position: [glyph_x, glyph_y],
                 tex_coord: [u0, v0],
                 color: fg_color,
                 bg_color,
@@ -857,7 +896,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [x + cell_w, y],
+                position: [glyph_x + glyph_w, glyph_y],
                 tex_coord: [u1, v0],
                 color: fg_color,
                 bg_color,
@@ -865,7 +904,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [x, y + cell_h],
+                position: [glyph_x, glyph_y + glyph_h],
                 tex_coord: [u0, v1],
                 color: fg_color,
                 bg_color,
@@ -873,7 +912,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [x + cell_w, y],
+                position: [glyph_x + glyph_w, glyph_y],
                 tex_coord: [u1, v0],
                 color: fg_color,
                 bg_color,
@@ -881,7 +920,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [x + cell_w, y + cell_h],
+                position: [glyph_x + glyph_w, glyph_y + glyph_h],
                 tex_coord: [u1, v1],
                 color: fg_color,
                 bg_color,
@@ -889,7 +928,7 @@ impl Renderer {
                 attrs,
             });
             dirty_vertices.push(Vertex {
-                position: [x, y + cell_h],
+                position: [glyph_x, glyph_y + glyph_h],
                 tex_coord: [u0, v1],
                 color: fg_color,
                 bg_color,
