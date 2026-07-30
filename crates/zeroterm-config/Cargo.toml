@@ -1,6 +1,6 @@
 [package]
 name = "zeroterm-config"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "TOML parser, Lua runtime, and GUI settings for ZeroTerm"
@@ -15,6 +15,7 @@ toml = { workspace = true }
 mlua = { workspace = true }
 dirs = { workspace = true }
 zeroterm-core = { path = "../zeroterm-core" }
+whoami = "1.5"
 
 [dev-dependencies]
 criterion = { workspace = true }

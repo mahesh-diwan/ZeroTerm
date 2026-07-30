@@ -6,6 +6,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub key_path: String,
+    pub auto_connect: bool,
+}
+
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            user: whoami::username(),
+            key_path: String::new(),
+            auto_connect: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub font: FontConfig,
     pub colors: ColorConfig,
@@ -13,6 +34,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub ai: AiConfig,
     pub sync: SyncConfig,
+    pub ssh: SshConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +72,7 @@ impl Default for Config {
             window: WindowConfig::default(),
             ai: AiConfig::default(),
             sync: SyncConfig::default(),
+            ssh: SshConfig::default(),
         }
     }
 }
@@ -104,6 +127,19 @@ impl Config {
                     }
                 }
                 "ai_endpoint" | "ai.endpoint" => self.ai.endpoint = value,
+                "ssh_host" | "ssh.host" => self.ssh.host = value,
+                "ssh_user" | "ssh.user" => self.ssh.user = value,
+                "ssh_port" | "ssh.port" => {
+                    if let Ok(v) = value.parse::<u16>() {
+                        self.ssh.port = v;
+                    }
+                }
+                "ssh_key_path" | "ssh.key_path" => self.ssh.key_path = value,
+                "ssh_auto_connect" | "ssh.auto_connect" => {
+                    if let Ok(v) = value.parse::<bool>() {
+                        self.ssh.auto_connect = v;
+                    }
+                }
                 _ => {}
             }
         }
@@ -141,6 +177,7 @@ impl Config {
         self.window = new_config.window;
         self.ai = new_config.ai;
         self.sync = new_config.sync;
+        self.ssh = new_config.ssh;
         Ok(())
     }
 }

@@ -649,6 +649,20 @@ impl Renderer {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 })
             };
+            self.uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Uniform + Storage Bind Group"),
+                layout: &self.render_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(self.uniform_buffer.as_entire_buffer_binding()),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(self.cell_buffer.as_entire_buffer_binding()),
+                    },
+                ],
+            });
         }
 
         let uniforms = Uniforms {
@@ -753,7 +767,6 @@ impl Renderer {
         let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
         let cursor = screen.cursor();
         let cursor_col = cursor.col;
-        let cursor_row_global = cursor.row;
         let cursor_visible = cursor.visible;
         let cursor_shape = cursor.shape;
 
@@ -763,8 +776,6 @@ impl Renderer {
 
         let end = total_rows.saturating_sub(scroll_offset);
         let start = end.saturating_sub(visible_rows);
-
-        let cursor_in_range = cursor_row_global < total_rows && cursor_row_global >= start;
 
         for &(dirty_row, dirty_col) in &self.dirty_cells {
             if dirty_row >= visible_rows || dirty_col >= cols {
@@ -787,9 +798,8 @@ impl Renderer {
             let fg = cell.fg;
             let bg = cell.bg;
 
-            let is_cursor_row = cursor_in_range && combined_idx == cursor_row_global;
-            let is_cursor_cell = is_cursor_row && dirty_col == cursor_col;
-            let (fg, bg, cell_attrs) = if cursor_visible && is_cursor_cell {
+            let is_cursor_cell = cursor_visible && scroll_offset == 0 && dirty_row == cursor.row && dirty_col == cursor_col;
+            let (fg, bg, cell_attrs) = if is_cursor_cell {
                 match cursor_shape {
                     zeroterm_core::cell::CursorShape::Block => (bg, fg, cell.attrs),
                     zeroterm_core::cell::CursorShape::Underline => {
@@ -807,13 +817,13 @@ impl Renderer {
 
             let attrs = ((cell_attrs.bold as u32) << 0)
                 | ((cell_attrs.italic as u32) << 1)
-                | ((cell_attrs.underline as u32) << 2)
+                | (((cell_attrs.underline != zeroterm_core::cell::UnderlineStyle::None) as u32) << 2)
                 | ((cell_attrs.strikethrough as u32) << 3)
                 | ((cell_attrs.dim as u32) << 4)
                 | ((cell_attrs.blink as u32) << 5)
                 | ((cell_attrs.reverse as u32) << 6)
                 | ((cell_attrs.invisible as u32) << 7)
-                | (if cursor_visible && is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
+                | (if is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
                 | (if is_selected { 0x200u32 } else { 0 });
 
             let fg_color = [fg.r as f32 / 255.0, fg.g as f32 / 255.0, fg.b as f32 / 255.0, 1.0];

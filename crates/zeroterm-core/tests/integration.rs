@@ -654,3 +654,219 @@ fn test_color_ansi_256_bounds() {
     assert_eq!(white.g, 255);
     assert_eq!(white.b, 255);
 }
+
+// --------------------- AI block detection (via screen API) ---------------------
+
+#[test]
+fn test_mark_block_boundary_creates_block() {
+    let mut p = setup(80, 24);
+    p.screen_mut().set_block_command("ls -la");
+    p.screen_mut().mark_block_boundary();
+    let blocks = p.screen().blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].command, "ls -la");
+    assert_eq!(blocks[0].id, 0);
+    assert!(blocks[0].end_line.is_none());
+}
+
+#[test]
+fn test_multiple_blocks_increment_id() {
+    let mut p = setup(80, 24);
+    p.screen_mut().set_block_command("cmd1");
+    p.screen_mut().mark_block_boundary();
+    p.screen_mut().set_block_command("cmd2");
+    p.screen_mut().mark_block_boundary();
+    let blocks = p.screen().blocks();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].id, 0);
+    assert_eq!(blocks[1].id, 1);
+    assert_eq!(blocks[1].command, "cmd2");
+}
+
+#[test]
+fn test_block_exit_code_set_directly() {
+    let mut p = setup(80, 24);
+    p.screen_mut().mark_block_boundary();
+    p.screen_mut().set_block_exit_code(42);
+    assert_eq!(p.screen().blocks().last().unwrap().exit_code, Some(42));
+}
+
+// --------------------- wide character handling ---------------------
+
+#[test]
+fn test_cjk_cell_width() {
+    use zeroterm_core::cell::Cell;
+    assert_eq!(Cell::new('a').width(), 1);
+    assert_eq!(Cell::new(' ').width(), 1);
+    assert_eq!(Cell::new('\u{4e00}').width(), 2);
+    assert_eq!(Cell::new('\u{4e8c}').width(), 2);
+}
+
+// --------------------- tab stops ---------------------
+
+#[test]
+fn test_tab_advances_through_stops() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x09");
+    assert_eq!(p.screen().cursor().col, 8);
+    p.parse(b"\x09");
+    assert_eq!(p.screen().cursor().col, 16);
+    p.parse(b"\x09");
+    assert_eq!(p.screen().cursor().col, 24);
+}
+
+#[test]
+fn test_tab_clear_all_no_stops() {
+    let mut p = setup(80, 24);
+    p.screen_mut().tab_clear_all();
+    p.parse(b"\x09");
+    assert_eq!(p.screen().cursor().col, 79);
+}
+
+#[test]
+fn test_tab_set_at_cursor() {
+    let mut p = setup(80, 24);
+    p.screen_mut().tab_clear_all();
+    p.screen_mut().cursor_col(15);
+    p.screen_mut().tab_set();
+    p.screen_mut().cursor_col(1);
+    p.parse(b"\x09");
+    assert_eq!(p.screen().cursor().col, 14);
+}
+
+// --------------------- alternate screen buffer ---------------------
+
+#[test]
+fn test_alternate_screen_preserves_normal_buffer() {
+    let mut p = setup(80, 24);
+    p.parse(b"Normal");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'N');
+    p.screen_mut().set_alternate_screen(true);
+    // alt screen starts empty; cursor at (0,5) from "Normal"
+    assert!(p.screen().cell(0, 0).unwrap().is_empty());
+    p.parse(b"\x1b[HAlt");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'A');
+    p.screen_mut().set_alternate_screen(false);
+    // normal buffer restored
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'N');
+}
+
+// --------------------- insert/delete line stress ---------------------
+
+#[test]
+fn test_insert_lines_operates_from_scroll_top() {
+    let mut p = setup(10, 5);
+    p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
+    p.parse(b"\x1b[2L");
+    let screen = p.screen();
+    // ponytail: IL always inserts at scroll_top (0), not cursor row
+    assert!(screen.cell(0, 0).unwrap().is_empty());
+    assert!(screen.cell(1, 0).unwrap().is_empty());
+    assert_eq!(screen.cell(2, 0).unwrap().ch, 'A');
+    assert_eq!(screen.cell(3, 0).unwrap().ch, 'B');
+    assert_eq!(screen.cell(4, 0).unwrap().ch, 'C');
+}
+
+#[test]
+fn test_delete_lines_operates_from_scroll_top() {
+    let mut p = setup(10, 5);
+    p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
+    p.parse(b"\x1b[2M");
+    let screen = p.screen();
+    // ponytail: DL always deletes from scroll_top (0), not cursor row
+    assert_eq!(screen.cell(0, 0).unwrap().ch, 'C');
+    assert_eq!(screen.cell(1, 0).unwrap().ch, 'D');
+    assert_eq!(screen.cell(2, 0).unwrap().ch, 'E');
+    assert!(screen.cell(3, 0).unwrap().is_empty());
+    assert!(screen.cell(4, 0).unwrap().is_empty());
+}
+
+// --------------------- scroll region + cursor (partial: DECSTBM not implemented) ---------------------
+// ponytail: DECSTBM (\e[3;5r) not implemented in parser, testing cursor bounds with origin mode
+
+#[test]
+fn test_cursor_bounded_by_origin_mode() {
+    let mut p = setup(80, 24);
+    p.screen_mut().set_origin_mode(true);
+    p.screen_mut().cursor_pos(3, 5);
+    assert_eq!(p.screen().cursor().row, 2);
+    assert_eq!(p.screen().cursor().col, 4);
+}
+
+// --------------------- OSC sequences ---------------------
+
+#[test]
+fn test_osc_1_icon_name_not_implemented() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]1;IconTitle\x07");
+    // ponytail: OSC 1 not implemented; only OSC 0/2 set title
+    assert_eq!(p.screen().title(), "");
+}
+
+#[test]
+fn test_osc_0_and_2_both_set_title() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]0;WindowTitle\x07");
+    assert_eq!(p.screen().title(), "WindowTitle");
+    p.parse(b"\x1b]2;NewTitle\x07");
+    assert_eq!(p.screen().title(), "NewTitle");
+}
+
+// --------------------- RIS full reset ---------------------
+
+#[test]
+fn test_ris_resets_attributes_fully() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b[1;31;42mX\x1b[5;10H");
+    // Before reset: bold, red fg, green bg, cursor at row 4 col 9
+    let x = p.screen().cell(0, 0).unwrap();
+    assert!(x.attrs.bold);
+    assert_eq!(x.fg, Color::from_ansi_16(1));
+    assert_eq!(x.bg, Color::from_ansi_16(2));
+    assert_eq!(p.screen().cursor().row, 4);
+    assert_eq!(p.screen().cursor().col, 9);
+    // RIS resets everything including cursor and attrs; buffer cleared
+    p.parse(b"\x1bc");
+    let screen = p.screen();
+    assert_eq!(screen.cursor().row, 0);
+    assert_eq!(screen.cursor().col, 0);
+    assert!(screen.cursor().visible);
+    assert!(screen.cell(0, 0).unwrap().is_empty());
+}
+
+// --------------------- multi-line paste ---------------------
+
+#[test]
+fn test_multi_line_paste_content() {
+    let mut p = setup(20, 10);
+    p.parse(b"abc\r\ndef\r\nghi");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'a');
+    assert_eq!(p.screen().cell(1, 0).unwrap().ch, 'd');
+    assert_eq!(p.screen().cell(2, 0).unwrap().ch, 'g');
+    assert_eq!(p.screen().cursor().row, 2);
+}
+
+// --------------------- backspace + wraparound ---------------------
+
+#[test]
+fn test_backspace_stays_at_zero_col() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x08");
+    assert_eq!(p.screen().cursor().col, 0);
+}
+
+#[test]
+fn test_backspace_moves_left() {
+    let mut p = setup(80, 24);
+    p.parse(b"AB\x08");
+    assert_eq!(p.screen().cursor().col, 1);
+    assert_eq!(p.screen().cursor().row, 0);
+}
+
+#[test]
+fn test_backspace_at_zero_with_wraparound_off() {
+    let mut p = setup(80, 24);
+    p.screen_mut().set_autowrap(false);
+    p.parse(b"\x08");
+    assert_eq!(p.screen().cursor().col, 0);
+}

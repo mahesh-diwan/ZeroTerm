@@ -7,6 +7,7 @@ members = [
     "crates/zeroterm-config",
     "crates/zeroterm-ai",
     "crates/zeroterm-sync",
+    "crates/zeroterm-ssh",
     "crates/zeroterm",
 ]
 
@@ -34,6 +35,11 @@ zeroize = "1.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 criterion = "0.5"
 dirs = "5.0"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
 
 [profile.dev]
 opt-level = 1

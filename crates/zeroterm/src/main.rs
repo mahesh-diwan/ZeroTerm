@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -76,6 +77,68 @@ fn spawn_pty_process(
                 Err(_) => break,
             }
         }
+    });
+
+    Ok((pty_rx, pty_tx))
+}
+
+fn spawn_ssh_process(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    key_path: Option<&Path>,
+    cols: usize,
+    rows: usize,
+) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
+    let host = host.to_string();
+    let user = user.to_string();
+    let password = password.map(|s| s.to_string());
+    let key_path = key_path.map(|p| p.to_path_buf());
+
+    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
+    let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
+
+    std::thread::spawn(move || {
+        let mut ssh = zeroterm_ssh::client::SshSession::new();
+        if let Err(e) = ssh.connect(&host, port, &user, password.as_deref(), key_path.as_deref()) {
+            let _ = output_tx.send(format!("\r\n\x1b[31mSSH: {}\x1b[0m\r\n", e).into_bytes());
+            return;
+        }
+        if let Err(e) = ssh.resize(cols as u32, rows as u32) {
+            let _ =
+                output_tx.send(format!("\r\n\x1b[31mSSH resize: {}\x1b[0m\r\n", e).into_bytes());
+        }
+
+        let mut buf = [0u8; 4096];
+        loop {
+            while let Ok(cmd) = input_rx.try_recv() {
+                match cmd {
+                    PtyCommand::Write(data) => {
+                        if ssh.write(&data).is_err() {
+                            return;
+                        }
+                    }
+                    PtyCommand::Resize(size) => {
+                        let _ = ssh.resize(size.cols as u32, size.rows as u32);
+                    }
+                    PtyCommand::Kill => {
+                        let _ = ssh.disconnect();
+                        return;
+                    }
+                }
+            }
+            match ssh.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = ssh.disconnect();
     });
 
     Ok((pty_rx, pty_tx))
@@ -339,6 +402,51 @@ impl App {
                 window.request_redraw();
             }
         }
+    }
+
+    fn connect_ssh(&mut self, host: &str, user: &str, port: u16) -> Result<()> {
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let cell_size = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_size())
+                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
+            let cell_w = cell_size[0];
+            let cell_h = cell_size[1];
+            let cols = (size.width as f32 / cell_w) as usize;
+            let rows = (size.height as f32 / cell_h) as usize;
+
+            let key_path = self
+                .config
+                .as_ref()
+                .and_then(|c| {
+                    if c.ssh.key_path.is_empty() {
+                        None
+                    } else {
+                        Some(c.ssh.key_path.as_str())
+                    }
+                })
+                .map(Path::new);
+
+            let (pty_rx, pty_tx) = spawn_ssh_process(host, port, user, None, key_path, cols, rows)?;
+            let parser = Parser::new(cols, rows);
+            let id = self.next_pane_id;
+            self.next_pane_id += 1;
+            self.panes.insert(
+                id,
+                PaneState {
+                    parser,
+                    pty_rx,
+                    pty_tx,
+                    title: format!("SSH: {}@{}", user, host),
+                },
+            );
+            self.active_pane = id;
+            self.scroll_offset = 0;
+            self.tab_manager.add_tab(Tab::new(id));
+        }
+        Ok(())
     }
 
     fn ai_explain(&self) {
@@ -641,6 +749,20 @@ impl ApplicationHandler for App {
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyI {
                             self.ai_explain();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyS {
+                            if let Some(config) = &self.config {
+                                if !config.ssh.host.is_empty() {
+                                    let host = config.ssh.host.clone();
+                                    let user = config.ssh.user.clone();
+                                    let port = config.ssh.port;
+                                    if let Err(e) = self.connect_ssh(&host, &user, port) {
+                                        error!("SSH connect failed: {}", e);
+                                    }
+                                    self.update_window_title();
+                                }
+                            }
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::Tab {

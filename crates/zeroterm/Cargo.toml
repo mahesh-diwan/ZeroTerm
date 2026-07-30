@@ -1,6 +1,6 @@
 [package]
 name = "zeroterm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "ZeroTerm - GPU-accelerated terminal emulator"
@@ -21,6 +21,7 @@ zeroterm-mux = { path = "../zeroterm-mux" }
 zeroterm-config = { path = "../zeroterm-config" }
 zeroterm-ai = { path = "../zeroterm-ai" }
 zeroterm-sync = { path = "../zeroterm-sync" }
+zeroterm-ssh = { path = "../zeroterm-ssh" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 notify = { version = "7", features = ["macos_kqueue"] }
 

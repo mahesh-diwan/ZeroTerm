@@ -1,0 +1,10 @@
+[package]
+name = "zeroterm-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+log = "0.4"
+ssh2 = "0.9"

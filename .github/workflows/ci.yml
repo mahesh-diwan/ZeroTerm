@@ -17,3 +17,5 @@ jobs:
         run: cargo test --workspace
       - name: Check formatting
         run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
