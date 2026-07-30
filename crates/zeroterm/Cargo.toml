@@ -22,6 +22,7 @@ zeroterm-config = { path = "../zeroterm-config" }
 zeroterm-ai = { path = "../zeroterm-ai" }
 zeroterm-sync = { path = "../zeroterm-sync" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
+notify = { version = "7", features = ["macos_kqueue"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

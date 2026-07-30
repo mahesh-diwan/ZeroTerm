@@ -1,10 +1,14 @@
 name: Release
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
         description: "Release version"
         required: true
+
 jobs:
   build:
     strategy:
@@ -31,3 +35,57 @@ jobs:
         with:
           name: zeroterm-${{ matrix.target }}
           path: target/release/zeroterm${{ matrix.suffix }}
+
+  appimage:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install appimagetool
+        run: |
+          sudo wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
+          sudo chmod +x /usr/local/bin/appimagetool
+      - name: Build AppImage
+        run: bash scripts/build-appimage.sh
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroterm-x86_64.AppImage
+          path: zeroterm-*.AppImage
+
+  flatpak:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Flatpak and deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --noninteractive org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+          flatpak install -y --noninteractive org.freedesktop.Sdk.Extension.rust-stable//24.08
+      - name: Build Flatpak
+        run: flatpak-builder --repo=repo --force-clean build-dir scripts/io.github.zeroterm.ZeroTerm.yml
+      - name: Bundle Flatpak
+        run: flatpak build-bundle repo zeroterm.flatpak io.github.zeroterm.ZeroTerm
+      - name: Upload Flatpak
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroterm.flatpak
+          path: zeroterm.flatpak
+
+  deb:
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Build .deb package
+        run: bash scripts/build-deb.sh
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroterm.deb
+          path: zeroterm_*.deb

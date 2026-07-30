@@ -109,7 +109,7 @@ impl Config {
         }
     }
 
-    fn default_config_path() -> PathBuf {
+    pub fn default_config_path() -> PathBuf {
         if let Some(config_dir) = dirs::config_dir() {
             config_dir.join("zeroterm").join("config.toml")
         } else {
@@ -130,6 +130,17 @@ impl Config {
 
         let contents = toml::to_string_pretty(self)?;
         fs::write(config_path, contents)?;
+        Ok(())
+    }
+
+    pub fn reload(&mut self, path: Option<&Path>) -> Result<(), anyhow::Error> {
+        let new_config = Self::load(path)?;
+        self.font = new_config.font;
+        self.colors = new_config.colors;
+        self.shell = new_config.shell;
+        self.window = new_config.window;
+        self.ai = new_config.ai;
+        self.sync = new_config.sync;
         Ok(())
     }
 }

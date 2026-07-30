@@ -1,0 +1,34 @@
+id: io.github.zeroterm.ZeroTerm
+runtime: org.freedesktop.Platform//24.08
+sdk: org.freedesktop.Sdk//24.08
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/zeroterm/cargo
+    RUST_BACKTRACE: "1"
+
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=x11
+  - --device=dri
+
+modules:
+  - name: zeroterm
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --frozen
+      - install -Dm755 target/release/zeroterm -t /app/bin/
+      - install -Dm644 scripts/io.github.zeroterm.ZeroTerm.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 io.github.zeroterm.ZeroTerm.desktop -t /app/share/applications/
+      - install -Dm644 io.github.zeroterm.ZeroTerm.svg -t /app/share/icons/hicolor/scalable/apps/
+    sources:
+      - type: dir
+        path: ../..
+      - type: file
+        path: io.github.zeroterm.ZeroTerm.desktop
+      - type: file
+        path: io.github.zeroterm.ZeroTerm.svg

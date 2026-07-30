@@ -16,6 +16,7 @@ swash = { workspace = true }
 bytemuck = "1"
 log = "0.4"
 zeroterm-core = { path = "../zeroterm-core" }
+zeroterm-config = { path = "../zeroterm-config" }
 
 [dev-dependencies]
 criterion = { workspace = true }

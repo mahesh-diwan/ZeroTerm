@@ -18,6 +18,8 @@ poly1305 = { workspace = true }
 zeroize = "1.8"
 rand = "0.8"
 zeroterm-core = { path = "../zeroterm-core" }
+zeroterm-config = { path = "../zeroterm-config" }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

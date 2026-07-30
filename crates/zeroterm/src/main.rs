@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 
@@ -99,6 +100,8 @@ struct App {
     shell_args: Vec<String>,
     ai_client: Option<Arc<AiClient>>,
     sync_daemon: Option<SyncDaemon>,
+    config_changed: Arc<AtomicBool>,
+    config: Option<Config>,
 }
 
 #[allow(dead_code)]
@@ -122,6 +125,8 @@ impl App {
             shell_args: vec![],
             ai_client: None,
             sync_daemon: None,
+            config_changed: Arc::new(AtomicBool::new(false)),
+            config: None,
         }
     }
 
@@ -203,6 +208,37 @@ impl App {
         } else {
             Some(SyncDaemon::new(config.sync.server_url.clone()))
         };
+
+        self.config = Some(config);
+
+        // Start config file watcher
+        let config_path = Config::default_config_path();
+        let config_dir = config_path.parent().unwrap().to_path_buf();
+        let changed = self.config_changed.clone();
+
+        std::thread::spawn(move || {
+            use notify::{EventKind, RecursiveMode, Watcher};
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher = match notify::recommended_watcher(
+                move |res: Result<notify::Event, notify::Error>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                            let _ = tx.send(());
+                        }
+                    }
+                },
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to start config watcher: {}", e);
+                    return;
+                }
+            };
+            let _ = watcher.watch(&config_dir, RecursiveMode::NonRecursive);
+            while rx.recv().is_ok() {
+                changed.store(true, Ordering::SeqCst);
+            }
+        });
 
         info!("ZeroTerm initialized: {}x{} ({})", cols, rows, shell);
         Ok(())
@@ -370,6 +406,15 @@ impl App {
     }
 
     fn render(&mut self) -> Result<()> {
+        if self.config_changed.load(Ordering::SeqCst) {
+            self.config_changed.store(false, Ordering::SeqCst);
+            if let Some(config) = &mut self.config {
+                config.reload(None).ok();
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.reload_config(config);
+                }
+            }
+        }
         if let Some(renderer) = &mut self.renderer {
             if let Some(pane) = self.panes.get(&self.active_pane) {
                 renderer.render(pane.parser.screen(), self.scroll_offset, self.selection)?;

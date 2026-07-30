@@ -10,7 +10,6 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use zeroterm_core::cell::Cell;
 use zeroterm_core::screen::Screen as CoreScreen;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -363,10 +362,9 @@ pub struct Renderer {
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
-    prev_buffer: Option<Vec<Vec<Cell>>>,
     cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
-    selection: Option<Selection>,
+    clear_color: [f64; 3],
 }
 
 impl Renderer {
@@ -617,10 +615,9 @@ impl Renderer {
             atlas_bind_group,
             glyph_atlas,
             cell_size: [cell_width, cell_height],
-            prev_buffer: None,
             cell_buffer_capacity,
             dirty_cells: Vec::new(),
-            selection: None,
+            clear_color: [0.117, 0.117, 0.117],
         })
     }
 
@@ -652,8 +649,6 @@ impl Renderer {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 })
             };
-            // Reset prev_buffer on resize to force full rebuild
-            self.prev_buffer = None;
         }
 
         let uniforms = Uniforms {
@@ -679,41 +674,11 @@ impl Renderer {
         let visible_rows = buffer.len();
         let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
 
-        // Dirty tracking: compare with previous frame
+        // All cells dirty every frame — GPU handles <200KB writes trivially
         self.dirty_cells.clear();
-        let is_first_frame = self.prev_buffer.is_none();
-        
-        if is_first_frame {
-            // First frame: all cells are dirty
-            for row in 0..visible_rows {
-                for col in 0..cols {
-                    self.dirty_cells.push((row, col));
-                }
-            }
-        } else if let Some(ref prev) = self.prev_buffer {
-            // Compare current buffer with previous
-            for row in 0..visible_rows.min(prev.len()) {
-                let curr_row = &buffer[row];
-                let prev_row = &prev[row];
-                for col in 0..cols.min(prev_row.len()) {
-                    if curr_row[col] != prev_row[col] {
-                        self.dirty_cells.push((row, col));
-                    }
-                }
-                // Handle case where cols changed
-                if cols > prev_row.len() {
-                    for col in prev_row.len()..cols {
-                        self.dirty_cells.push((row, col));
-                    }
-                }
-            }
-            // Handle case where rows changed
-            if visible_rows > prev.len() {
-                for row in prev.len()..visible_rows {
-                    for col in 0..cols {
-                        self.dirty_cells.push((row, col));
-                    }
-                }
+        for row in 0..visible_rows {
+            for col in 0..cols {
+                self.dirty_cells.push((row, col));
             }
         }
 
@@ -754,9 +719,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.117,
-                            g: 0.117,
-                            b: 0.117,
+                            r: self.clear_color[0],
+                            g: self.clear_color[1],
+                            b: self.clear_color[2],
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -778,9 +743,6 @@ impl Renderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-
-        // Store current buffer for next frame
-        self.prev_buffer = Some(buffer.iter().map(|row| row.to_vec()).collect());
 
         Ok(())
     }
@@ -877,5 +839,23 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    pub fn reload_config(&mut self, config: &zeroterm_config::Config) {
+        if let Some((r, g, b)) = Self::parse_hex_color(&config.colors.background) {
+            self.clear_color = [r, g, b];
+        }
+    }
+
+    fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {
+        let hex = hex.trim_start_matches('#');
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f64 / 255.0;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f64 / 255.0;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f64 / 255.0;
+            Some((r, g, b))
+        } else {
+            None
+        }
     }
 }
