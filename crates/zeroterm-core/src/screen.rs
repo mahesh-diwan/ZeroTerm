@@ -3,6 +3,16 @@
 use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone)]
+pub struct CommandBlock {
+    pub id: usize,
+    pub start_line: usize,
+    pub end_line: Option<usize>,
+    pub command: String,
+    pub exit_code: Option<i32>,
+    pub timestamp: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
     pub cols: usize,
@@ -43,6 +53,9 @@ pub struct Screen {
     ident_callback: Option<Box<dyn Fn() + Send + Sync>>,
     status_callback: Option<Box<dyn Fn() + Send + Sync>>,
     cursor_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    blocks: Vec<CommandBlock>,
+    block_id_counter: usize,
+    current_block_command: String,
 }
 
 impl Screen {
@@ -80,6 +93,9 @@ impl Screen {
             ident_callback: None,
             status_callback: None,
             cursor_callback: None,
+            blocks: Vec::new(),
+            block_id_counter: 0,
+            current_block_command: String::new(),
         }
     }
 
@@ -693,5 +709,37 @@ impl Screen {
 
     pub fn on_cursor_report(&mut self, f: impl Fn() + Send + Sync + 'static) {
         self.cursor_callback = Some(Box::new(f));
+    }
+
+    pub fn mark_block_boundary(&mut self) {
+        if let Some(block) = self.blocks.last_mut() {
+            if block.end_line.is_none() {
+                block.end_line = Some(self.cursor.row);
+            }
+        }
+        let id = self.block_id_counter;
+        self.block_id_counter += 1;
+        self.blocks.push(CommandBlock {
+            id,
+            start_line: self.cursor.row,
+            end_line: None,
+            command: std::mem::take(&mut self.current_block_command),
+            exit_code: None,
+            timestamp: std::time::Instant::now(),
+        });
+    }
+
+    pub fn blocks(&self) -> &[CommandBlock] {
+        &self.blocks
+    }
+
+    pub fn set_block_command(&mut self, cmd: &str) {
+        self.current_block_command = cmd.to_string();
+    }
+
+    pub fn set_block_exit_code(&mut self, code: i32) {
+        if let Some(block) = self.blocks.last_mut() {
+            block.exit_code = Some(code);
+        }
     }
 }

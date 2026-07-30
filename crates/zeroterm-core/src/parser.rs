@@ -66,6 +66,9 @@ pub struct Parser {
     osc_buffer: String,
     dcs_buffer: String,
     screen: crate::screen::Screen,
+    after_newline: bool,
+    command_buf: String,
+    collecting_command: bool,
 }
 
 impl Parser {
@@ -76,6 +79,9 @@ impl Parser {
             osc_buffer: String::new(),
             dcs_buffer: String::new(),
             screen: crate::screen::Screen::new(cols, rows),
+            after_newline: false,
+            command_buf: String::new(),
+            collecting_command: false,
         }
     }
 
@@ -91,6 +97,10 @@ impl Parser {
 
     pub fn screen_mut(&mut self) -> &mut crate::screen::Screen {
         &mut self.screen
+    }
+
+    pub fn set_exit_code(&mut self, code: i32) {
+        self.screen.set_block_exit_code(code);
     }
 
     fn handle_byte(&mut self, byte: u8) {
@@ -115,7 +125,21 @@ impl Parser {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F | 0x18 | 0x1A | 0x7F => self.execute_control(byte),
             0x1B => self.state = ParserState::Escape,
-            0x20..=0x7E => self.screen.put_char(byte as char),
+            0x20..=0x7E => {
+                let ch = byte as char;
+                if self.after_newline {
+                    if matches!(ch, '$' | '%' | '#' | '>') {
+                        self.screen.mark_block_boundary();
+                        self.collecting_command = true;
+                        self.command_buf.clear();
+                    }
+                    self.after_newline = false;
+                }
+                if self.collecting_command {
+                    self.command_buf.push(ch);
+                }
+                self.screen.put_char(ch);
+            }
             0x80..=0xFF => {} // UTF-8 continuation bytes handled by caller
         }
     }
@@ -309,11 +333,22 @@ impl Parser {
 
     fn execute_control(&mut self, byte: u8) {
         match byte {
-            0x07 => self.screen.bell(),                      // BEL
-            0x08 => self.screen.cursor_left(),               // BS
-            0x09 => self.screen.tab(),                       // HT
-            0x0A | 0x0B | 0x0C => self.screen.linefeed(),    // LF, VT, FF
-            0x0D => self.screen.carriage_return(),           // CR
+            0x07 => self.screen.bell(),        // BEL
+            0x08 => self.screen.cursor_left(), // BS
+            0x09 => self.screen.tab(),         // HT
+            0x0A | 0x0B | 0x0C => {
+                self.screen.linefeed(); // LF, VT, FF
+                self.after_newline = true;
+            }
+            0x0D => {
+                self.screen.carriage_return(); // CR
+                self.after_newline = true;
+                if self.collecting_command {
+                    self.screen.set_block_command(&self.command_buf);
+                    self.command_buf.clear();
+                    self.collecting_command = false;
+                }
+            }
             0x0E => self.screen.shift_out(),                 // SO
             0x0F => self.screen.shift_in(),                  // SI
             0x18 | 0x1A => self.state = ParserState::Ground, // CAN, SUB

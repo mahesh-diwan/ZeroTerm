@@ -19,6 +19,8 @@ zeroterm-core = { path = "../zeroterm-core" }
 zeroterm-render = { path = "../zeroterm-render" }
 zeroterm-mux = { path = "../zeroterm-mux" }
 zeroterm-config = { path = "../zeroterm-config" }
+zeroterm-ai = { path = "../zeroterm-ai" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

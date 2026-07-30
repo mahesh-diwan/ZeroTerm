@@ -10,6 +10,20 @@ pub struct Config {
     pub colors: ColorConfig,
     pub shell: ShellConfig,
     pub window: WindowConfig,
+    pub ai: AiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiConfig {
+    pub endpoint: String,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -19,6 +33,7 @@ impl Default for Config {
             colors: ColorConfig::default(),
             shell: ShellConfig::default(),
             window: WindowConfig::default(),
+            ai: AiConfig::default(),
         }
     }
 }

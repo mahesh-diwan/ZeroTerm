@@ -1,20 +1,22 @@
-//! ZeroTerm - Main entry point
-
-use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+
+use anyhow::Result;
+use arboard::Clipboard;
 use tracing::{error, info};
 use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{ModifiersState, PhysicalKey};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Window, WindowAttributes};
 
-use arboard::Clipboard;
+use zeroterm_ai::client::AiClient;
 use zeroterm_config::Config;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
+use zeroterm_mux::tab::Tab;
 use zeroterm_mux::TabManager;
 use zeroterm_render::{Renderer, Selection};
 
@@ -24,22 +26,77 @@ enum PtyCommand {
     Kill,
 }
 
+struct PaneState {
+    parser: Parser,
+    pty_rx: Receiver<Vec<u8>>,
+    pty_tx: Sender<PtyCommand>,
+    title: String,
+}
+
+fn spawn_pty_process(
+    shell: &str,
+    shell_args: &[String],
+    cols: usize,
+    rows: usize,
+) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
+    let shell_refs: Vec<&str> = shell_args.iter().map(|s| s.as_str()).collect();
+    let mut backend = PortablePtyBackend::new()?;
+    let mut process = backend.spawn(shell, &shell_refs, None)?;
+    process.resize(PtySize { cols, rows })?;
+
+    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
+    let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            while let Ok(cmd) = input_rx.try_recv() {
+                match cmd {
+                    PtyCommand::Write(data) => {
+                        let _ = process.write(&data);
+                    }
+                    PtyCommand::Resize(size) => {
+                        let _ = process.resize(size);
+                    }
+                    PtyCommand::Kill => {
+                        let _ = process.kill();
+                        return;
+                    }
+                }
+            }
+            match process.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok((pty_rx, pty_tx))
+}
+
 #[allow(dead_code)]
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    parser: Option<Parser>,
+    panes: HashMap<usize, PaneState>,
+    active_pane: usize,
+    next_pane_id: usize,
     tab_manager: TabManager,
-    pty_rx: Option<Receiver<Vec<u8>>>,
-    pty_tx: Option<Sender<PtyCommand>>,
     modifiers: ModifiersState,
     scroll_offset: usize,
     font_size: f32,
-    // Selection state
     selection: Option<Selection>,
     selecting: bool,
     mouse_pos: (f32, f32),
     clipboard: Option<Clipboard>,
+    shell: String,
+    shell_args: Vec<String>,
+    ai_client: Option<Arc<AiClient>>,
 }
 
 #[allow(dead_code)]
@@ -48,10 +105,10 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            parser: None,
+            panes: HashMap::new(),
+            active_pane: 0,
+            next_pane_id: 1,
             tab_manager: TabManager::new(),
-            pty_rx: None,
-            pty_tx: None,
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
             font_size: 14.0,
@@ -59,13 +116,32 @@ impl App {
             selecting: false,
             mouse_pos: (0.0, 0.0),
             clipboard: Clipboard::new().ok(),
+            shell: String::new(),
+            shell_args: vec![],
+            ai_client: None,
+        }
+    }
+
+    fn active_pane(&self) -> Option<&PaneState> {
+        self.panes.get(&self.active_pane)
+    }
+
+    fn active_pane_mut(&mut self) -> Option<&mut PaneState> {
+        self.panes.get_mut(&self.active_pane)
+    }
+
+    fn update_window_title(&self) {
+        if let Some(pane) = self.active_pane() {
+            let title = pane.parser.screen().title();
+            if let Some(window) = &self.window {
+                window.set_title(title);
+            }
         }
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         info!("Initializing ZeroTerm");
 
-        // Load config
         let config = Config::load(None).unwrap_or_default();
 
         let window_attrs = WindowAttributes::default()
@@ -88,96 +164,228 @@ impl App {
         let cols = (size.width as f32 / cell_w) as usize;
         let rows = (size.height as f32 / cell_h) as usize;
 
-        let parser = Parser::new(cols, rows);
-
-        // Detect default shell from config
         let shell = config.shell.program.clone();
-        let shell_args: Vec<&str> = config.shell.args.iter().map(|s| s.as_str()).collect();
+        let shell_args = config.shell.args.clone();
+        self.shell = shell.clone();
+        self.shell_args = shell_args.clone();
 
-        // Spawn PTY — resize BEFORE moving into thread
-        let mut backend = PortablePtyBackend::new()?;
-        let mut process = backend.spawn(&shell, &shell_args, None)?;
-        process.resize(PtySize { cols, rows })?;
+        let (pty_rx, pty_tx) = spawn_pty_process(&shell, &shell_args, cols, rows)?;
 
-        // Channels: output_tx→pty_rx (PTY→main), pty_tx→input_rx (main→PTY)
-        let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
-        let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
+        let parser = Parser::new(cols, rows);
+        let mut panes = HashMap::new();
+        panes.insert(
+            0,
+            PaneState {
+                parser,
+                pty_rx,
+                pty_tx,
+                title: "ZeroTerm".into(),
+            },
+        );
 
-        // Reader thread owns the process
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                // Check for pending commands
-                while let Ok(cmd) = input_rx.try_recv() {
-                    match cmd {
-                        PtyCommand::Write(data) => {
-                            let _ = process.write(&data);
-                        }
-                        PtyCommand::Resize(size) => {
-                            let _ = process.resize(size);
-                        }
-                        PtyCommand::Kill => {
-                            let _ = process.kill();
-                            return;
-                        }
-                    }
-                }
-                // Read PTY output
-                match process.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if output_tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let ai_client = if config.ai.endpoint.is_empty() {
+            None
+        } else {
+            Some(Arc::new(AiClient::new(&config.ai.endpoint)))
+        };
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.parser = Some(parser);
-        self.pty_rx = Some(pty_rx);
-        self.pty_tx = Some(pty_tx);
+        self.panes = panes;
+        self.active_pane = 0;
+        self.next_pane_id = 1;
+        self.ai_client = ai_client;
 
         info!("ZeroTerm initialized: {}x{} ({})", cols, rows, shell);
         Ok(())
     }
 
+    fn create_new_tab(&mut self) -> Result<()> {
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let cell_size = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_size())
+                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
+            let cell_w = cell_size[0];
+            let cell_h = cell_size[1];
+            let cols = (size.width as f32 / cell_w) as usize;
+            let rows = (size.height as f32 / cell_h) as usize;
+
+            let (pty_rx, pty_tx) = spawn_pty_process(&self.shell, &self.shell_args, cols, rows)?;
+            let parser = Parser::new(cols, rows);
+            let id = self.next_pane_id;
+            self.next_pane_id += 1;
+            self.panes.insert(
+                id,
+                PaneState {
+                    parser,
+                    pty_rx,
+                    pty_tx,
+                    title: "ZeroTerm".into(),
+                },
+            );
+            self.active_pane = id;
+            self.scroll_offset = 0;
+            self.tab_manager.add_tab(Tab::new(id));
+        }
+        Ok(())
+    }
+
+    fn close_active_tab(&mut self) {
+        if self.panes.len() <= 1 {
+            return;
+        }
+        if let Some(pane) = self.panes.remove(&self.active_pane) {
+            let _ = pane.pty_tx.send(PtyCommand::Kill);
+        }
+        self.tab_manager.remove_tab(self.active_pane);
+        let first = *self.panes.keys().next().unwrap_or(&0);
+        self.active_pane = first;
+        self.scroll_offset = 0;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn next_tab(&mut self) {
+        let mut keys: Vec<&usize> = self.panes.keys().collect();
+        keys.sort();
+        if keys.len() <= 1 {
+            return;
+        }
+        let pos = keys
+            .iter()
+            .position(|k| **k == self.active_pane)
+            .unwrap_or(0);
+        let next = (pos + 1) % keys.len();
+        self.active_pane = *keys[next];
+        self.scroll_offset = 0;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn previous_tab(&mut self) {
+        let mut keys: Vec<&usize> = self.panes.keys().collect();
+        keys.sort();
+        if keys.len() <= 1 {
+            return;
+        }
+        let pos = keys
+            .iter()
+            .position(|k| **k == self.active_pane)
+            .unwrap_or(0);
+        let prev = if pos == 0 { keys.len() - 1 } else { pos - 1 };
+        self.active_pane = *keys[prev];
+        self.scroll_offset = 0;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn switch_to_tab(&mut self, idx: usize) {
+        let mut keys: Vec<&usize> = self.panes.keys().collect();
+        keys.sort();
+        if idx < keys.len() {
+            self.active_pane = *keys[idx];
+            self.scroll_offset = 0;
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn ai_explain(&self) {
+        if let Some(ai_client) = &self.ai_client {
+            if let Some(pane) = self.panes.get(&self.active_pane) {
+                let screen = pane.parser.screen();
+                let mut text = String::new();
+                for row in screen.buffer() {
+                    for cell in row {
+                        text.push(cell.ch);
+                    }
+                    text.push('\n');
+                }
+                let client = ai_client.clone();
+                let tx = pane.pty_tx.clone();
+                std::thread::spawn(move || {
+                    let rt = match tokio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = tx.send(PtyCommand::Write(
+                                format!("\r\n\u{1b}[31mRuntime error: {}\u{1b}[0m\r\n", e)
+                                    .into_bytes(),
+                            ));
+                            return;
+                        }
+                    };
+                    match rt.block_on(client.explain(&text)) {
+                        Ok(response) => {
+                            let _ = tx.send(PtyCommand::Write(response.into_bytes()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(PtyCommand::Write(
+                                format!("\r\n\u{1b}[31mAI error: {}\u{1b}[0m\r\n", e).into_bytes(),
+                            ));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     fn drain_pty(&mut self) -> bool {
         let mut got_data = false;
-        if let (Some(parser), Some(rx)) = (&mut self.parser, &self.pty_rx) {
-            while let Ok(data) = rx.try_recv() {
-                parser.parse(&data);
+        let active = self.active_pane;
+        let mut title_changed = None;
+        for (&id, pane) in &mut self.panes {
+            let is_active = id == active;
+            while let Ok(data) = pane.pty_rx.try_recv() {
+                if is_active {
+                    pane.parser.parse(&data);
+                    let new_title = pane.parser.screen().title().to_string();
+                    if new_title != pane.title {
+                        pane.title = new_title.clone();
+                        title_changed = Some(new_title);
+                    }
+                }
                 got_data = true;
+            }
+        }
+        if let Some(title) = title_changed {
+            if let Some(window) = &self.window {
+                window.set_title(&title);
             }
         }
         got_data
     }
 
     fn render(&mut self) -> Result<()> {
-        if let (Some(renderer), Some(parser)) = (&mut self.renderer, &self.parser) {
-            renderer.render(parser.screen(), self.scroll_offset, self.selection)?;
+        if let Some(renderer) = &mut self.renderer {
+            if let Some(pane) = self.panes.get(&self.active_pane) {
+                renderer.render(pane.parser.screen(), self.scroll_offset, self.selection)?;
+            }
         }
         Ok(())
     }
 
     fn write_pty(&self, data: &[u8]) {
-        if let Some(tx) = &self.pty_tx {
-            let _ = tx.send(PtyCommand::Write(data.to_vec()));
+        if let Some(pane) = self.panes.get(&self.active_pane) {
+            let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
         }
     }
 
     fn resize_pty(&self, cols: usize, rows: usize) {
-        if let Some(tx) = &self.pty_tx {
-            let _ = tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+        if let Some(pane) = self.panes.get(&self.active_pane) {
+            let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
         }
     }
 
     fn max_scroll_offset(&self) -> usize {
-        if let Some(parser) = &self.parser {
-            let screen = parser.screen();
+        if let Some(pane) = self.active_pane() {
+            let screen = pane.parser.screen();
             let total_rows = screen.scrollback().len() + screen.buffer().len();
             let visible_rows = screen.size().rows;
             total_rows.saturating_sub(visible_rows)
@@ -197,11 +405,11 @@ impl App {
 
     // Selection methods
     fn screen_to_cell(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        if let (Some(renderer), Some(parser)) = (&self.renderer, &self.parser) {
+        if let (Some(renderer), Some(pane)) = (&self.renderer, self.active_pane()) {
             let cell_size = renderer.cell_size();
             let cell_w = cell_size[0];
             let cell_h = cell_size[1];
-            let screen = parser.screen();
+            let screen = pane.parser.screen();
             let buffer = screen.buffer();
             let visible_rows = buffer.len();
             let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
@@ -210,7 +418,6 @@ impl App {
             let row = (y / cell_h).floor() as usize;
 
             if row < visible_rows && col < cols {
-                // Account for scrollback offset
                 let scrollback = screen.scrollback().len();
                 let total_rows = scrollback + visible_rows;
                 let end = total_rows.saturating_sub(self.scroll_offset);
@@ -254,46 +461,51 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        if let (Some(sel), Some(parser), Some(clipboard)) =
-            (&self.selection, &self.parser, &mut self.clipboard)
-        {
-            let screen = parser.screen();
-            let scrollback = screen.scrollback();
-            let buffer = screen.buffer();
-            let visible_rows = buffer.len();
-            let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+        let sel = self.selection.clone();
+        let text = sel.as_ref().and_then(|sel| {
+            self.active_pane().map(|pane| {
+                let screen = pane.parser.screen();
+                let scrollback = screen.scrollback();
+                let buffer = screen.buffer();
+                let visible_rows = buffer.len();
+                let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
 
-            let (start_row, start_col, end_row, end_col) = if sel.start_row < sel.end_row
-                || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
-            {
-                (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
-            } else {
-                (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
-            };
-
-            let mut text = String::new();
-            let total_scrollback = scrollback.len();
-            let total_rows = total_scrollback + visible_rows;
-
-            for r in start_row..=end_row.min(total_rows - 1) {
-                let line = if r < total_scrollback {
-                    &scrollback[total_scrollback - 1 - r]
+                let (start_row, start_col, end_row, end_col) = if sel.start_row < sel.end_row
+                    || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
+                {
+                    (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
                 } else {
-                    &buffer[r - total_scrollback]
+                    (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
                 };
 
-                let line_start = if r == start_row { start_col } else { 0 };
-                let line_end = if r == end_row { end_col + 1 } else { cols };
+                let mut text = String::new();
+                let total_scrollback = scrollback.len();
+                let total_rows = total_scrollback + visible_rows;
 
-                for c in line_start..line_end.min(line.len()) {
-                    text.push(line[c].ch);
+                for r in start_row..=end_row.min(total_rows - 1) {
+                    let line = if r < total_scrollback {
+                        &scrollback[total_scrollback - 1 - r]
+                    } else {
+                        &buffer[r - total_scrollback]
+                    };
+
+                    let line_start = if r == start_row { start_col } else { 0 };
+                    let line_end = if r == end_row { end_col + 1 } else { cols };
+
+                    for c in line_start..line_end.min(line.len()) {
+                        text.push(line[c].ch);
+                    }
+                    if r < end_row {
+                        text.push('\n');
+                    }
                 }
-                if r < end_row {
-                    text.push('\n');
-                }
+                text
+            })
+        });
+        if let Some(text) = text {
+            if let Some(clipboard) = &mut self.clipboard {
+                let _ = clipboard.set_text(text.trim_end());
             }
-
-            let _ = clipboard.set_text(text.trim_end());
         }
     }
 
@@ -321,8 +533,8 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested");
-                if let Some(tx) = &self.pty_tx {
-                    let _ = tx.send(PtyCommand::Kill);
+                for (_, pane) in &self.panes {
+                    let _ = pane.pty_tx.send(PtyCommand::Kill);
                 }
                 event_loop.exit();
             }
@@ -338,8 +550,8 @@ impl ApplicationHandler for App {
                 let rows = (size.height as f32 / cell_h) as usize;
 
                 self.resize_pty(cols, rows);
-                if let Some(parser) = &mut self.parser {
-                    parser.screen_mut().resize(cols, rows);
+                if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+                    pane.parser.screen_mut().resize(cols, rows);
                 }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
@@ -357,12 +569,63 @@ impl ApplicationHandler for App {
                 }
 
                 let ctrl = self.modifiers.control_key();
+                let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
+
+                // Tab management shortcuts
+                match &event.physical_key {
+                    PhysicalKey::Code(code) => {
+                        if ctrl && shift && !alt && *code == KeyCode::KeyT {
+                            if let Err(e) = self.create_new_tab() {
+                                error!("Failed to create tab: {}", e);
+                            }
+                            self.update_window_title();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyW {
+                            self.close_active_tab();
+                            self.update_window_title();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyI {
+                            self.ai_explain();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::Tab {
+                            self.previous_tab();
+                            self.update_window_title();
+                            return;
+                        }
+                        if ctrl && !shift && !alt && *code == KeyCode::Tab {
+                            self.next_tab();
+                            self.update_window_title();
+                            return;
+                        }
+                        if alt && !ctrl && !shift {
+                            let idx = match code {
+                                KeyCode::Digit1 => Some(0),
+                                KeyCode::Digit2 => Some(1),
+                                KeyCode::Digit3 => Some(2),
+                                KeyCode::Digit4 => Some(3),
+                                KeyCode::Digit5 => Some(4),
+                                KeyCode::Digit6 => Some(5),
+                                KeyCode::Digit7 => Some(6),
+                                KeyCode::Digit8 => Some(7),
+                                KeyCode::Digit9 => Some(8),
+                                _ => None,
+                            };
+                            if let Some(idx) = idx {
+                                self.switch_to_tab(idx);
+                                self.update_window_title();
+                                return;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
 
                 match &event.physical_key {
                     PhysicalKey::Code(code) => {
-                        use winit::keyboard::KeyCode;
-
                         // Handle scrollback navigation with Shift modifier
                         let shift = self.modifiers.shift_key();
                         if shift && !ctrl && !alt {
@@ -456,7 +719,7 @@ impl ApplicationHandler for App {
                                 _ => vec![],
                             },
                             // Ctrl+Shift+C: Copy selection
-                            _ if ctrl && self.modifiers.shift_key() && !alt => match code {
+                            _ if ctrl && shift && !alt => match code {
                                 KeyCode::KeyC => {
                                     self.copy_selection();
                                     if let Some(window) = &self.window {
@@ -498,7 +761,6 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Drain PTY before each render
                 self.drain_pty();
 
                 if let Err(e) = self.render() {
