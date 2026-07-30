@@ -62,56 +62,31 @@ struct Uniforms {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Vertex {
-    position: [f32; 2],
-    tex_coord: [f32; 2],
-    color: [f32; 4],
-    bg_color: [f32; 4],
-    cell_size: [f32; 2],
+struct CellData {
+    glyph_uv_min: [f32; 2],
+    glyph_uv_max: [f32; 2],
+    glyph_size: [f32; 2],
+    _pad0: [f32; 2],
+    fg: [f32; 4],
+    bg: [f32; 4],
     attrs: u32,
+    _pad1: [u32; 3],
 }
 
-impl Vertex {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 3,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 4,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 14]>() as wgpu::BufferAddress,
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Uint32,
-                },
-            ],
-        }
-    }
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct QuadVertex {
+    position: [f32; 2],
 }
+
+const QUAD_VERTS: [QuadVertex; 6] = [
+    QuadVertex { position: [0.0, 0.0] },
+    QuadVertex { position: [1.0, 0.0] },
+    QuadVertex { position: [0.0, 1.0] },
+    QuadVertex { position: [1.0, 0.0] },
+    QuadVertex { position: [1.0, 1.0] },
+    QuadVertex { position: [0.0, 1.0] },
+];
 
 #[derive(Clone, Copy)]
 struct GlyphInfo {
@@ -381,14 +356,15 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
+    cell_buffer: wgpu::Buffer,
+    quad_vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
     prev_buffer: Option<Vec<Vec<Cell>>>,
-    vertex_buffer_capacity: usize,
+    cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
     selection: Option<Selection>,
 }
@@ -473,28 +449,62 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let cell_buffer_capacity = (cols as usize) * (rows as usize);
+        let cell_buffer = {
+            let cell_data = vec![CellData::zeroed(); cell_buffer_capacity];
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Cell Data Buffer"),
+                contents: bytemuck::cast_slice(&cell_data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+
+        let quad_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Quad Vertex Buffer"),
+            contents: bytemuck::cast_slice(&QUAD_VERTS),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Uniform Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("Uniform + Storage Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Uniform Bind Group"),
+            label: Some("Uniform + Storage Bind Group"),
             layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(uniform_buffer.as_entire_buffer_binding()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(cell_buffer.as_entire_buffer_binding()),
+                },
+            ],
         });
 
         // Atlas bind group layout
@@ -536,6 +546,19 @@ impl Renderer {
             ],
         });
 
+        let vertex_attributes = [
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x2,
+            },
+        ];
+        let vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &vertex_attributes,
+        };
+
         // Render pipeline
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -550,7 +573,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
+                buffers: &[vertex_buffer_layout],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -578,16 +601,7 @@ impl Renderer {
             cache: None,
         });
 
-        // Vertex buffer - pre-allocate for full screen (cols * rows * 6 vertices per cell)
-        let vertex_buffer_capacity = (cols as usize) * (rows as usize) * 6;
-        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Vertex Buffer"),
-            size: (std::mem::size_of::<Vertex>() * vertex_buffer_capacity) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        log::info!("Renderer initialized: {}x{} (vertex buffer capacity: {} vertices)", size.width, size.height, vertex_buffer_capacity);
+        log::info!("Renderer initialized: {}x{} (cell buffer capacity: {} cells)", size.width, size.height, cell_buffer_capacity);
 
         Ok(Self {
             surface,
@@ -596,14 +610,15 @@ impl Renderer {
             config,
             size,
             render_pipeline,
-            vertex_buffer,
+            cell_buffer,
+            quad_vertex_buffer,
             uniform_buffer,
             uniform_bind_group,
             atlas_bind_group,
             glyph_atlas,
             cell_size: [cell_width, cell_height],
             prev_buffer: None,
-            vertex_buffer_capacity,
+            cell_buffer_capacity,
             dirty_cells: Vec::new(),
             selection: None,
         })
@@ -620,7 +635,7 @@ impl Renderer {
         let new_cols = (width as f32 / self.cell_size[0]).ceil() as usize;
         let new_rows = (height as f32 / self.cell_size[1]).ceil() as usize;
 
-        let needs_resize = new_cols * new_rows * 6 != self.vertex_buffer_capacity;
+        let needs_resize = new_cols * new_rows != self.cell_buffer_capacity;
 
         self.size = PhysicalSize::new(width, height);
         self.config.width = width;
@@ -628,13 +643,15 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
 
         if needs_resize {
-            self.vertex_buffer_capacity = new_cols * new_rows * 6;
-            self.vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Vertex Buffer"),
-                size: (std::mem::size_of::<Vertex>() * self.vertex_buffer_capacity) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            self.cell_buffer_capacity = new_cols * new_rows;
+            self.cell_buffer = {
+                let cell_data = vec![CellData::zeroed(); self.cell_buffer_capacity];
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Cell Data Buffer"),
+                    contents: bytemuck::cast_slice(&cell_data),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+            };
             // Reset prev_buffer on resize to force full rebuild
             self.prev_buffer = None;
         }
@@ -702,7 +719,7 @@ impl Renderer {
 
 // Build and upload vertices for dirty cells only
         if !self.dirty_cells.is_empty() {
-            self.build_and_upload_dirty_vertices(screen, scroll_offset, selection)?;
+            self.update_cell_data(screen, scroll_offset, selection)?;
         }
 
         // Update uniforms
@@ -753,11 +770,10 @@ impl Renderer {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            
-            // Draw all vertices (the buffer contains all cells, dirty ones were updated)
-            let total_vertices = (visible_rows * cols * 6) as u32;
-            render_pass.draw(0..6, 0..total_vertices);
+            render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+
+            let instance_count = (visible_rows * cols) as u32;
+            render_pass.draw(0..6, 0..instance_count);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -769,35 +785,24 @@ impl Renderer {
         Ok(())
     }
 
-    fn build_and_upload_dirty_vertices(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
+    fn update_cell_data(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
         let buffer = screen.buffer();
         let visible_rows = buffer.len();
         let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
-        let cell_w = self.cell_size[0];
-        let cell_h = self.cell_size[1];
-
-        // Get cursor info
         let cursor = screen.cursor();
         let cursor_col = cursor.col;
         let cursor_row_global = cursor.row;
         let cursor_visible = cursor.visible;
         let cursor_shape = cursor.shape;
 
-        // Build combined rows: scrollback (oldest first) + buffer
         let scrollback = screen.scrollback();
         let total_scrollback = scrollback.len();
         let total_rows = total_scrollback + visible_rows;
 
-        // Visible window: [start..end) in the combined row space
         let end = total_rows.saturating_sub(scroll_offset);
         let start = end.saturating_sub(visible_rows);
 
-        // Check if cursor is in visible range
         let cursor_in_range = cursor_row_global < total_rows && cursor_row_global >= start;
-
-        // Build vertices for dirty cells only
-        let mut dirty_vertices = Vec::new();
-        let mut dirty_offsets = Vec::new(); // (offset_in_buffer, start_index_in_dirty_vertices, count)
 
         for &(dirty_row, dirty_col) in &self.dirty_cells {
             if dirty_row >= visible_rows || dirty_col >= cols {
@@ -806,7 +811,6 @@ impl Renderer {
 
             let combined_idx = start + dirty_row;
             let line = if combined_idx < total_scrollback {
-                // Scrollback lines are stored newest-first, reverse for chronological
                 &scrollback[total_scrollback - 1 - combined_idx]
             } else {
                 &buffer[combined_idx - total_scrollback]
@@ -818,16 +822,12 @@ impl Renderer {
 
             let cell = &line[dirty_col];
 
-            let x = dirty_col as f32 * cell_w;
-            let y = dirty_row as f32 * cell_h;
-
             let fg = cell.fg;
             let bg = cell.bg;
 
-            // Check if this is the cursor row
             let is_cursor_row = cursor_in_range && combined_idx == cursor_row_global;
             let is_cursor_cell = is_cursor_row && dirty_col == cursor_col;
-            let (fg, bg, attrs) = if cursor_visible && is_cursor_cell {
+            let (fg, bg, cell_attrs) = if cursor_visible && is_cursor_cell {
                 match cursor_shape {
                     zeroterm_core::cell::CursorShape::Block => (bg, fg, cell.attrs),
                     zeroterm_core::cell::CursorShape::Underline => {
@@ -835,109 +835,45 @@ impl Renderer {
                         a.underline = zeroterm_core::cell::UnderlineStyle::Single;
                         (fg, bg, a)
                     }
-                    zeroterm_core::cell::CursorShape::Bar => {
-                        // Set bit 8 (0x100) for bar cursor rendering in shader
-                        let mut a = cell.attrs;
-                        (fg, bg, a)
-                    }
+                    zeroterm_core::cell::CursorShape::Bar => (fg, bg, cell.attrs),
                 }
             } else {
                 (fg, bg, cell.attrs)
             };
 
-            // Check if this cell is selected
             let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
 
-            let attrs = ((attrs.bold as u32) << 0)
-                | ((attrs.italic as u32) << 1)
-                | ((attrs.underline as u32) << 2)
-                | ((attrs.strikethrough as u32) << 3)
-                | ((attrs.dim as u32) << 4)
-                | ((attrs.blink as u32) << 5)
-                | ((attrs.reverse as u32) << 6)
-                | ((attrs.invisible as u32) << 7)
-                // Bar cursor flag - bit 8 (0x100)
+            let attrs = ((cell_attrs.bold as u32) << 0)
+                | ((cell_attrs.italic as u32) << 1)
+                | ((cell_attrs.underline as u32) << 2)
+                | ((cell_attrs.strikethrough as u32) << 3)
+                | ((cell_attrs.dim as u32) << 4)
+                | ((cell_attrs.blink as u32) << 5)
+                | ((cell_attrs.reverse as u32) << 6)
+                | ((cell_attrs.invisible as u32) << 7)
                 | (if cursor_visible && is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
-                // Selection flag - bit 9 (0x200)
                 | (if is_selected { 0x200u32 } else { 0 });
 
-            let fg_color = [
-                fg.r as f32 / 255.0,
-                fg.g as f32 / 255.0,
-                fg.b as f32 / 255.0,
-                1.0,
-            ];
-            let bg_color = [
-                bg.r as f32 / 255.0,
-                bg.g as f32 / 255.0,
-                bg.b as f32 / 255.0,
-                1.0,
-            ];
+            let fg_color = [fg.r as f32 / 255.0, fg.g as f32 / 255.0, fg.b as f32 / 255.0, 1.0];
+            let bg_color = [bg.r as f32 / 255.0, bg.g as f32 / 255.0, bg.b as f32 / 255.0, 1.0];
 
-            let (u0, v0, u1, v1, _, _) = self
+            let (u0, v0, u1, v1, gw, gh) = self
                 .glyph_atlas
                 .get_or_insert_glyph(cell.ch, &self.device, &self.queue);
 
-            let base_offset = (dirty_row * cols + dirty_col) * 6;
-            let vertex_start = dirty_vertices.len();
-            dirty_offsets.push((base_offset, vertex_start, 6));
+            let cell_data = CellData {
+                glyph_uv_min: [u0, v0],
+                glyph_uv_max: [u1, v1],
+                glyph_size: [gw, gh],
+                _pad0: [0.0, 0.0],
+                fg: fg_color,
+                bg: bg_color,
+                attrs,
+                _pad1: [0; 3],
+            };
 
-            // Two triangles per cell (6 vertices) — full-cell quad, UV maps glyph subrect
-            dirty_vertices.push(Vertex {
-                position: [x, y],
-                tex_coord: [u0, v0],
-                color: fg_color,
-                bg_color,
-                cell_size: [0.0, 0.0],
-                attrs,
-            });
-            dirty_vertices.push(Vertex {
-                position: [x + cell_w, y],
-                tex_coord: [u1, v0],
-                color: fg_color,
-                bg_color,
-                cell_size: [1.0, 0.0],
-                attrs,
-            });
-            dirty_vertices.push(Vertex {
-                position: [x, y + cell_h],
-                tex_coord: [u0, v1],
-                color: fg_color,
-                bg_color,
-                cell_size: [0.0, 1.0],
-                attrs,
-            });
-            dirty_vertices.push(Vertex {
-                position: [x + cell_w, y],
-                tex_coord: [u1, v0],
-                color: fg_color,
-                bg_color,
-                cell_size: [1.0, 0.0],
-                attrs,
-            });
-            dirty_vertices.push(Vertex {
-                position: [x + cell_w, y + cell_h],
-                tex_coord: [u1, v1],
-                color: fg_color,
-                bg_color,
-                cell_size: [1.0, 1.0],
-                attrs,
-            });
-            dirty_vertices.push(Vertex {
-                position: [x, y + cell_h],
-                tex_coord: [u0, v1],
-                color: fg_color,
-                bg_color,
-                cell_size: [0.0, 1.0],
-                attrs,
-            });
-        }
-
-        // Upload dirty vertices to GPU buffer at their respective offsets
-        for (offset, vertex_start, count) in dirty_offsets {
-            let byte_offset = (offset * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-            let vertex_slice = &dirty_vertices[vertex_start..vertex_start + count];
-            self.queue.write_buffer(&self.vertex_buffer, byte_offset, bytemuck::cast_slice(vertex_slice));
+            let offset = ((dirty_row * cols + dirty_col) * std::mem::size_of::<CellData>()) as wgpu::BufferAddress;
+            self.queue.write_buffer(&self.cell_buffer, offset, bytemuck::bytes_of(&cell_data));
         }
 
         Ok(())
