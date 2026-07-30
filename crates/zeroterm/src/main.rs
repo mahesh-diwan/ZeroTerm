@@ -19,6 +19,7 @@ use zeroterm_core::Parser;
 use zeroterm_mux::tab::Tab;
 use zeroterm_mux::TabManager;
 use zeroterm_render::{Renderer, Selection};
+use zeroterm_sync::daemon::SyncDaemon;
 
 enum PtyCommand {
     Write(Vec<u8>),
@@ -97,6 +98,7 @@ struct App {
     shell: String,
     shell_args: Vec<String>,
     ai_client: Option<Arc<AiClient>>,
+    sync_daemon: Option<SyncDaemon>,
 }
 
 #[allow(dead_code)]
@@ -119,6 +121,7 @@ impl App {
             shell: String::new(),
             shell_args: vec![],
             ai_client: None,
+            sync_daemon: None,
         }
     }
 
@@ -195,6 +198,11 @@ impl App {
         self.active_pane = 0;
         self.next_pane_id = 1;
         self.ai_client = ai_client;
+        self.sync_daemon = if config.sync.server_url.is_empty() {
+            None
+        } else {
+            Some(SyncDaemon::new(config.sync.server_url.clone()))
+        };
 
         info!("ZeroTerm initialized: {}x{} ({})", cols, rows, shell);
         Ok(())
@@ -341,10 +349,9 @@ impl App {
         let active = self.active_pane;
         let mut title_changed = None;
         for (&id, pane) in &mut self.panes {
-            let is_active = id == active;
             while let Ok(data) = pane.pty_rx.try_recv() {
-                if is_active {
-                    pane.parser.parse(&data);
+                pane.parser.parse(&data);
+                if id == active {
                     let new_title = pane.parser.screen().title().to_string();
                     if new_title != pane.title {
                         pane.title = new_title.clone();

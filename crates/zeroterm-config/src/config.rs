@@ -1,6 +1,7 @@
 //! Config parsing and management
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,20 @@ pub struct Config {
     pub shell: ShellConfig,
     pub window: WindowConfig,
     pub ai: AiConfig,
+    pub sync: SyncConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    pub server_url: String,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            server_url: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +49,7 @@ impl Default for Config {
             shell: ShellConfig::default(),
             window: WindowConfig::default(),
             ai: AiConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
@@ -46,12 +62,50 @@ impl Config {
             Self::default_config_path()
         };
 
-        if config_path.exists() {
+        let mut config = if config_path.exists() {
             let contents = fs::read_to_string(&config_path)?;
-            let config: Config = toml::from_str(&contents)?;
-            Ok(config)
+            toml::from_str(&contents)?
         } else {
-            Ok(Config::default())
+            Config::default()
+        };
+
+        if let Ok(overrides) = crate::lua::LuaEngine::evaluate(".zeroterm.lua") {
+            config.apply_overrides(overrides);
+        }
+
+        Ok(config)
+    }
+
+    pub fn apply_overrides(&mut self, overrides: HashMap<String, String>) {
+        for (key, value) in overrides {
+            match key.as_str() {
+                "font_family" | "font.family" => self.font.family = value,
+                "font_size" | "font.size" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        self.font.size = v;
+                    }
+                }
+                "line_height" | "font.line_height" => {
+                    if let Ok(v) = value.parse::<f32>() {
+                        self.font.line_height = v;
+                    }
+                }
+                "foreground" | "colors.foreground" => self.colors.foreground = value,
+                "background" | "colors.background" => self.colors.background = value,
+                "shell" | "shell.program" => self.shell.program = value,
+                "window_width" | "window.width" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        self.window.width = v;
+                    }
+                }
+                "window_height" | "window.height" => {
+                    if let Ok(v) = value.parse::<u32>() {
+                        self.window.height = v;
+                    }
+                }
+                "ai_endpoint" | "ai.endpoint" => self.ai.endpoint = value,
+                _ => {}
+            }
         }
     }
 
