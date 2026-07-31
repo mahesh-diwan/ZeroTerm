@@ -1,49 +1,69 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-:root {
-  --bg: #0a0a0f;
-  --bg-elevated: #11111a;
-  --fg: #e8e8ed;
-  --fg-muted: #7a7a8a;
-  --accent: #00d4aa;
-  --accent-dim: #00d4aa33;
-  --border: #222233;
-  --card: #14141f;
-  --card-hover: #1a1a2a;
+@theme {
+  --color-bg: #08080e;
+  --color-bg-elevated: #0f0f18;
+  --color-surface: #14141f;
+  --color-surface-hover: #1a1a2a;
+  --color-fg: #e4e4ec;
+  --color-fg-muted: #6b6b80;
+  --color-fg-dim: #3a3a50;
+  --color-accent: #00d4aa;
+  --color-accent-dim: #00d4aa22;
+  --color-accent-glow: #00d4aa15;
+  --color-border: #1a1a2e;
+  --color-border-light: #252540;
+
+  --font-sans: Geist, system-ui, sans-serif;
+  --font-mono: Geist Mono, JetBrains Mono, monospace;
+
+  --animate-fade-in: fade-in 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-fade-up: fade-up 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-fade-up-lg: fade-up-lg 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-scale-in: scale-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-cursor: cursor-blink 1s step-end infinite;
+  --animate-float: float 4s ease-in-out infinite;
 }
 
-* {
-  box-sizing: border-box;
-}
-
-html {
-  scroll-behavior: smooth;
-}
-
-body {
-  background: var(--bg);
-  color: var(--fg);
-  font-family: "Geist", "JetBrains Mono", system-ui, sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-@layer utilities {
-  .text-balance {
-    text-wrap: balance;
+@keyframes fade-in {
+  from {
+    opacity: 0;
   }
-
-  .bg-grid {
-    background-image:
-      linear-gradient(var(--border) 1px, transparent 1px),
-      linear-gradient(90deg, var(--border) 1px, transparent 1px);
-    background-size: 60px 60px;
+  to {
+    opacity: 1;
   }
+}
 
-  .terminal-font {
-    font-family: "JetBrains Mono", "Fira Code", monospace;
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-up-lg {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 
@@ -58,79 +78,74 @@ body {
   }
 }
 
-.animate-cursor {
-  animation: cursor-blink 1s step-end infinite;
-}
-
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(20px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-fade-in-up {
-  animation: fade-in-up 0.6s ease-out forwards;
-  opacity: 0;
-}
-
-.delay-1 {
-  animation-delay: 0.1s;
-}
-.delay-2 {
-  animation-delay: 0.2s;
-}
-.delay-3 {
-  animation-delay: 0.3s;
-}
-.delay-4 {
-  animation-delay: 0.4s;
-}
-.delay-5 {
-  animation-delay: 0.5s;
-}
-
-@keyframes typewriter {
-  from {
-    width: 0;
-  }
-  to {
-    width: 100%;
-  }
-}
-
-.animate-typewriter {
-  overflow: hidden;
-  white-space: nowrap;
-  border-right: 2px solid var(--accent);
-  animation:
-    typewriter 2s steps(40) 1s forwards,
-    cursor-blink 1s step-end infinite;
-  width: 0;
-}
-
 @keyframes float {
   0%,
   100% {
     transform: translateY(0);
   }
   50% {
-    transform: translateY(-8px);
+    transform: translateY(-6px);
   }
 }
 
-.animate-float {
-  animation: float 3s ease-in-out infinite;
+@keyframes pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 20px var(--color-accent-dim);
+  }
+  50% {
+    box-shadow:
+      0 0 40px var(--color-accent-dim),
+      0 0 60px var(--color-accent-glow);
+  }
 }
 
-.glow-accent {
-  box-shadow:
-    0 0 30px var(--accent-dim),
-    0 0 60px var(--accent-dim);
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@utility text-balance {
+  text-wrap: balance;
+}
+
+@utility bg-grid {
+  background-image:
+    linear-gradient(var(--color-border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-border) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+@utility bg-grid-subtle {
+  background-image:
+    linear-gradient(var(--color-fg-dim) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-fg-dim) 1px, transparent 1px);
+  background-size: 64px 64px;
+  opacity: 0.3;
+}
+
+:root {
+  --bg: #08080e;
+  --bg-elevated: #0f0f18;
+  --fg: #e4e4ec;
+  --fg-muted: #6b6b80;
+  --accent: #00d4aa;
+  --border: #1a1a2e;
+  --card: #14141f;
+  --card-hover: #1a1a2a;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 @media (prefers-reduced-motion: reduce) {

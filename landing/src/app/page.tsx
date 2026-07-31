@@ -1,165 +1,197 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 
+// ─── data ───────────────────────────────────────────────────────────────────
+
 const features = [
-  {
-    icon: '⚡',
-    title: 'Zero Latency',
-    desc: 'GPU-accelerated rendering via wgpu. 120 FPS at 4K. Every keystroke renders in < 1ms.',
-  },
-  {
-    icon: '🦀',
-    title: 'Pure Rust',
-    titleExtra: 'No Electron',
-    desc: 'Written entirely in Rust. No JS runtime, no Electron overhead. < 50MB RAM at idle.',
-  },
-  {
-    icon: '📦',
-    title: 'Native Multiplexing',
-    desc: 'Tabs, splits, sessions — built-in. No tmux, no screen, no config required.',
-  },
-  {
-    icon: '🔒',
-    title: 'SSH First',
-    desc: 'Native SSH client (thrussh). Persistent sessions. Disconnect without killing remote work.',
-  },
-  {
-    icon: '🎨',
-    title: 'Graphics Protocols',
-    desc: 'Kitty, Sixel, iTerm2 inline images. Render images, plots, GIFs directly in terminal.',
-  },
-  {
-    icon: '🤖',
-    title: 'Local AI (Optional)',
-    desc: 'Ollama/LM Studio integration. Explain output, suggest commands, complete code — all local.',
-  },
-  {
-    icon: '🖥️',
-    title: 'Cross-Platform',
-    desc: 'Metal on macOS, DX12 on Windows, Vulkan on Linux. Native feel everywhere.',
-  },
-  {
-    icon: '⚙️',
-    title: 'Zero Config',
-    desc: 'Works out of the box. TOML + Lua for power users. Sensible defaults for everyone.',
-  },
+  { title: 'GPU Accelerated', desc: 'wgpu rendering at 120 FPS at 4K. No Electron. No JS runtime.', tag: 'Performance' },
+  { title: 'Pure Rust', desc: 'Zero bloat. Under 50MB RAM at idle. Cold start in under 200ms.', tag: 'Core' },
+  { title: 'Native Multiplexing', desc: 'Tabs, splits, sessions built in. No tmux or screen config needed.', tag: 'UX' },
+  { title: 'SSH First', desc: 'Native SSH client. Persistent sessions survive disconnects.', tag: 'Network' },
+  { title: 'Graphics Protocols', desc: 'Kitty, Sixel, iTerm2 inline images in your terminal.', tag: 'Graphics' },
+  { title: 'Local AI', desc: 'Ollama and LM Studio integration. Explain output and suggest commands.', tag: 'AI' },
+  { title: 'Cross-Platform', desc: 'Metal on macOS, DX12 on Windows, Vulkan on Linux.', tag: 'Platform' },
+  { title: 'Zero Config', desc: 'Works out of the box. TOML and Lua for power users.', tag: 'Setup' },
 ];
 
 const stats = [
-  { value: '120', label: 'FPS at 4K' },
-  { value: '<50MB', label: 'RAM at idle' },
-  { value: '<200ms', label: 'Cold start' },
-  { value: '100%', label: 'Unicode pass' },
+  { value: '120', suffix: 'FPS', label: 'at 4K' },
+  { value: '<50', suffix: 'MB', label: 'RAM idle' },
+  { value: '<200', suffix: 'ms', label: 'cold start' },
+  { value: '100', suffix: '%', label: 'Unicode' },
 ];
 
 const platforms = [
-  { name: 'macOS', badge: 'Metal', color: 'from-purple-500 to-pink-500' },
-  { name: 'Windows', badge: 'DX12', color: 'from-blue-500 to-cyan-500' },
-  { name: 'Linux', badge: 'Vulkan', color: 'from-orange-500 to-red-500' },
+  { name: 'macOS', badge: 'Metal' },
+  { name: 'Windows', badge: 'DX12' },
+  { name: 'Linux', badge: 'Vulkan' },
+];
+
+const installers = [
+  { id: 'cargo', label: 'Cargo', cmd: 'cargo install zeroterm' },
+  { id: 'brew', label: 'Homebrew', cmd: 'brew install zeroterm' },
+  { id: 'binary', label: 'Binary', cmd: 'curl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-installer.sh | sh' },
+];
+
+const faqs = [
+  { q: 'What is ZeroTerm?', a: 'ZeroTerm is a GPU-accelerated terminal emulator built from scratch in Rust. It uses wgpu for rendering and supports native multiplexing, SSH, image protocols, and optional local AI integration.' },
+  { q: 'How do I install it?', a: 'Use Cargo, Homebrew, or download a binary from GitHub Releases. No external dependencies required.' },
+  { q: 'Does it support tmux?', a: 'ZeroTerm has built-in multiplexing — tabs, splits, and session management. No tmux or screen needed, though tmux works if you prefer it.' },
+  { q: 'Is it available on Windows?', a: 'Yes. ZeroTerm runs on Windows via DX12, macOS via Metal, and Linux via Vulkan — all through wgpu.' },
+  { q: 'Can I use it over SSH?', a: 'Yes. ZeroTerm has a native SSH client with persistent sessions. Disconnect without killing remote work.' },
+  { q: 'Is it open source?', a: 'Yes. ZeroTerm is MIT licensed. Source code is available on GitHub.' },
+];
+
+const roadmap = [
+  { phase: 1, title: 'The Engine', status: 'Complete', items: ['PTY Integration', 'VT100 Parser', 'Screen Buffer', 'wgpu Rendering', 'Input Handling'] },
+  { phase: 2, title: 'Multiplexing', status: 'In Progress', items: ['Tab System', 'Splits (Tiling)', 'SSH Integration', 'Session Restore'] },
+  { phase: 3, title: 'Modern UX', status: 'Planned', items: ['Block Output', 'Graphics Protocols', 'Local AI', 'GUI Settings'] },
+  { phase: 4, title: 'Ecosystem', status: 'Planned', items: ['macOS Native', 'Windows Native', 'Linux Native', 'Encrypted Sync', 'WASM Plugins'] },
+];
+
+// ─── hooks ──────────────────────────────────────────────────────────────────
+
+function useInView(threshold = 0.15) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [inView, setInView] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(([e]) => { if (e.isIntersecting) { setInView(true); obs.disconnect(); } }, { threshold });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [threshold]);
+  return [ref, inView] as const;
+}
+
+function AnimatedSection({ children, className = '', delay = 0 }: { children: React.ReactNode; className?: string; delay?: number }) {
+  const [ref, inView] = useInView();
+  return (
+    <div
+      ref={ref}
+      className={`transition-all duration-700 ease-[cubic-bezier(0.16,1,0.3,1)] ${className} ${
+        inView ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-6'
+      }`}
+      style={{ transitionDelay: `${delay}ms` }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// ─── Terminal Demo ──────────────────────────────────────────────────────────
+
+const terminalLines = [
+  { text: 'user@zeroterm:~$ ', cmd: true },
+  { text: 'zeroterm --version', cmd: true },
+  { text: 'ZeroTerm v0.2.0 (rustc 1.81)', cmd: false },
+  { text: 'user@zeroterm:~$ ', cmd: true },
+  { text: 'echo "GPU accelerated"', cmd: true },
+  { text: 'GPU accelerated', cmd: false },
+  { text: 'user@zeroterm:~$ ', cmd: true },
+  { text: 'cat /proc/cpuinfo | grep cores', cmd: true },
+  { text: 'cpu cores        : 8', cmd: false },
+  { text: 'user@zeroterm:~$ ', cmd: true },
+  { text: 'ssh prod-server', cmd: true },
+  { text: 'Connected to prod-server (persistent session)', cmd: false },
+  { text: 'user@prod:~$ ', cmd: true },
 ];
 
 function TerminalDemo() {
-  const [lines, setLines] = useState<string[]>([
-    'user@zeroterm:~$ ',
-  ]);
-  const [currentLine, setCurrentLine] = useState('');
-  const [cursor, setCursor] = useState(true);
+  const [visible, setVisible] = useState(1);
 
   useEffect(() => {
-    const interval = setInterval(() => setCursor(c => !c), 530);
-    return () => clearInterval(interval);
-  }, []);
-
-  useEffect(() => {
-    const demoCommands = [
-      { cmd: 'echo "Zero latency. Zero bloat. Zero config."', delay: 800 },
-      { cmd: 'zeroterm --version', delay: 1600 },
-      { cmd: 'ZeroTerm v0.1.0 (rustc 1.79)', delay: 2000 },
-      { cmd: 'htop', delay: 2800 },
-      { cmd: '  CPU: ████░░░░░░ 12%  MEM: ████░░░░░░ 48MB', delay: 3200 },
-      { cmd: '  GPU: ████████░░ 89%  FPS: 120', delay: 3600 },
-      { cmd: 'ssh prod-server', delay: 4400 },
-      { cmd: 'Connected to prod-server (persistent session)', delay: 4800 },
-      { cmd: 'user@prod:~$ ', delay: 5200 },
-    ];
-
-    let totalDelay = 0;
-    demoCommands.forEach(({ cmd, delay }) => {
-      totalDelay += delay;
-      setTimeout(() => {
-        setLines(prev => {
-          const last = prev[prev.length - 1];
-          if (last.endsWith('$ ') || last.endsWith('# ')) {
-            return [...prev.slice(0, -1), last + cmd, 'user@zeroterm:~$ '];
-          }
-          return [...prev, cmd, 'user@zeroterm:~$ '];
-        });
-      }, totalDelay);
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    terminalLines.forEach((_, i) => {
+      timers.push(setTimeout(() => setVisible(i + 1), i * 350 + 500));
     });
+    return () => timers.forEach(clearTimeout);
   }, []);
 
   return (
-    <div className="terminal-font bg-[var(--card)] border border-[var(--border)] rounded-xl overflow-hidden max-w-3xl mx-auto animate-fade-in-up delay-3">
-      <div className="flex items-center gap-2 px-4 py-3 bg-[var(--bg-elevated)] border-b border-[var(--border)]">
-        <div className="w-3 h-3 rounded-full bg-red-500" />
-        <div className="w-3 h-3 rounded-full bg-yellow-500" />
-        <div className="w-3 h-3 rounded-full bg-green-500" />
-        <span className="ml-4 text-sm text-[var(--fg-muted)]">zeroterm</span>
+    <div className="rounded-xl border border-border overflow-hidden bg-[#06060c] shadow-2xl shadow-accent-dim/20">
+      <div className="flex items-center gap-1.5 px-4 py-3 bg-surface border-b border-border">
+        <div className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
+        <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/80" />
+        <div className="w-2.5 h-2.5 rounded-full bg-green-500/80" />
+        <span className="ml-3 text-xs text-fg-muted/60 font-mono">zeroterm</span>
       </div>
-      <div className="p-4 h-64 overflow-y-auto">
-        <pre className="whitespace-pre-wrap text-sm leading-relaxed">
-          {lines.map((line, i) => (
-            <div key={i} className="flex items-start">
-              <span className="text-[var(--accent)] mr-2">{i === lines.length - 1 ? '▶' : '✓'}</span>
-              <span>{line}</span>
-              {i === lines.length - 1 && <span className={`animate-cursor text-[var(--accent)] ml-1`}>█</span>}
+      <div className="p-4 min-h-[280px]">
+        <pre className="text-sm leading-relaxed font-mono">
+          {terminalLines.slice(0, visible).map((line, i) => (
+            <div
+              key={i}
+              className={`transition-opacity duration-300 ${i < visible ? 'opacity-100' : 'opacity-0'}`}
+            >
+              {line.cmd ? (
+                <span>
+                  {i === 0 || terminalLines[i - 1]?.cmd === false ? (
+                    <span className="text-accent">$ </span>
+                  ) : null}
+                  <span className="text-fg-muted/80">{line.text.replace(/^user@.*?\$ /, '')}</span>
+                </span>
+              ) : (
+                <span className="text-fg/90">{line.text}</span>
+              )}
             </div>
           ))}
+          {visible >= terminalLines.length && (
+            <span className="inline-block w-2 h-4 bg-accent/80 animate-cursor ml-1" />
+          )}
         </pre>
       </div>
     </div>
   );
 }
 
+// ─── Sections ───────────────────────────────────────────────────────────────
+
 function Hero() {
   return (
-    <section className="relative min-h-screen flex items-center justify-center px-6 py-20 bg-grid">
-      <div className="absolute inset-0 bg-gradient-to-br from-[var(--accent)]/5 via-transparent to-transparent" />
-      <div className="relative z-10 max-w-5xl mx-auto text-center">
-        <div className="animate-fade-in-up">
-          <span className="inline-block px-4 py-1.5 rounded-full border border-[var(--accent)]/30 bg-[var(--accent)]/10 text-[var(--accent)] text-sm font-medium mb-6">
-            Now in Public Beta
-          </span>
+    <section className="relative overflow-hidden">
+      <div className="absolute inset-0 bg-grid-subtle pointer-events-none" />
+      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-accent-glow rounded-full blur-[120px] pointer-events-none" />
+      <div className="relative max-w-6xl mx-auto px-6 pt-28 pb-20 lg:pt-36 lg:pb-28">
+        <div className="grid lg:grid-cols-2 gap-12 lg:gap-16 items-center">
+          <AnimatedSection>
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-accent/20 bg-accent-dim/5 text-accent text-xs font-medium mb-6">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+              Now in Public Beta
+            </div>
+            <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tighter leading-[1.05]">
+              Zero latency.
+              <br />
+              Zero bloat.
+              <br />
+              <span className="text-accent">ZeroTerm.</span>
+            </h1>
+            <p className="mt-5 text-lg text-fg-muted max-w-xl leading-relaxed text-balance">
+              GPU-accelerated terminal emulator built in Rust. 120 FPS at 4K, under 50MB RAM, native
+              multiplexing, SSH, and local AI — all in one binary.
+            </p>
+            <div className="mt-8 flex flex-col sm:flex-row gap-3">
+              <Link
+                href="https://github.com/mahesh-diwan/ZeroTerm/releases"
+                className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-accent text-bg font-semibold text-sm hover:brightness-110 transition-all active:scale-[0.98]"
+              >
+                Download Now
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+              </Link>
+              <Link
+                href="https://github.com/mahesh-diwan/ZeroTerm"
+                className="inline-flex items-center justify-center gap-2 px-6 py-3 rounded-xl border border-border text-fg text-sm font-medium hover:bg-surface-hover transition-all active:scale-[0.98]"
+              >
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.305-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.872.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z" /></svg>
+                GitHub
+              </Link>
+            </div>
+          </AnimatedSection>
+          <AnimatedSection delay={200}>
+            <TerminalDemo />
+          </AnimatedSection>
         </div>
-        <h1 className="text-5xl md:text-7xl lg:text-8xl font-bold leading-[1.05] tracking-tight animate-fade-in-up delay-1">
-          <span className="bg-gradient-to-r from-[var(--fg)] via-[var(--accent)] to-[var(--fg)] bg-clip-text text-transparent">
-            ZeroTerm
-          </span>
-        </h1>
-        <p className="mt-6 text-xl md:text-2xl text-[var(--fg-muted)] max-w-3xl mx-auto animate-fade-in-up delay-2 text-balance">
-          Zero latency. Zero bloat. Zero config. Zero cloud. Zero tools.
-        </p>
-        <p className="mt-4 text-lg text-[var(--fg-muted)] animate-fade-in-up delay-2">
-          GPU-accelerated terminal emulator built in Rust. 120 FPS at 4K. {'<50MB'}  RAM. Native multiplexing.
-        </p>
-        <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-4 animate-fade-in-up delay-3">
-          <Link
-            href="https://github.com/mahesh-diwan/ZeroTerm/releases"
-            className="group px-8 py-4 rounded-xl bg-[var(--accent)] text-[var(--bg)] font-semibold text-lg hover:scale-[1.02] transition-transform glow-accent"
-          >
-            Download Latest Release
-            <span className="ml-2 inline-block group-hover:translate-x-1 transition-transform">→</span>
-          </Link>
-          <Link
-            href="https://github.com/mahesh-diwan/ZeroTerm"
-            className="px-8 py-4 rounded-xl border border-[var(--border)] text-[var(--fg)] font-semibold text-lg hover:bg-[var(--card-hover)] transition-colors"
-          >
-            View on GitHub
-          </Link>
-        </div>
-        <TerminalDemo />
       </div>
     </section>
   );
@@ -167,16 +199,58 @@ function Hero() {
 
 function Stats() {
   return (
-    <section className="py-20 px-6 bg-[var(--bg-elevated)]/50 border-y border-[var(--border)]">
-      <div className="max-w-5xl mx-auto grid grid-cols-2 md:grid-cols-4 gap-8">
-        {stats.map((stat, i) => (
-          <div key={stat.label} className="text-center animate-fade-in-up" style={{ animationDelay: `${i * 0.1}s` }}>
-            <div className="text-4xl md:text-5xl lg:text-6xl font-bold bg-gradient-to-r from-[var(--accent)] to-[var(--fg)] bg-clip-text text-transparent">
-              {stat.value}
+    <section className="border-y border-border">
+      <div className="max-w-6xl mx-auto px-6 py-12">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
+          {stats.map((s, i) => (
+            <AnimatedSection key={s.label} delay={i * 80} className="text-center">
+              <div className="text-3xl md:text-4xl font-bold tracking-tighter">
+                <span className="text-accent">{s.value}</span>
+                <span className="text-fg-muted/50 text-2xl md:text-3xl"> {s.suffix}</span>
+              </div>
+              <div className="mt-1 text-sm text-fg-muted">{s.label}</div>
+            </AnimatedSection>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function About() {
+  return (
+    <section className="py-24 lg:py-32">
+      <div className="max-w-6xl mx-auto px-6">
+        <AnimatedSection>
+          <div className="grid lg:grid-cols-2 gap-12 lg:gap-20">
+            <div>
+              <h2 className="text-2xl sm:text-3xl lg:text-4xl font-bold tracking-tight leading-tight text-balance">
+                A terminal built for how developers actually work.
+              </h2>
             </div>
-            <div className="mt-2 text-[var(--fg-muted)] text-lg">{stat.label}</div>
+            <div className="space-y-6">
+              <p className="text-fg-muted leading-relaxed text-balance">
+                ZeroTerm is a GPU-accelerated terminal emulator written entirely in Rust. It uses wgpu for rendering,
+                a fully custom VT parser, and native OS multiplexing — no Electron, no JavaScript runtime, no bloat.
+              </p>
+              <div className="space-y-3">
+                {[
+                  'GPU-accelerated rendering via wgpu — Metal, DX12, or Vulkan',
+                  'Native multiplexing — tabs, splits, session management',
+                  'Built-in SSH client with persistent sessions',
+                  'Kitty / Sixel / iTerm2 image protocol support',
+                  'Local AI integration via Ollama and LM Studio',
+                  'TOML + Lua config for power users',
+                ].map((item, i) => (
+                  <div key={i} className="flex items-start gap-3 text-sm text-fg leading-relaxed">
+                    <svg className="w-4 h-4 mt-0.5 shrink-0 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
+                    {item}
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
-        ))}
+        </AnimatedSection>
       </div>
     </section>
   );
@@ -184,28 +258,21 @@ function Stats() {
 
 function Features() {
   return (
-    <section className="py-20 px-6">
-      <div className="max-w-5xl mx-auto">
-        <div className="text-center mb-16 animate-fade-in-up">
-          <h2 className="text-3xl md:text-4xl font-bold">Built Different</h2>
-          <p className="mt-4 text-[var(--fg-muted)] text-lg max-w-2xl mx-auto">
-            Every feature exists because developers asked for it. No bloat, no telemetry, no accounts.
+    <section className="py-24 lg:py-32 border-t border-border">
+      <div className="max-w-6xl mx-auto px-6">
+        <AnimatedSection className="max-w-2xl mb-16">
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Everything you need, nothing you don&apos;t.</h2>
+          <p className="mt-4 text-fg-muted leading-relaxed text-balance">
+            From GPU-accelerated rendering to local AI. ZeroTerm ships every feature as a single, native binary.
           </p>
-        </div>
-        <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6">
-          {features.map((feature, i) => (
-            <div
-              key={feature.title}
-              className="group p-6 rounded-2xl bg-[var(--card)] border border-[var(--border)] hover:border-[var(--accent)]/50 hover:bg-[var(--card-hover)] transition-all duration-300 animate-fade-in-up"
-              style={{ animationDelay: `${i * 0.08}s` }}
-            >
-              <div className="text-4xl mb-4">{feature.icon}</div>
-              <h3 className="text-xl font-semibold mb-2">
-                {feature.title}
-                {feature.titleExtra && <span className="text-[var(--accent)] ml-2 text-base">{feature.titleExtra}</span>}
-              </h3>
-              <p className="text-[var(--fg-muted)] leading-relaxed">{feature.desc}</p>
-            </div>
+        </AnimatedSection>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {features.map((f, i) => (
+            <AnimatedSection key={f.title} delay={i * 60} className="group p-5 rounded-xl border border-border hover:border-border-light bg-surface hover:bg-surface-hover transition-all duration-300">
+              <div className="text-[10px] uppercase tracking-widest text-fg-dim font-medium mb-3">{f.tag}</div>
+              <h3 className="font-semibold mb-1.5">{f.title}</h3>
+              <p className="text-sm text-fg-muted leading-relaxed">{f.desc}</p>
+            </AnimatedSection>
           ))}
         </div>
       </div>
@@ -215,31 +282,25 @@ function Features() {
 
 function Platforms() {
   return (
-    <section className="py-20 px-6 bg-[var(--bg-elevated)]/50 border-y border-[var(--border)]">
-      <div className="max-w-5xl mx-auto">
-        <div className="text-center mb-16 animate-fade-in-up">
-          <h2 className="text-3xl md:text-4xl font-bold">Native Everywhere</h2>
-          <p className="mt-4 text-[var(--fg-muted)] text-lg max-w-2xl mx-auto">
+    <section className="py-24 lg:py-32 border-t border-border bg-surface/30">
+      <div className="max-w-6xl mx-auto px-6">
+        <AnimatedSection className="max-w-2xl mb-16">
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Native everywhere.</h2>
+          <p className="mt-4 text-fg-muted leading-relaxed text-balance">
             Not a web app wrapped in Tauri. Native GPU APIs on every platform.
           </p>
-        </div>
-        <div className="grid md:grid-cols-3 gap-6">
-          {platforms.map((platform, i) => (
-            <div
-              key={platform.name}
-              className="p-8 rounded-2xl bg-[var(--card)] border border-[var(--border)] text-center animate-fade-in-up"
-              style={{ animationDelay: `${i * 0.1}s` }}
-            >
-              <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full bg-gradient-to-r ${platform.color} text-white font-medium mb-4`}>
-                {platform.badge}
-              </div>
-              <h3 className="text-2xl font-bold mb-2">{platform.name}</h3>
-              <p className="text-[var(--fg-muted)]">
-                {platform.name === 'macOS' && 'Metal via wgpu • Transparent titlebar • .app bundle • Notarized'}
-                {platform.name === 'Windows' && 'DirectX 12 via wgpu • ConPTY • Acrylic/Mica • .msi installer'}
-                {platform.name === 'Linux' && 'Vulkan via wgpu • Wayland + X11 • GTK4 dialogs • .deb/.rpm/Flatpak'}
+        </AnimatedSection>
+        <div className="grid sm:grid-cols-3 gap-4">
+          {platforms.map((p, i) => (
+            <AnimatedSection key={p.name} delay={i * 80} className="p-6 rounded-xl border border-border bg-surface">
+              <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-accent-dim/10 text-accent text-xs font-mono font-medium mb-4">{p.badge}</div>
+              <h3 className="text-lg font-semibold mb-2">{p.name}</h3>
+              <p className="text-sm text-fg-muted leading-relaxed">
+                {p.name === 'macOS' && 'Metal via wgpu. Transparent titlebar. Notarized .app bundle.'}
+                {p.name === 'Windows' && 'DirectX 12 via wgpu. ConPTY. Acrylic and Mica effects.'}
+                {p.name === 'Linux' && 'Vulkan via wgpu. Wayland and X11. .deb, .rpm, and Flatpak.'}
               </p>
-            </div>
+            </AnimatedSection>
           ))}
         </div>
       </div>
@@ -247,164 +308,125 @@ function Platforms() {
   );
 }
 
-function Install() {
-  const commands = {
-    cargo: 'cargo install zeroterm',
-    brew: 'brew install zeroterm',
-    scoop: 'scoop install zeroterm',
-    aur: 'yay -S zeroterm',
-    deb: 'sudo dpkg -i zeroterm_0.1.0_amd64.deb',
-    rpm: 'sudo rpm -i zeroterm-0.1.0-1.x86_64.rpm',
-    flatpak: 'flatpak install flathub dev.zeroterm.ZeroTerm',
-    binary: 'curl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-x86_64-unknown-linux-gnu.tar.gz | tar xz && ./zeroterm',
-  };
-
-  const tabs = [
-    { id: 'cargo', label: 'Cargo', cmd: commands.cargo },
-    { id: 'brew', label: 'Homebrew', cmd: commands.brew },
-    { id: 'scoop', label: 'Scoop', cmd: commands.scoop },
-    { id: 'aur', label: 'AUR', cmd: commands.aur },
-    { id: 'deb', label: '.deb', cmd: commands.deb },
-    { id: 'rpm', label: '.rpm', cmd: commands.rpm },
-    { id: 'flatpak', label: 'Flatpak', cmd: commands.flatpak },
-    { id: 'binary', label: 'Binary', cmd: commands.binary },
-  ];
-
-  const [activeTab, setActiveTab] = useState('cargo');
+function InstallSection() {
+  const [active, setActive] = useState('cargo');
+  const [copied, setCopied] = useState(false);
+  const activeCmd = installers.find((i) => i.id === active)?.cmd ?? '';
 
   return (
-    <section className="py-20 px-6">
-      <div className="max-w-5xl mx-auto">
-        <div className="text-center mb-12 animate-fade-in-up">
-          <h2 className="text-3xl md:text-4xl font-bold">Install in Seconds</h2>
-          <p className="mt-4 text-[var(--fg-muted)] text-lg">Pick your platform. One command. No dependencies.</p>
-        </div>
-        <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl overflow-hidden animate-fade-in-up delay-1">
-          <div className="flex overflow-x-auto px-4 py-3 bg-[var(--bg-elevated)] border-b border-[var(--border)]">
-            {tabs.map(tab => (
+    <section className="py-24 lg:py-32">
+      <div className="max-w-6xl mx-auto px-6">
+        <AnimatedSection className="max-w-2xl mb-16">
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Install in seconds.</h2>
+          <p className="mt-4 text-fg-muted leading-relaxed text-balance">Pick your package manager. One command. No dependencies.</p>
+        </AnimatedSection>
+        <AnimatedSection delay={100} className="max-w-2xl mx-auto">
+          <div className="rounded-xl border border-border overflow-hidden">
+            <div className="flex gap-1 px-4 pt-3 pb-2 bg-surface border-b border-border">
+              {installers.map((inst) => (
+                <button
+                  key={inst.id}
+                  onClick={() => setActive(inst.id)}
+                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+                    active === inst.id ? 'bg-accent text-bg' : 'text-fg-muted hover:text-fg hover:bg-surface-hover'
+                  }`}
+                >
+                  {inst.label}
+                </button>
+              ))}
+            </div>
+            <div className="p-4 bg-bg font-mono text-sm flex items-center justify-between">
+              <code className="text-fg/90">{activeCmd}</code>
               <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
-                  activeTab === tab.id
-                    ? 'bg-[var(--accent)] text-[var(--bg)]'
-                    : 'text-[var(--fg-muted)] hover:text-[var(--fg)] hover:bg-[var(--card)]'
-                }`}
+                onClick={() => { navigator.clipboard.writeText(activeCmd); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+                className="shrink-0 px-3 py-1 rounded-md text-xs font-medium text-fg-muted hover:text-fg hover:bg-surface-hover transition-all"
               >
-                {tab.label}
-              </button>
-            ))}
-          </div>
-          <div className="p-6">
-            <div className="terminal-font bg-[var(--bg)] border border-[var(--border)] rounded-xl p-4 relative">
-              <div className="flex items-center gap-2 mb-3">
-                <div className="w-3 h-3 rounded-full bg-red-500" />
-                <div className="w-3 h-3 rounded-full bg-yellow-500" />
-                <div className="w-3 h-3 rounded-full bg-green-500" />
-              </div>
-              <pre className="text-sm text-[var(--fg)]">
-                <code>{tabs.find(t => t.id === activeTab)?.cmd}</code>
-              </pre>
-              <button
-                className="absolute top-4 right-4 text-[var(--fg-muted)] hover:text-[var(--accent)] text-sm"
-                onClick={() => navigator.clipboard.writeText(tabs.find(t => t.id === activeTab)?.cmd || '')}
-              >
-                Copy
+                {copied ? 'Copied' : 'Copy'}
               </button>
             </div>
           </div>
+          <p className="mt-4 text-center text-sm text-fg-muted">
+            Or download from{' '}
+            <Link href="https://github.com/mahesh-diwan/ZeroTerm/releases" className="text-accent hover:underline">GitHub Releases</Link>
+          </p>
+        </AnimatedSection>
+      </div>
+    </section>
+  );
+}
+
+function FAQ() {
+  const [open, setOpen] = useState<number | null>(null);
+
+  return (
+    <section className="py-24 lg:py-32 border-t border-border bg-surface/30">
+      <div className="max-w-3xl mx-auto px-6">
+        <AnimatedSection className="text-center mb-16">
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Frequently asked questions.</h2>
+        </AnimatedSection>
+        <div className="space-y-2">
+          {faqs.map((faq, i) => (
+            <AnimatedSection key={i} delay={i * 60}>
+              <button
+                onClick={() => setOpen(open === i ? null : i)}
+                className="w-full flex items-center justify-between gap-4 px-5 py-4 rounded-xl border border-border hover:border-border-light bg-surface hover:bg-surface-hover transition-all text-left"
+              >
+                <span className="font-medium text-sm">{faq.q}</span>
+                <svg
+                  className={`w-4 h-4 shrink-0 text-fg-muted transition-transform duration-300 ${open === i ? 'rotate-45' : ''}`}
+                  fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              </button>
+              <div
+                className={`overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] ${
+                  open === i ? 'max-h-48 opacity-100' : 'max-h-0 opacity-0'
+                }`}
+              >
+                <p className="px-5 py-4 text-sm text-fg-muted leading-relaxed">{faq.a}</p>
+              </div>
+            </AnimatedSection>
+          ))}
         </div>
-        <p className="mt-8 text-center text-[var(--fg-muted)] animate-fade-in-up delay-2">
-          Or download from <Link href="https://github.com/mahesh-diwan/ZeroTerm/releases" className="text-[var(--accent)] hover:underline">GitHub Releases</Link>
-        </p>
       </div>
     </section>
   );
 }
 
 function Roadmap() {
-  const phases = [
-    {
-      num: '1',
-      title: 'The Engine',
-      status: '✅ Complete',
-      items: ['PTY Integration', 'VT100 Parser', 'Screen Buffer', 'wgpu Rendering', 'Input Handling'],
-      timeframe: 'Months 1–3',
-    },
-    {
-      num: '2',
-      title: 'Multiplexing',
-      status: '🚧 In Progress',
-      items: ['Tab System', 'Splits (Tiling)', 'SSH Integration', 'Session Restore'],
-      timeframe: 'Months 3–4',
-    },
-    {
-      num: '3',
-      title: 'Modern UX',
-      status: '📋 Planned',
-      items: ['Block Output', 'Modern Input', 'Graphics Protocols', 'Local AI', 'GUI Settings'],
-      timeframe: 'Months 4–6',
-    },
-    {
-      num: '4',
-      title: 'Cross-Platform Polish',
-      status: '📋 Planned',
-      items: ['macOS Native', 'Windows Native', 'Linux Native', 'Encrypted Sync'],
-      timeframe: 'Months 6–8',
-    },
-    {
-      num: '5',
-      title: 'Ecosystem & v1.0',
-      status: '📋 Planned',
-      items: ['WASM Plugins', 'Documentation', 'Plugin Marketplace', 'v1.0 Release'],
-      timeframe: 'Months 8–12',
-    },
-  ];
-
   return (
-    <section className="py-20 px-6 bg-[var(--bg-elevated)]/50 border-y border-[var(--border)]">
-      <div className="max-w-5xl mx-auto">
-        <div className="text-center mb-16 animate-fade-in-up">
-          <h2 className="text-3xl md:text-4xl font-bold">Roadmap</h2>
-          <p className="mt-4 text-[var(--fg-muted)] text-lg max-w-2xl mx-auto">
-            Transparent development. No surprises. Community-driven priorities.
-          </p>
-        </div>
-        <div className="relative">
-          <div className="absolute left-8 top-0 bottom-0 w-0.5 bg-gradient-to-b from-[var(--accent)] to-[var(--border)]" />
-          {phases.map((phase, i) => (
-            <div key={phase.num} className="relative pl-20 pb-16 animate-fade-in-up" style={{ animationDelay: `${i * 0.1}s` }}>
-              <div className="absolute left-0 top-0 flex items-center justify-center">
-                <div className={`w-16 h-16 rounded-full border-4 flex items-center justify-center text-2xl font-bold z-10 bg-[var(--bg)] ${
-                  phase.status.includes('Complete') ? 'border-[var(--accent)] text-[var(--accent)]' :
-                  phase.status.includes('Progress') ? 'border-[var(--accent)]/50 text-[var(--accent)]' :
-                  'border-[var(--border)] text-[var(--fg-muted)]'
+    <section className="py-24 lg:py-32 border-t border-border">
+      <div className="max-w-6xl mx-auto px-6">
+        <AnimatedSection className="max-w-2xl mb-16">
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Roadmap.</h2>
+          <p className="mt-4 text-fg-muted leading-relaxed text-balance">Transparent development. Community-driven priorities.</p>
+        </AnimatedSection>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {roadmap.map((r, i) => (
+            <AnimatedSection key={r.phase} delay={i * 80} className="p-5 rounded-xl border border-border bg-surface">
+              <div className="flex items-center gap-3 mb-4">
+                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border ${
+                  r.status === 'Complete' ? 'border-accent text-accent' : 'border-border text-fg-muted'
                 }`}>
-                  {phase.num}
+                  {r.phase}
                 </div>
+                <span className={`text-[10px] uppercase tracking-widest font-medium ${
+                  r.status === 'Complete' ? 'text-accent' : 'text-fg-dim'
+                }`}>
+                  {r.status}
+                </span>
               </div>
-              <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 ml-4">
-                <div className="flex items-baseline gap-4 mb-4">
-                  <h3 className="text-xl font-bold">{phase.title}</h3>
-                  <span className={`px-3 py-1 rounded-full text-sm font-medium ${
-                    phase.status.includes('Complete') ? 'bg-[var(--accent)]/20 text-[var(--accent)] border border-[var(--accent)]/30' :
-                    phase.status.includes('Progress') ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30' :
-                    'bg-[var(--bg-elevated)] text-[var(--fg-muted)] border border-[var(--border)]'
-                  }`}>
-                    {phase.status}
-                  </span>
-                </div>
-                <p className="text-[var(--fg-muted)] mb-4">{phase.timeframe}</p>
-                <ul className="grid grid-cols-2 gap-2 text-sm">
-                  {phase.items.map(item => (
-                    <li key={item} className="flex items-center gap-2 text-[var(--fg-muted)]">
-                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--border)]" />
-                      {item}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            </div>
+              <h3 className="font-semibold mb-3">{r.title}</h3>
+              <ul className="space-y-1.5">
+                {r.items.map((item) => (
+                  <li key={item} className="flex items-center gap-2 text-sm text-fg-muted">
+                    <span className="w-1 h-1 rounded-full bg-fg-dim shrink-0" />
+                    {item}
+                  </li>
+                ))}
+              </ul>
+            </AnimatedSection>
           ))}
         </div>
       </div>
@@ -412,15 +434,19 @@ function Roadmap() {
   );
 }
 
+// ─── Page ────────────────────────────────────────────────────────────────────
+
 export default function Home() {
   return (
-    <div className="min-h-screen">
+    <>
       <Hero />
       <Stats />
+      <About />
       <Features />
       <Platforms />
-      <Install />
+      <InstallSection />
+      <FAQ />
       <Roadmap />
-    </div>
+    </>
   );
 }
