@@ -220,7 +220,8 @@ impl GlyphAtlas {
                 return Ok(data);
             }
         }
-        anyhow::bail!("No monospace font found in search paths")
+        log::info!("No system font found, using embedded DejaVu Sans Mono fallback");
+        Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
     }
 
     fn get_or_insert_glyph(
