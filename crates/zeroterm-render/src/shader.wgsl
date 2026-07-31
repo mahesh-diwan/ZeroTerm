@@ -99,6 +99,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         fg.a = 0.0;
     }
 
+    if (input.attrs & 0x800u) != 0u {
+        bg = mix(bg, vec4<f32>(1.0, 1.0, 1.0, 1.0), 0.07);
+    }
+
     let glyph_alpha = textureSample(atlas_texture, atlas_sampler, input.tex_coord).a;
 
     color = mix(color, fg, glyph_alpha);

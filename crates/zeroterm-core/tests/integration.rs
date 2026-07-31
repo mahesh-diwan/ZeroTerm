@@ -692,6 +692,28 @@ fn test_block_exit_code_set_directly() {
     assert_eq!(p.screen().blocks().last().unwrap().exit_code, Some(42));
 }
 
+#[test]
+fn test_block_duration_and_metadata() {
+    let mut p = setup(80, 24);
+    p.screen_mut().set_block_command("ls");
+    p.screen_mut().mark_block_boundary();
+    p.screen_mut().set_block_exit_code(0);
+    p.screen_mut().set_block_command("whoami");
+    p.screen_mut().mark_block_boundary();
+    let blocks = p.screen().blocks();
+    assert_eq!(blocks.len(), 2);
+    let first = &blocks[0];
+    assert!(
+        first.duration_ms.is_some(),
+        "first block should have a duration"
+    );
+    assert_eq!(
+        p.screen().block_metadata(first),
+        format!("exit:0 \u{00b7} {}ms", first.duration_ms.unwrap())
+    );
+    assert_eq!(p.screen().block_metadata(&blocks[1]), "exit:?");
+}
+
 // --------------------- wide character handling ---------------------
 
 #[test]

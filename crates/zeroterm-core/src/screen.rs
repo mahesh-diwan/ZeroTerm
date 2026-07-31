@@ -11,6 +11,7 @@ pub struct CommandBlock {
     pub command: String,
     pub exit_code: Option<i32>,
     pub timestamp: std::time::Instant,
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +187,17 @@ impl Screen {
 
     fn current_buffer_mut(&mut self) -> &mut Vec<Vec<Cell>> {
         self.alt_buffer.as_mut().unwrap_or(&mut self.buffer)
+    }
+
+    pub fn set_cells(&mut self, row: usize, cells: &[Cell]) {
+        let buffer = self.current_buffer_mut();
+        if let Some(dst) = buffer.get_mut(row) {
+            for (i, cell) in cells.iter().enumerate() {
+                if let Some(c) = dst.get_mut(i) {
+                    *c = *cell;
+                }
+            }
+        }
     }
 
     pub fn buffer(&self) -> &[Vec<Cell>] {
@@ -749,6 +761,7 @@ impl Screen {
             if block.end_line.is_none() {
                 block.end_line = Some(self.cursor.row);
             }
+            block.duration_ms = Some(block.timestamp.elapsed().as_millis() as u64);
         }
         let id = self.block_id_counter;
         self.block_id_counter += 1;
@@ -759,11 +772,23 @@ impl Screen {
             command: std::mem::take(&mut self.current_block_command),
             exit_code: None,
             timestamp: std::time::Instant::now(),
+            duration_ms: None,
         });
     }
 
     pub fn blocks(&self) -> &[CommandBlock] {
         &self.blocks
+    }
+
+    pub fn block_metadata(&self, block: &CommandBlock) -> String {
+        let exit = block
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        match block.duration_ms {
+            Some(ms) => format!("exit:{} \u{00b7} {}ms", exit, ms),
+            None => format!("exit:{}", exit),
+        }
     }
 
     pub fn set_block_command(&mut self, cmd: &str) {

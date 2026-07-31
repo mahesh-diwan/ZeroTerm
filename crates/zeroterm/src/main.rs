@@ -17,11 +17,39 @@ use zeroterm_ai::client::AiClient;
 use zeroterm_config::Config;
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
-use zeroterm_core::screen::Size as PtySize;
+use zeroterm_core::screen::{CommandBlock, Size as PtySize};
 use zeroterm_core::Parser;
+use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
 use zeroterm_render::{Renderer, Selection};
 use zeroterm_sync::daemon::SyncDaemon;
+
+use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
+
+mod session;
+mod settings;
+
+const COPY_MARKER: &str = "[copy]";
+
+fn block_output_text(screen: &zeroterm_core::screen::Screen, block: &CommandBlock) -> String {
+    let buffer = screen.buffer();
+    let last = buffer.len().saturating_sub(1);
+    let end = block
+        .end_line
+        .map_or(last, |e| e.saturating_sub(1))
+        .min(last);
+    let start = block.start_line.min(end);
+    let mut text = String::new();
+    for row in start..=end {
+        if let Some(line) = buffer.get(row) {
+            for cell in line {
+                text.push(cell.ch);
+            }
+        }
+        text.push('\n');
+    }
+    text.trim_end().to_string()
+}
 
 enum PtyCommand {
     Write(Vec<u8>),
@@ -34,6 +62,7 @@ struct PaneState {
     pty_rx: Receiver<Vec<u8>>,
     pty_tx: Sender<PtyCommand>,
     title: String,
+    pane_cmd: String,
 }
 
 fn spawn_pty_process(
@@ -152,6 +181,8 @@ struct App {
     active_pane: usize,
     next_pane_id: usize,
     tabs: Vec<Tab>,
+    // ponytail: split rendering shows active pane fullscreen; per-pane viewport rendering when renderer supports it
+    split_root: SplitNode,
     modifiers: ModifiersState,
     scroll_offset: usize,
     font_size: f32,
@@ -169,6 +200,7 @@ struct App {
     sync_tick: u32,
     cursor_visible: bool,
     font_path: Option<String>,
+    settings: SettingsMenu,
 }
 
 #[allow(dead_code)]
@@ -181,6 +213,7 @@ impl App {
             active_pane: 0,
             next_pane_id: 1,
             tabs: Vec::new(),
+            split_root: SplitNode::Leaf(0),
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
             font_size: 14.0,
@@ -198,6 +231,7 @@ impl App {
             sync_tick: 0,
             cursor_visible: true,
             font_path: None,
+            settings: SettingsMenu::new(&SettingsContext::default()),
         }
     }
 
@@ -271,6 +305,7 @@ impl App {
                 pty_rx,
                 pty_tx,
                 title: "ZeroTerm v0.2.0".into(),
+                pane_cmd: shell.clone(),
             },
         );
 
@@ -285,6 +320,39 @@ impl App {
         self.panes = panes;
         self.active_pane = 0;
         self.next_pane_id = 1;
+
+        let session_path = session::session_file_path();
+        if let Some(records) = session::load_session(&session_path) {
+            if records.len() > 1 {
+                for record in records.iter().skip(1) {
+                    let cmd = if record.cmd.is_empty() {
+                        shell.clone()
+                    } else {
+                        record.cmd.clone()
+                    };
+                    match spawn_pty_process(&cmd, &[], cols, rows) {
+                        Ok((pty_rx, pty_tx)) => {
+                            let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
+                            let id = self.next_pane_id;
+                            self.next_pane_id += 1;
+                            self.panes.insert(
+                                id,
+                                PaneState {
+                                    parser: Parser::new(cols, rows),
+                                    pty_rx,
+                                    pty_tx,
+                                    title: record.title.clone(),
+                                    pane_cmd: cmd,
+                                },
+                            );
+                            self.tabs.push(Tab::new(id));
+                        }
+                        Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
+                    }
+                }
+            }
+        }
+
         self.ai_client = ai_client;
         self.sync_daemon = if config.sync.server_url.is_empty() {
             None
@@ -293,6 +361,9 @@ impl App {
         };
 
         self.config = Some(config);
+
+        let ctx = self.settings_ctx();
+        self.settings.refresh(&ctx);
 
         // Start config file watcher
         let config_path = Config::default_config_path();
@@ -351,11 +422,48 @@ impl App {
                     pty_rx,
                     pty_tx,
                     title: "ZeroTerm v0.2.0".into(),
+                    pane_cmd: self.shell.clone(),
                 },
             );
             self.active_pane = id;
             self.scroll_offset = 0;
+            self.split_root = SplitNode::Leaf(id);
             self.tabs.push(Tab::new(id));
+        }
+        Ok(())
+    }
+
+    fn create_split_pane(&mut self, dir: SplitDir) -> Result<()> {
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let cell_size = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_size())
+                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
+            let cell_w = cell_size[0];
+            let cell_h = cell_size[1];
+            let cols = (size.width as f32 / cell_w) as usize;
+            let rows = (size.height as f32 / cell_h) as usize;
+
+            let (pty_rx, pty_tx) = spawn_pty_process(&self.shell, &self.shell_args, cols, rows)?;
+            let parser = Parser::new(cols, rows);
+            let id = self.next_pane_id;
+            self.next_pane_id += 1;
+            self.panes.insert(
+                id,
+                PaneState {
+                    parser,
+                    pty_rx,
+                    pty_tx,
+                    title: "ZeroTerm v0.2.0".into(),
+                    pane_cmd: self.shell.clone(),
+                },
+            );
+            let parent = self.active_pane;
+            self.split_root.insert_leaf(id, dir, parent, 0.5);
+            self.active_pane = id;
+            self.scroll_offset = 0;
         }
         Ok(())
     }
@@ -364,10 +472,12 @@ impl App {
         if self.panes.len() <= 1 {
             return;
         }
-        if let Some(pane) = self.panes.remove(&self.active_pane) {
+        let closed = self.active_pane;
+        if let Some(pane) = self.panes.remove(&closed) {
             let _ = pane.pty_tx.send(PtyCommand::Kill);
         }
-        self.tabs.retain(|t| t.id != self.active_pane);
+        self.split_root.remove_leaf(closed);
+        self.tabs.retain(|t| t.id != closed);
         let first = *self.panes.keys().next().unwrap_or(&0);
         self.active_pane = first;
         self.scroll_offset = 0;
@@ -424,6 +534,48 @@ impl App {
         }
     }
 
+    fn compute_split_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
+        self.split_root.compute_rects()
+    }
+
+    fn focus_adjacent_pane(&mut self, dir: KeyCode) {
+        let rects = self.split_root.compute_rects();
+        if rects.len() <= 1 {
+            return;
+        }
+        let cur = self.active_pane;
+        let cur_rect = match rects.get(&cur) {
+            Some(r) => *r,
+            None => return,
+        };
+        let cx = cur_rect.0 + cur_rect.2 / 2.0;
+        let cy = cur_rect.1 + cur_rect.3 / 2.0;
+        let mut best: Option<(usize, f32)> = None;
+        for (&id, &(x, y, w, h)) in &rects {
+            if id == cur {
+                continue;
+            }
+            let px = x + w / 2.0;
+            let py = y + h / 2.0;
+            let dx = px - cx;
+            let dy = py - cy;
+            let (in_dir, dist) = match dir {
+                KeyCode::ArrowLeft if dx < 0.0 => (true, -dx + dy.abs()),
+                KeyCode::ArrowRight if dx > 0.0 => (true, dx + dy.abs()),
+                KeyCode::ArrowUp if dy < 0.0 => (true, -dy + dx.abs()),
+                KeyCode::ArrowDown if dy > 0.0 => (true, dy + dx.abs()),
+                _ => (false, 0.0),
+            };
+            if in_dir && best.map_or(true, |(_, b)| dist < b) {
+                best = Some((id, dist));
+            }
+        }
+        if let Some((id, _)) = best {
+            self.active_pane = id;
+            self.scroll_offset = 0;
+        }
+    }
+
     fn connect_ssh(&mut self, host: &str, user: &str, port: u16) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
@@ -460,10 +612,12 @@ impl App {
                     pty_rx,
                     pty_tx,
                     title: format!("SSH: {}@{}", user, host),
+                    pane_cmd: format!("ssh {}@{}", user, host),
                 },
             );
             self.active_pane = id;
             self.scroll_offset = 0;
+            self.split_root = SplitNode::Leaf(id);
             self.tabs.push(Tab::new(id));
         }
         Ok(())
@@ -553,6 +707,7 @@ impl App {
             warn!("Pane {} process exited", id);
             if self.panes.len() > 1 {
                 self.panes.remove(id);
+                self.split_root.remove_leaf(*id);
                 if self.active_pane == *id {
                     self.active_pane = *self.panes.keys().next().unwrap_or(&0);
                 }
@@ -581,12 +736,11 @@ impl App {
             self.config_changed.store(false, Ordering::SeqCst);
             if let Some(config) = &mut self.config {
                 config.reload(None).ok();
-                self.opacity = config.window.opacity;
-                self.font_path = config.font.path.clone();
-                if let Some(renderer) = &mut self.renderer {
-                    renderer.reload_config(config);
-                }
             }
+            self.apply_config_to_renderer();
+        }
+        if self.settings.open {
+            self.draw_settings_overlay();
         }
         if let Some(renderer) = &mut self.renderer {
             if let Some(pane) = self.panes.get(&self.active_pane) {
@@ -738,6 +892,37 @@ impl App {
         self.selection = None;
     }
 
+    fn copy_block_output(&mut self) -> bool {
+        if self.scroll_offset != 0 {
+            return false;
+        }
+        let Some((global_row, col)) = self.screen_to_cell(self.mouse_pos.0, self.mouse_pos.1)
+        else {
+            return false;
+        };
+        let Some(pane) = self.active_pane() else {
+            return false;
+        };
+        let screen = pane.parser.screen();
+        let scrollback = screen.scrollback().len();
+        if global_row < scrollback {
+            return false;
+        }
+        let row = global_row - scrollback;
+        let cols = screen.size().cols;
+        if col + COPY_MARKER.len() < cols {
+            return false;
+        }
+        let Some(block) = screen.blocks().iter().find(|b| b.start_line == row) else {
+            return false;
+        };
+        let text = block_output_text(screen, block);
+        if let Some(clipboard) = &mut self.clipboard {
+            let _ = clipboard.set_text(&text);
+        }
+        true
+    }
+
     fn cycle_opacity(&mut self) {
         const STEPS: [f64; 3] = [1.0, 0.85, 0.7];
         let idx = STEPS
@@ -748,6 +933,109 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_opacity(self.opacity);
         }
+    }
+
+    fn settings_ctx(&self) -> SettingsContext {
+        let config = self.config.as_ref();
+        SettingsContext {
+            font_size: config.map_or(14.0, |c| c.font.size),
+            opacity: self.opacity,
+            theme: config
+                .map(|c| SettingsMenu::theme_name(&c.colors.background))
+                .unwrap_or_else(|| "tokyo-night".to_string()),
+        }
+    }
+
+    fn apply_config_to_renderer(&mut self) {
+        if let Some(config) = &self.config {
+            self.opacity = config.window.opacity;
+            self.font_path = config.font.path.clone();
+            if let Some(renderer) = &mut self.renderer {
+                renderer.reload_config(config);
+            }
+        }
+    }
+
+    fn toggle_settings(&mut self) {
+        self.settings.toggle();
+        if self.settings.open {
+            let ctx = self.settings_ctx();
+            self.settings.refresh(&ctx);
+            if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+                self.settings.save_screen(pane.parser.screen());
+            }
+            self.draw_settings_overlay();
+        } else {
+            self.close_settings();
+        }
+    }
+
+    fn close_settings(&mut self) {
+        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+            self.settings.restore_screen(pane.parser.screen_mut());
+        }
+        self.settings.open = false;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn draw_settings_overlay(&mut self) {
+        let Some(pane) = self.panes.get_mut(&self.active_pane) else {
+            return;
+        };
+        let (cols, rows) = {
+            let s = pane.parser.screen();
+            (s.size().cols, s.size().rows)
+        };
+        let bytes = self.settings.overlay_bytes(cols, rows);
+        pane.parser.parse(&bytes);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn apply_settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::Close => {
+                self.close_settings();
+                return;
+            }
+            SettingsAction::FontSizeDelta(delta) => {
+                if let Some(config) = &mut self.config {
+                    config.font.size = (config.font.size + delta as f32).max(6.0);
+                    let _ = config.save(None);
+                }
+            }
+            SettingsAction::OpacityDelta(delta) => {
+                self.opacity = (self.opacity + delta as f64).clamp(0.5, 1.0);
+                if let Some(config) = &mut self.config {
+                    config.window.opacity = self.opacity;
+                }
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_opacity(self.opacity);
+                }
+            }
+            SettingsAction::ToggleTheme | SettingsAction::CycleTheme => {
+                let bg = self
+                    .config
+                    .as_ref()
+                    .map_or("#1a1b26", |c| c.colors.background.as_str());
+                let (fg, bg) = self.settings.next_theme(bg);
+                if let Some(config) = &mut self.config {
+                    config.colors.foreground = fg.to_string();
+                    config.colors.background = bg.to_string();
+                    let _ = config.save(None);
+                }
+            }
+            SettingsAction::ReloadConfig => {
+                if let Some(config) = &mut self.config {
+                    config.reload(None).ok();
+                }
+            }
+        }
+        self.apply_config_to_renderer();
+        self.draw_settings_overlay();
     }
 }
 
@@ -770,6 +1058,9 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested");
+                if let Err(e) = session::save_session(&session::session_file_path(), &self.panes) {
+                    error!("Failed to save session: {}", e);
+                }
                 for (_, pane) in &self.panes {
                     let _ = pane.pty_tx.send(PtyCommand::Kill);
                 }
@@ -812,6 +1103,27 @@ impl ApplicationHandler for App {
                 // Tab management shortcuts
                 match &event.physical_key {
                     PhysicalKey::Code(code) => {
+                        if ctrl && shift && !alt && *code == KeyCode::KeyP {
+                            self.toggle_settings();
+                            return;
+                        }
+                        if self.settings.open {
+                            match code {
+                                KeyCode::ArrowUp => self.settings.prev(),
+                                KeyCode::ArrowDown => self.settings.next(),
+                                KeyCode::Enter => {
+                                    let ctx = self.settings_ctx();
+                                    let action = self.settings.activate(&ctx);
+                                    self.apply_settings_action(action);
+                                }
+                                KeyCode::Escape => self.close_settings(),
+                                _ => {}
+                            }
+                            if self.settings.open {
+                                self.draw_settings_overlay();
+                            }
+                            return;
+                        }
                         if ctrl && shift && !alt && *code == KeyCode::KeyT {
                             if let Err(e) = self.create_new_tab() {
                                 error!("Failed to create tab: {}", e);
@@ -821,6 +1133,20 @@ impl ApplicationHandler for App {
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyW {
                             self.close_active_tab();
+                            self.update_window_title();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyE {
+                            if let Err(e) = self.create_split_pane(SplitDir::Vertical) {
+                                error!("Failed to split pane: {}", e);
+                            }
+                            self.update_window_title();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyD {
+                            if let Err(e) = self.create_split_pane(SplitDir::Horizontal) {
+                                error!("Failed to split pane: {}", e);
+                            }
                             self.update_window_title();
                             return;
                         }
@@ -857,6 +1183,17 @@ impl ApplicationHandler for App {
                             return;
                         }
                         if alt && !ctrl && !shift {
+                            match code {
+                                KeyCode::ArrowLeft
+                                | KeyCode::ArrowRight
+                                | KeyCode::ArrowUp
+                                | KeyCode::ArrowDown => {
+                                    self.focus_adjacent_pane(*code);
+                                    self.update_window_title();
+                                    return;
+                                }
+                                _ => {}
+                            }
                             let idx = match code {
                                 KeyCode::Digit1 => Some(0),
                                 KeyCode::Digit2 => Some(1),
@@ -1094,7 +1431,9 @@ impl ApplicationHandler for App {
                     }
                 } else if button == MouseButton::Left {
                     if state == winit::event::ElementState::Pressed {
-                        self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+                        if !self.copy_block_output() {
+                            self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+                        }
                     } else {
                         self.end_selection();
                     }

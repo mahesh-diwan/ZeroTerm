@@ -22,6 +22,8 @@ zeroterm-ai = { path = "../zeroterm-ai" }
 zeroterm-sync = { path = "../zeroterm-sync" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 notify = { version = "7", features = ["macos_kqueue"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 zeroterm-ssh = { path = "../zeroterm-ssh" }

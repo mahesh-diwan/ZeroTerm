@@ -48,6 +48,10 @@ impl Selection {
 const ATLAS_SIZE: u32 = 1024;
 
 const ATTR_HAS_IMAGE: u32 = 0x400;
+const ATTR_BLOCK_DIVIDER: u32 = 0x800;
+const ATTR_DIM: u32 = 0x10;
+
+const COPY_MARKER: &str = "[copy]";
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -865,6 +869,16 @@ impl Renderer {
         let end = total_rows.saturating_sub(scroll_offset);
         let start = end.saturating_sub(visible_rows);
 
+        // ponytail: block start_line is buffer-local; divider rows only line up
+        // with view rows while scroll_offset == 0. Scrolled dividers are skipped.
+        let mut divider_rows = std::collections::HashSet::new();
+        let mut divider_meta: std::collections::HashMap<usize, Vec<char>> =
+            std::collections::HashMap::new();
+        for block in screen.blocks() {
+            divider_rows.insert(block.start_line);
+            divider_meta.insert(block.start_line, screen.block_metadata(block).chars().collect());
+        }
+
         let mut batch = vec![CellData::zeroed(); visible_rows * cols];
         for &(dirty_row, dirty_col) in &self.dirty_cells {
             if dirty_row >= visible_rows || dirty_col >= cols {
@@ -921,9 +935,32 @@ impl Renderer {
             let fg_color = [fg.r as f32 / 255.0, fg.g as f32 / 255.0, fg.b as f32 / 255.0, 1.0];
             let bg_color = [bg.r as f32 / 255.0, bg.g as f32 / 255.0, bg.b as f32 / 255.0, 1.0];
 
+            let mut ch = cell.ch;
+            if divider_rows.contains(&dirty_row) {
+                attrs |= ATTR_BLOCK_DIVIDER;
+                let meta = divider_meta.get(&dirty_row);
+                let meta_len = meta.map_or(0, Vec::len);
+                let copy_start = cols.saturating_sub(COPY_MARKER.len());
+                let meta_start = copy_start.saturating_sub(meta_len);
+                let overlay = if dirty_col >= copy_start {
+                    COPY_MARKER
+                        .as_bytes()
+                        .get(dirty_col - copy_start)
+                        .map(|&b| b as char)
+                } else if dirty_col >= meta_start {
+                    meta.and_then(|m| m.get(dirty_col - meta_start)).copied()
+                } else {
+                    None
+                };
+                if let Some(c) = overlay {
+                    ch = c;
+                    attrs |= ATTR_DIM;
+                }
+            }
+
             let (u0, v0, u1, v1, gw, gh) = self
                 .glyph_atlas
-                .get_or_insert_glyph(cell.ch, &self.device, &self.queue);
+                .get_or_insert_glyph(ch, &self.device, &self.queue);
 
             batch[dirty_row * cols + dirty_col] = CellData {
                 glyph_uv_min: [u0, v0],
