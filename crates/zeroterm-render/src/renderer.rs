@@ -58,6 +58,7 @@ const COPY_MARKER: &str = "[copy]";
 struct Uniforms {
     screen_size: [f32; 2],
     cell_size: [f32; 2],
+    viewport_origin: [f32; 2],
     cols: u32,
     rows: u32,
 }
@@ -403,6 +404,11 @@ pub struct Renderer {
     cell_height: f32,
     cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
+    viewport_origin: [f32; 2],
+    current_frame: Option<wgpu::SurfaceTexture>,
+    current_view: Option<wgpu::TextureView>,
+    current_encoder: Option<wgpu::CommandEncoder>,
+    needs_clear: bool,
     clear_color: [f64; 3],
     opacity: f64,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
@@ -486,6 +492,7 @@ impl Renderer {
         let uniforms = Uniforms {
             screen_size: [size.width as f32, size.height as f32],
             cell_size: [cell_width, cell_height],
+            viewport_origin: [0.0, 0.0],
             cols,
             rows,
         };
@@ -701,6 +708,11 @@ impl Renderer {
             cell_height,
             cell_buffer_capacity,
             dirty_cells: Vec::new(),
+            viewport_origin: [0.0, 0.0],
+            current_frame: None,
+            current_view: None,
+            current_encoder: None,
+            needs_clear: false,
             clear_color: [0.117, 0.117, 0.117],
             opacity,
             image_texture: Some(placeholder_tex),
@@ -758,6 +770,7 @@ impl Renderer {
         let uniforms = Uniforms {
             screen_size: [width as f32, height as f32],
             cell_size: [self.cell_width, self.cell_height],
+            viewport_origin: [0.0, 0.0],
             cols: new_cols as u32,
             rows: new_rows as u32,
         };
@@ -765,7 +778,21 @@ impl Renderer {
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
-    pub fn render(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
+    /// Offset added to every cell position in the shader (pixels).
+    /// Applied when render_screen writes uniforms; no separate write_buffer.
+    pub fn set_viewport(&mut self, x: f32, y: f32) {
+        self.viewport_origin = [x, y];
+    }
+
+    pub fn cols_for(&self, width: f32) -> usize {
+        (width / self.cell_size[0]).floor().max(1.0) as usize
+    }
+
+    pub fn rows_for(&self, height: f32) -> usize {
+        (height / self.cell_size[1]).floor().max(1.0) as usize
+    }
+
+    pub fn begin_frame(&mut self) -> Result<()> {
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -780,6 +807,27 @@ impl Renderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+        self.current_frame = Some(frame);
+        self.current_view = Some(view);
+        self.current_encoder = Some(encoder);
+        self.needs_clear = true;
+        Ok(())
+    }
+
+    pub fn render_screen(
+        &mut self,
+        screen: &CoreScreen,
+        scroll_offset: usize,
+        selection: Option<Selection>,
+    ) -> Result<()> {
+        if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
 
         let buffer = screen.buffer();
         let visible_rows = buffer.len();
@@ -804,52 +852,61 @@ impl Renderer {
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
             cell_size: [self.cell_width, self.cell_height],
+            viewport_origin: self.viewport_origin,
             cols: cols as u32,
             rows: visible_rows as u32,
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        // Render
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
+        let view = self.current_view.as_ref().unwrap();
+        let encoder = self.current_encoder.as_mut().unwrap();
+        let load = if self.needs_clear {
+            self.needs_clear = false;
+            wgpu::LoadOp::Clear(wgpu::Color {
+                r: self.clear_color[0],
+                g: self.clear_color[1],
+                b: self.clear_color[2],
+                a: self.opacity,
+            })
+        } else {
+            wgpu::LoadOp::Load
+        };
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: self.clear_color[0],
-                            g: self.clear_color[1],
-                            b: self.clear_color[2],
-                            a: self.opacity,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
 
-            let instance_count = (visible_rows * cols) as u32;
-            render_pass.draw(0..6, 0..instance_count);
+        let instance_count = (visible_rows * cols) as u32;
+        render_pass.draw(0..6, 0..instance_count);
+
+        Ok(())
+    }
+
+    pub fn end_frame(&mut self) -> Result<()> {
+        if let Some(encoder) = self.current_encoder.take() {
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        frame.present();
-
+        self.current_view = None;
+        if let Some(frame) = self.current_frame.take() {
+            frame.present();
+        }
         Ok(())
     }
 

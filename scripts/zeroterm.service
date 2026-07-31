@@ -1,0 +1,16 @@
+[Unit]
+Description=ZeroTerm terminal emulator
+# ZeroTerm embeds its settings sync daemon; it activates automatically when
+# sync.server_url is set in the config. There is no separate --sync flag, so
+# this unit runs the full terminal app and sync runs in-process.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zeroterm
+Restart=on-failure
+# GUI app: set your display session, e.g.:
+# Environment=DISPLAY=:0
+# Environment=WAYLAND_DISPLAY=wayland-0
+
+[Install]
+WantedBy=default.target

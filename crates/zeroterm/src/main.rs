@@ -15,6 +15,7 @@ use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use zeroterm_ai::client::AiClient;
 use zeroterm_config::Config;
+use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::{CommandBlock, Size as PtySize};
@@ -173,6 +174,140 @@ fn spawn_ssh_process(
     Ok((pty_rx, pty_tx))
 }
 
+/// SSH host picker overlay, drawn into the active pane like the settings menu.
+/// Destructive to covered cells, so the region is snapshotted on open and
+/// restored on close (same pattern as settings.rs).
+struct HostPicker {
+    open: bool,
+    aliases: Vec<String>,
+    cursor: usize,
+    saved_cells: Option<Vec<Vec<Cell>>>,
+    saved_top: Option<usize>,
+    saved_cursor: Option<Cursor>,
+}
+
+impl HostPicker {
+    fn new() -> Self {
+        Self {
+            open: false,
+            aliases: Vec::new(),
+            cursor: 0,
+            saved_cells: None,
+            saved_top: None,
+            saved_cursor: None,
+        }
+    }
+
+    fn open(&mut self, aliases: Vec<String>) {
+        self.aliases = aliases;
+        self.cursor = 0;
+        self.open = true;
+    }
+
+    fn next(&mut self) {
+        if !self.aliases.is_empty() {
+            self.cursor = (self.cursor + 1) % self.aliases.len();
+        }
+    }
+
+    fn prev(&mut self) {
+        if !self.aliases.is_empty() {
+            self.cursor = (self.cursor + self.aliases.len() - 1) % self.aliases.len();
+        }
+    }
+
+    fn selected(&self) -> Option<String> {
+        self.aliases.get(self.cursor).cloned()
+    }
+
+    fn panel_lines(&self) -> Vec<String> {
+        let mut lines = vec![" SSH Hosts ".to_string()];
+        for (i, alias) in self.aliases.iter().enumerate() {
+            let marker = if i == self.cursor { '>' } else { ' ' };
+            lines.push(format!(" {} {}", marker, alias));
+        }
+        lines.push(" arrows: navigate  enter: connect  esc: cancel ".to_string());
+        lines
+    }
+
+    fn overlay_rect(&self, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+        let lines = self.panel_lines();
+        let width = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(10)
+            .min(cols.saturating_sub(2))
+            .max(2);
+        let height = lines.len().min(rows).max(2);
+        let top = (rows - height) / 2;
+        let left = (cols - width) / 2;
+        (top, left, height, width)
+    }
+
+    fn overlay_bytes(&self, cols: usize, rows: usize) -> Vec<u8> {
+        let lines = self.panel_lines();
+        let (top, left, height, width) = self.overlay_rect(cols, rows);
+        let panel_bg = (40, 44, 52);
+        let panel_fg = (197, 200, 198);
+        let sel_bg = (61, 89, 171);
+        let sel_fg = (255, 255, 255);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1b[?25l");
+        for (i, line) in lines.iter().take(height).enumerate() {
+            let (bg, fg) = if i >= 1 && i - 1 == self.cursor {
+                (sel_bg, sel_fg)
+            } else {
+                (panel_bg, panel_fg)
+            };
+            let text: String = line.chars().take(width).collect();
+            let pad = width.saturating_sub(text.chars().count());
+            out.extend_from_slice(format!("\x1b[{};{}H", top + i + 1, left + 1).as_bytes());
+            out.extend_from_slice(
+                format!(
+                    "\x1b[48;2;{};{};{}m\x1b[38;2;{};{};{}m",
+                    bg.0, bg.1, bg.2, fg.0, fg.1, fg.2
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(text.as_bytes());
+            for _ in 0..pad {
+                out.push(b' ');
+            }
+            out.extend_from_slice(b"\x1b[0m");
+        }
+        out
+    }
+
+    fn save_screen(&mut self, screen: &zeroterm_core::screen::Screen) {
+        let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
+        let buf = screen.buffer();
+        self.saved_cells = Some(
+            (0..height)
+                .map(|i| buf.get(top + i).cloned().unwrap_or_default())
+                .collect(),
+        );
+        self.saved_top = Some(top);
+        self.saved_cursor = Some(screen.cursor());
+    }
+
+    fn restore_screen(&mut self, screen: &mut zeroterm_core::screen::Screen) {
+        if let (Some(cells), Some(top), Some(cursor)) =
+            (&self.saved_cells, self.saved_top, &self.saved_cursor)
+        {
+            for (i, row_cells) in cells.iter().enumerate() {
+                screen.set_cells(top + i, row_cells);
+            }
+            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
+            screen.set_cursor_visible(cursor.visible);
+        }
+        self.saved_cells = None;
+        self.saved_top = None;
+        self.saved_cursor = None;
+    }
+}
+
 #[allow(dead_code)]
 struct App {
     window: Option<Arc<Window>>,
@@ -181,7 +316,7 @@ struct App {
     active_pane: usize,
     next_pane_id: usize,
     tabs: Vec<Tab>,
-    // ponytail: split rendering shows active pane fullscreen; per-pane viewport rendering when renderer supports it
+    // ponytail: per-pane scroll kept as single field, inactive panes render at offset 0
     split_root: SplitNode,
     modifiers: ModifiersState,
     scroll_offset: usize,
@@ -201,6 +336,7 @@ struct App {
     cursor_visible: bool,
     font_path: Option<String>,
     settings: SettingsMenu,
+    host_picker: HostPicker,
 }
 
 #[allow(dead_code)]
@@ -232,6 +368,7 @@ impl App {
             cursor_visible: true,
             font_path: None,
             settings: SettingsMenu::new(&SettingsContext::default()),
+            host_picker: HostPicker::new(),
         }
     }
 
@@ -464,6 +601,7 @@ impl App {
             self.split_root.insert_leaf(id, dir, parent, 0.5);
             self.active_pane = id;
             self.scroll_offset = 0;
+            self.resize_panes_to_rects();
         }
         Ok(())
     }
@@ -481,6 +619,7 @@ impl App {
         let first = *self.panes.keys().next().unwrap_or(&0);
         self.active_pane = first;
         self.scroll_offset = 0;
+        self.resize_panes_to_rects();
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -623,6 +762,60 @@ impl App {
         Ok(())
     }
 
+    fn open_host_picker(&mut self) {
+        let aliases = zeroterm_ssh::client::ssh_aliases();
+        if aliases.is_empty() {
+            return;
+        }
+        self.host_picker.open(aliases);
+        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+            self.host_picker.save_screen(pane.parser.screen());
+        }
+        self.draw_host_picker();
+    }
+
+    fn draw_host_picker(&mut self) {
+        let Some(pane) = self.panes.get_mut(&self.active_pane) else {
+            return;
+        };
+        let (cols, rows) = {
+            let s = pane.parser.screen();
+            (s.size().cols, s.size().rows)
+        };
+        let bytes = self.host_picker.overlay_bytes(cols, rows);
+        pane.parser.parse(&bytes);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn close_host_picker(&mut self) {
+        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+            self.host_picker.restore_screen(pane.parser.screen_mut());
+        }
+        self.host_picker.open = false;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn pick_host(&mut self) {
+        let Some(alias) = self.host_picker.selected() else {
+            self.close_host_picker();
+            return;
+        };
+        self.close_host_picker();
+        let user = self
+            .config
+            .as_ref()
+            .map_or_else(String::new, |c| c.ssh.user.clone());
+        let port = self.config.as_ref().map_or(22, |c| c.ssh.port);
+        if let Err(e) = self.connect_ssh(&alias, &user, port) {
+            error!("SSH connect failed: {}", e);
+        }
+        self.update_window_title();
+    }
+
     fn ai_explain(&self) {
         if let Some(ai_client) = &self.ai_client {
             if let Some(pane) = self.panes.get(&self.active_pane) {
@@ -713,6 +906,7 @@ impl App {
                 }
             }
         }
+        self.resize_panes_to_rects();
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {
                 window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
@@ -742,23 +936,62 @@ impl App {
         if self.settings.open {
             self.draw_settings_overlay();
         }
-        if let Some(renderer) = &mut self.renderer {
+        let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
+            return Ok(());
+        };
+        let win_size = window.inner_size();
+
+        renderer.begin_frame()?;
+
+        let rects = self.split_root.compute_rects();
+        if rects.len() <= 1 {
             if let Some(pane) = self.panes.get(&self.active_pane) {
-                renderer.render(pane.parser.screen(), self.scroll_offset, self.selection)?;
+                renderer.set_viewport(0.0, 0.0);
+                renderer.render_screen(pane.parser.screen(), self.scroll_offset, self.selection)?;
+            }
+        } else {
+            let mut ordered: Vec<(usize, (f32, f32, f32, f32))> = rects.into_iter().collect();
+            ordered.sort_by_key(|(id, _)| *id);
+            for (id, (nx, ny, _, _)) in ordered {
+                let Some(pane) = self.panes.get(&id) else {
+                    continue;
+                };
+                let px = nx * win_size.width as f32;
+                let py = ny * win_size.height as f32;
+                let is_active = id == self.active_pane;
+                renderer.set_viewport(px, py);
+                renderer.render_screen(
+                    pane.parser.screen(),
+                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active { self.selection } else { None },
+                )?;
             }
         }
+
+        renderer.end_frame()?;
         Ok(())
+    }
+
+    /// Resize every split-tree pane's parser + pty to its rect dims.
+    fn resize_panes_to_rects(&mut self) {
+        let (Some(renderer), Some(window)) = (&self.renderer, &self.window) else {
+            return;
+        };
+        let size = window.inner_size();
+        let rects = self.split_root.compute_rects();
+        for (&id, &(_, _, nw, nh)) in &rects {
+            let cols = renderer.cols_for(nw * size.width as f32);
+            let rows = renderer.rows_for(nh * size.height as f32);
+            if let Some(pane) = self.panes.get_mut(&id) {
+                pane.parser.screen_mut().resize(cols, rows);
+                let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+            }
+        }
     }
 
     fn write_pty(&self, data: &[u8]) {
         if let Some(pane) = self.panes.get(&self.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
-        }
-    }
-
-    fn resize_pty(&self, cols: usize, rows: usize) {
-        if let Some(pane) = self.panes.get(&self.active_pane) {
-            let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
         }
     }
 
@@ -780,6 +1013,55 @@ impl App {
 
     fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    // Jump scroll to nearest command block in delta direction (-1 = prev, +1 = next)
+    // relative to the middle of the current view. Block start_line is buffer-local;
+    // global row = scrollback.len() + start_line. All buffer rows sit at the bottom of
+    // the scrollable range, so a jump clamps to offset 0, landing the block at its
+    // natural buffer row (near the top only when start_line is small).
+    fn jump_to_block(&mut self, delta: i32) {
+        let Some(pane) = self.active_pane() else {
+            return;
+        };
+        let screen = pane.parser.screen();
+        if screen.blocks().is_empty() {
+            return;
+        }
+        let scrollback = screen.scrollback().len();
+        let visible = screen.size().rows;
+        let total = scrollback + visible;
+        let start = total
+            .saturating_sub(self.scroll_offset)
+            .saturating_sub(visible);
+        let mid = start + visible / 2;
+        let target_row = if delta < 0 {
+            screen
+                .blocks()
+                .iter()
+                .rev()
+                .find(|b| scrollback + b.start_line < mid)
+                .map(|b| scrollback + b.start_line)
+        } else {
+            screen
+                .blocks()
+                .iter()
+                .find(|b| scrollback + b.start_line > mid)
+                .map(|b| scrollback + b.start_line)
+        };
+        let Some(target_row) = target_row else {
+            return;
+        };
+        let offset = total
+            .saturating_sub(target_row + visible)
+            .min(self.max_scroll_offset());
+        if offset == self.scroll_offset {
+            return;
+        }
+        self.scroll_offset = offset;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     // Selection methods
@@ -1067,23 +1349,10 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                let cell_size = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.cell_size())
-                    .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
-                let cell_w = cell_size[0];
-                let cell_h = cell_size[1];
-                let cols = (size.width as f32 / cell_w) as usize;
-                let rows = (size.height as f32 / cell_h) as usize;
-
-                self.resize_pty(cols, rows);
-                if let Some(pane) = self.panes.get_mut(&self.active_pane) {
-                    pane.parser.screen_mut().resize(cols, rows);
-                }
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
+                self.resize_panes_to_rects();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1105,6 +1374,19 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(code) => {
                         if ctrl && shift && !alt && *code == KeyCode::KeyP {
                             self.toggle_settings();
+                            return;
+                        }
+                        if self.host_picker.open {
+                            match code {
+                                KeyCode::ArrowUp => self.host_picker.prev(),
+                                KeyCode::ArrowDown => self.host_picker.next(),
+                                KeyCode::Enter => self.pick_host(),
+                                KeyCode::Escape => self.close_host_picker(),
+                                _ => {}
+                            }
+                            if self.host_picker.open {
+                                self.draw_host_picker();
+                            }
                             return;
                         }
                         if self.settings.open {
@@ -1168,8 +1450,18 @@ impl ApplicationHandler for App {
                                         error!("SSH connect failed: {}", e);
                                     }
                                     self.update_window_title();
+                                } else {
+                                    self.open_host_picker();
                                 }
                             }
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyK {
+                            self.jump_to_block(-1);
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyJ {
+                            self.jump_to_block(1);
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::Tab {

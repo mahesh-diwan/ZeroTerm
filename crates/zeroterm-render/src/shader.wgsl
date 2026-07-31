@@ -1,11 +1,9 @@
 struct Uniforms {
     screen_size: vec2<f32>,
     cell_size: vec2<f32>,
-    cursor_pos: vec2<f32>,
-    cursor_visible: u32,
+    viewport_origin: vec2<f32>,
     cols: u32,
     rows: u32,
-    _padding: u32,
 }
 
 @group(0) @binding(0)
@@ -55,7 +53,7 @@ fn vs_main(input: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput
     let cell_origin = vec2<f32>(f32(col), f32(row)) * uniforms.cell_size;
     let local = input.position;
 
-    let pos = cell_origin + local * uniforms.cell_size;
+    let pos = uniforms.viewport_origin + cell_origin + local * uniforms.cell_size;
 
     let x = pos.x / uniforms.screen_size.x * 2.0 - 1.0;
     let y = 1.0 - pos.y / uniforms.screen_size.y * 2.0;
