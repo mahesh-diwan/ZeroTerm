@@ -22,7 +22,7 @@ use zeroterm_core::screen::{CommandBlock, Size as PtySize};
 use zeroterm_core::Parser;
 use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
-use zeroterm_render::{Renderer, Selection};
+use zeroterm_render::{Renderer, Selection, TabInfo};
 use zeroterm_sync::daemon::SyncDaemon;
 
 use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
@@ -855,6 +855,48 @@ impl App {
         }
     }
 
+    fn ai_suggest(&self) {
+        let Some(ai_client) = &self.ai_client else {
+            warn!("ai_suggest: no AI client configured");
+            return;
+        };
+        let Some(pane) = self.panes.get(&self.active_pane) else {
+            return;
+        };
+        let blocks = pane.parser.screen().blocks();
+        if blocks.is_empty() {
+            warn!("ai_suggest: no command history");
+            return;
+        }
+        let history: Vec<&str> = blocks
+            .iter()
+            .rev()
+            .take(10)
+            .map(|b| b.command.as_str())
+            .filter(|c| !c.is_empty())
+            .collect();
+        let history = history.into_iter().rev().collect::<Vec<_>>().join("\n");
+        let client = ai_client.clone();
+        let tx = pane.pty_tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    warn!("ai_suggest: runtime error: {}", e);
+                    return;
+                }
+            };
+            match rt.block_on(client.suggest(&history)) {
+                Ok(suggestion) => {
+                    let _ = tx.send(PtyCommand::Write(suggestion.into_bytes()));
+                }
+                Err(e) => {
+                    warn!("ai_suggest: {}", e);
+                }
+            }
+        });
+    }
+
     fn drain_pty(&mut self) -> bool {
         let mut got_data = false;
         let active = self.active_pane;
@@ -940,13 +982,32 @@ impl App {
             return Ok(());
         };
         let win_size = window.inner_size();
+        let tab_h = renderer.cell_size()[1];
+        let content_h = (win_size.height as f32 - tab_h).max(0.0);
 
         renderer.begin_frame()?;
+
+        let mut tab_ids: Vec<usize> = self.panes.keys().copied().collect();
+        tab_ids.sort();
+        let active_idx = tab_ids
+            .iter()
+            .position(|&id| id == self.active_pane)
+            .unwrap_or(0);
+        let tab_infos: Vec<TabInfo> = tab_ids
+            .iter()
+            .map(|&id| TabInfo {
+                title: self
+                    .panes
+                    .get(&id)
+                    .map_or_else(String::new, |p| p.title.clone()),
+                active: id == self.active_pane,
+            })
+            .collect();
 
         let rects = self.split_root.compute_rects();
         if rects.len() <= 1 {
             if let Some(pane) = self.panes.get(&self.active_pane) {
-                renderer.set_viewport(0.0, 0.0);
+                renderer.set_viewport(0.0, tab_h);
                 renderer.render_screen(pane.parser.screen(), self.scroll_offset, self.selection)?;
             }
         } else {
@@ -957,7 +1018,7 @@ impl App {
                     continue;
                 };
                 let px = nx * win_size.width as f32;
-                let py = ny * win_size.height as f32;
+                let py = ny * content_h + tab_h;
                 let is_active = id == self.active_pane;
                 renderer.set_viewport(px, py);
                 renderer.render_screen(
@@ -967,6 +1028,8 @@ impl App {
                 )?;
             }
         }
+
+        renderer.draw_tab_bar(&tab_infos, active_idx)?;
 
         renderer.end_frame()?;
         Ok(())
@@ -978,10 +1041,12 @@ impl App {
             return;
         };
         let size = window.inner_size();
+        let tab_h = renderer.cell_size()[1];
+        let content_h = (size.height as f32 - tab_h).max(0.0);
         let rects = self.split_root.compute_rects();
         for (&id, &(_, _, nw, nh)) in &rects {
             let cols = renderer.cols_for(nw * size.width as f32);
-            let rows = renderer.rows_for(nh * size.height as f32);
+            let rows = renderer.rows_for(nh * content_h);
             if let Some(pane) = self.panes.get_mut(&id) {
                 pane.parser.screen_mut().resize(cols, rows);
                 let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
@@ -1065,36 +1130,93 @@ impl App {
     }
 
     // Selection methods
-    fn screen_to_cell(&self, x: f32, y: f32) -> Option<(usize, usize)> {
-        if let (Some(renderer), Some(pane)) = (&self.renderer, self.active_pane()) {
-            let cell_size = renderer.cell_size();
-            let cell_w = cell_size[0];
-            let cell_h = cell_size[1];
-            let screen = pane.parser.screen();
-            let buffer = screen.buffer();
-            let visible_rows = buffer.len();
-            let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+    /// Tab bar height in pixels = one cell row (must match render()'s content_h math).
+    fn tab_bar_height(&self) -> f32 {
+        self.renderer.as_ref().map_or(0.0, |r| r.cell_size()[1])
+    }
 
-            let col = (x / cell_w).floor() as usize;
-            let row = (y / cell_h).floor() as usize;
-
-            if row < visible_rows && col < cols {
-                let scrollback = screen.scrollback().len();
-                let total_rows = scrollback + visible_rows;
-                let end = total_rows.saturating_sub(self.scroll_offset);
-                let start = end.saturating_sub(visible_rows);
-                let global_row = start + row;
-                Some((global_row, col))
-            } else {
-                None
+    /// Map a window pixel point to the pane under it (normalized rects × window size).
+    fn pane_at_point(&self, x: f32, y: f32) -> Option<usize> {
+        let rects = self.split_root.compute_rects();
+        if rects.len() <= 1 {
+            return rects.keys().next().copied();
+        }
+        let window = self.window.as_ref()?;
+        let win_w = window.inner_size().width as f32;
+        let tab_h = self.tab_bar_height();
+        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+        for (&id, &(nx, ny, nw, nh)) in &rects {
+            let (px, py, pw, ph) = (
+                nx * win_w,
+                ny * content_h + tab_h,
+                nw * win_w,
+                nh * content_h,
+            );
+            if x >= px && y >= py && x < px + pw && y < py + ph {
+                return Some(id);
             }
+        }
+        None
+    }
+
+    fn screen_to_cell(&self, pane_id: usize, x: f32, y: f32) -> Option<(usize, usize)> {
+        let (Some(renderer), Some(pane)) = (&self.renderer, self.panes.get(&pane_id)) else {
+            return None;
+        };
+        let rect = self.split_root.compute_rects().get(&pane_id).copied()?;
+        let window = self.window.as_ref()?;
+        let win_w = window.inner_size().width as f32;
+        let tab_h = self.tab_bar_height();
+        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+        let (px, py, pw, ph) = (
+            rect.0 * win_w,
+            rect.1 * content_h + tab_h,
+            rect.2 * win_w,
+            rect.3 * content_h,
+        );
+        let (lx, ly) = (x - px, y - py);
+        if lx < 0.0 || ly < 0.0 || lx >= pw || ly >= ph {
+            return None;
+        }
+        let cell_size = renderer.cell_size();
+        let cell_w = cell_size[0];
+        let cell_h = cell_size[1];
+        let screen = pane.parser.screen();
+        let buffer = screen.buffer();
+        let visible_rows = buffer.len();
+        let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+        let col = (lx / cell_w).floor() as usize;
+        let row = (ly / cell_h).floor() as usize;
+
+        if row < visible_rows && col < cols {
+            let scrollback = screen.scrollback().len();
+            let total_rows = scrollback + visible_rows;
+            // scroll_offset is a single field owned by the active pane; inactive panes render at 0
+            let offset = if pane_id == self.active_pane {
+                self.scroll_offset
+            } else {
+                0
+            };
+            let end = total_rows.saturating_sub(offset);
+            let start = end.saturating_sub(visible_rows);
+            let global_row = start + row;
+            Some((global_row, col))
         } else {
             None
         }
     }
 
     fn start_selection(&mut self, x: f32, y: f32) {
-        if let Some((row, col)) = self.screen_to_cell(x, y) {
+        let Some(pane_id) = self.pane_at_point(x, y) else {
+            return;
+        };
+        // Click focuses the clicked pane so selection renders/copies against its screen.
+        if pane_id != self.active_pane {
+            self.active_pane = pane_id;
+            self.scroll_offset = 0;
+        }
+        if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
             self.selection = Some(Selection {
                 start_row: row,
                 start_col: col,
@@ -1108,7 +1230,8 @@ impl App {
 
     fn update_selection(&mut self, x: f32, y: f32) {
         if self.selecting {
-            if let Some((row, col)) = self.screen_to_cell(x, y) {
+            // Selection lives in the active pane (click focused it); leaving its rect clamps.
+            if let Some((row, col)) = self.screen_to_cell(self.active_pane, x, y) {
                 if let Some(sel) = &mut self.selection {
                     sel.end_row = row;
                     sel.end_col = col;
@@ -1175,14 +1298,22 @@ impl App {
     }
 
     fn copy_block_output(&mut self) -> bool {
-        if self.scroll_offset != 0 {
-            return false;
-        }
-        let Some((global_row, col)) = self.screen_to_cell(self.mouse_pos.0, self.mouse_pos.1)
-        else {
+        let (x, y) = self.mouse_pos;
+        let Some(pane_id) = self.pane_at_point(x, y) else {
             return false;
         };
-        let Some(pane) = self.active_pane() else {
+        let offset = if pane_id == self.active_pane {
+            self.scroll_offset
+        } else {
+            0
+        };
+        if offset != 0 {
+            return false;
+        }
+        let Some((global_row, col)) = self.screen_to_cell(pane_id, x, y) else {
+            return false;
+        };
+        let Some(pane) = self.panes.get(&pane_id) else {
             return false;
         };
         let screen = pane.parser.screen();
@@ -1436,6 +1567,10 @@ impl ApplicationHandler for App {
                             self.ai_explain();
                             return;
                         }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyA {
+                            self.ai_suggest();
+                            return;
+                        }
                         if ctrl && shift && !alt && *code == KeyCode::KeyO {
                             self.cycle_opacity();
                             return;
@@ -1664,8 +1799,26 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
+                let x = position.x as f32;
+                let y = position.y as f32;
+                // ponytail: focus-follows-mouse hardcoded ON; gate on config.mouse.focus_follows
+                // when the config gains a mouse section. Skipped during drag-select.
+                let hovered = self.pane_at_point(x, y);
+                if !self.selecting {
+                    if let Some(id) = hovered {
+                        if id != self.active_pane {
+                            self.active_pane = id;
+                            self.scroll_offset = 0;
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
+                }
+                let pane_id = hovered.unwrap_or(self.active_pane);
                 let mouse_tracking = self
-                    .active_pane()
+                    .panes
+                    .get(&pane_id)
                     .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
                 if let Some(window) = &self.window {
                     if mouse_tracking != MouseTrackingMode::Off {
@@ -1675,9 +1828,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 if mouse_tracking == MouseTrackingMode::AnyEvent && !self.selecting {
-                    if let Some((row, col)) =
-                        self.screen_to_cell(position.x as f32, position.y as f32)
-                    {
+                    if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
                         let mods = (if self.modifiers.shift_key() { 4 } else { 0 })
                             | (if self.modifiers.control_key() { 8 } else { 0 })
                             | (if self.modifiers.alt_key() { 16 } else { 0 });
@@ -1687,15 +1838,18 @@ impl ApplicationHandler for App {
                     }
                 }
                 if self.selecting {
-                    self.update_selection(position.x as f32, position.y as f32);
+                    self.update_selection(x, y);
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = self.mouse_pos;
+                let pane_id = self.pane_at_point(x, y).unwrap_or(self.active_pane);
                 let mouse_tracking = self
-                    .active_pane()
+                    .panes
+                    .get(&pane_id)
                     .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
                 if mouse_tracking != MouseTrackingMode::Off {
                     let button_id = match button {
@@ -1704,9 +1858,7 @@ impl ApplicationHandler for App {
                         MouseButton::Right => 2,
                         _ => 0,
                     };
-                    if let Some((row, col)) =
-                        self.screen_to_cell(self.mouse_pos.0, self.mouse_pos.1)
-                    {
+                    if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
                         let mods = (if self.modifiers.shift_key() { 4 } else { 0 })
                             | (if self.modifiers.control_key() { 8 } else { 0 })
                             | (if self.modifiers.alt_key() { 16 } else { 0 });
@@ -1724,7 +1876,7 @@ impl ApplicationHandler for App {
                 } else if button == MouseButton::Left {
                     if state == winit::event::ElementState::Pressed {
                         if !self.copy_block_output() {
-                            self.start_selection(self.mouse_pos.0, self.mouse_pos.1);
+                            self.start_selection(x, y);
                         }
                     } else {
                         self.end_selection();
@@ -1735,6 +1887,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let (x, y) = self.mouse_pos;
+                // ponytail: single scroll_offset field; wheel over another pane focuses it
+                // first, then scrolls (per-pane scroll map skipped)
+                if let Some(id) = self.pane_at_point(x, y) {
+                    if id != self.active_pane {
+                        self.active_pane = id;
+                        self.scroll_offset = 0;
+                    }
+                }
                 match delta {
                     MouseScrollDelta::LineDelta(_, y) => {
                         if y > 0.0 {

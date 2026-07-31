@@ -362,6 +362,9 @@ impl Screen {
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
 
+        // ponytail: scrollback is capped, so more iterations than the cap are wasted
+        let n = n.min(self.scrollback_limit);
+
         for _ in 0..n {
             if top < bottom {
                 let line = self.current_buffer_mut().remove(top);
@@ -379,6 +382,9 @@ impl Screen {
         let top = self.scroll_top();
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
+
+        // ponytail: scrollback is capped, so more iterations than the cap are wasted
+        let n = n.min(self.scrollback_limit);
 
         for _ in 0..n {
             if top < bottom {

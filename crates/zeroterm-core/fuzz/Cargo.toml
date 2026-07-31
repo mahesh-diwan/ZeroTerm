@@ -1,0 +1,22 @@
+[package]
+name = "zeroterm-core-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone crate: own lockfile, out of the main workspace
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zeroterm-core = { path = ".." }
+
+[[bin]]
+name = "fuzz_parser"
+path = "fuzz_targets/fuzz_parser.rs"
+test = false
+doc = false
+bench = false

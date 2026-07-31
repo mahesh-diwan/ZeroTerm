@@ -45,6 +45,12 @@ impl Selection {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TabInfo {
+    pub title: String,
+    pub active: bool,
+}
+
 const ATLAS_SIZE: u32 = 1024;
 
 const ATTR_HAS_IMAGE: u32 = 0x400;
@@ -397,6 +403,9 @@ pub struct Renderer {
     quad_vertex_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    tab_bar_buffer: wgpu::Buffer,
+    tab_bar_uniform_buffer: wgpu::Buffer,
+    tab_bar_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
@@ -689,6 +698,38 @@ impl Renderer {
 
         log::info!("Renderer initialized: {}x{} (cell buffer capacity: {} cells)", size.width, size.height, cell_buffer_capacity);
 
+        let tab_bar_buffer = {
+            let cells = vec![CellData::zeroed(); cols as usize];
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tab Bar Cell Buffer"),
+                contents: bytemuck::cast_slice(&cells),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let tab_bar_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Tab Bar Uniform Buffer"),
+            contents: bytemuck::cast_slice(&[uniforms]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tab_bar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Tab Bar Bind Group"),
+            layout: &render_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        tab_bar_uniform_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        tab_bar_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        });
+
         Ok(Self {
             surface,
             device,
@@ -700,6 +741,9 @@ impl Renderer {
             quad_vertex_buffer,
             uniform_buffer,
             uniform_bind_group,
+            tab_bar_buffer,
+            tab_bar_uniform_buffer,
+            tab_bar_bind_group,
             atlas_bind_group_layout,
             atlas_bind_group,
             glyph_atlas,
@@ -762,6 +806,32 @@ impl Renderer {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Buffer(self.cell_buffer.as_entire_buffer_binding()),
+                    },
+                ],
+            });
+            self.tab_bar_buffer = {
+                let cells = vec![CellData::zeroed(); new_cols];
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Tab Bar Cell Buffer"),
+                    contents: bytemuck::cast_slice(&cells),
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+            };
+            self.tab_bar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Tab Bar Bind Group"),
+                layout: &self.render_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(
+                            self.tab_bar_uniform_buffer.as_entire_buffer_binding(),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(
+                            self.tab_bar_buffer.as_entire_buffer_binding(),
+                        ),
                     },
                 ],
             });
@@ -907,6 +977,101 @@ impl Renderer {
         if let Some(frame) = self.current_frame.take() {
             frame.present();
         }
+        Ok(())
+    }
+
+    /// Render a horizontal tab strip at the top of the window (one cell tall).
+    /// Runs as its own instanced pass after the pane(s); shader is unchanged.
+    pub fn draw_tab_bar(&mut self, tabs: &[TabInfo], active: usize) -> Result<()> {
+        if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
+
+        const INACTIVE_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
+        const ACTIVE_BG: [f32; 4] = [0.28, 0.43, 0.62, 1.0];
+        const FG: [f32; 4] = [0.85, 0.88, 0.92, 1.0];
+        const FG_DIM: [f32; 4] = [0.55, 0.57, 0.62, 1.0];
+
+        let cols = self.cols_for(self.size.width as f32);
+        let space = self
+            .glyph_atlas
+            .get_or_insert_glyph(' ', &self.device, &self.queue);
+
+        let mut batch = vec![CellData::zeroed(); cols];
+        for cell in &mut batch {
+            cell.bg = INACTIVE_BG;
+            cell.fg = FG_DIM;
+            cell.glyph_uv_min = [space.0, space.1];
+            cell.glyph_uv_max = [space.2, space.3];
+            cell.glyph_size = [space.4, space.5];
+        }
+
+        let mut col = 1usize;
+        for (i, tab) in tabs.iter().enumerate() {
+            if col >= cols {
+                break;
+            }
+            let title = truncate_title(&tab.title, 20);
+            let span = title.chars().count().saturating_add(2);
+            let is_active = i == active;
+            let bg = if is_active { ACTIVE_BG } else { INACTIVE_BG };
+            let fg = if is_active { FG } else { FG_DIM };
+            let end = (col + span).min(cols);
+            for c in col..end {
+                batch[c].bg = bg;
+                batch[c].fg = fg;
+            }
+            for (k, ch) in title.chars().enumerate() {
+                let c = col + 1 + k;
+                if c >= cols {
+                    break;
+                }
+                let (u0, v0, u1, v1, gw, gh) = self
+                    .glyph_atlas
+                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+                batch[c].glyph_uv_min = [u0, v0];
+                batch[c].glyph_uv_max = [u1, v1];
+                batch[c].glyph_size = [gw, gh];
+            }
+            col += span + 1;
+        }
+
+        self.queue
+            .write_buffer(&self.tab_bar_buffer, 0, bytemuck::cast_slice(&batch));
+
+        let uniforms = Uniforms {
+            screen_size: [self.size.width as f32, self.size.height as f32],
+            cell_size: [self.cell_width, self.cell_height],
+            viewport_origin: [0.0, 0.0],
+            cols: cols as u32,
+            rows: 1,
+        };
+        self.queue
+            .write_buffer(&self.tab_bar_uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let view = self.current_view.as_ref().unwrap();
+        let encoder = self.current_encoder.as_mut().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Tab Bar Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.tab_bar_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        render_pass.draw(0..6, 0..cols as u32);
+
         Ok(())
     }
 
@@ -1116,5 +1281,15 @@ impl Renderer {
         } else {
             None
         }
+    }
+}
+
+fn truncate_title(title: &str, max: usize) -> String {
+    if title.chars().count() <= max {
+        title.to_string()
+    } else {
+        let mut s: String = title.chars().take(max).collect();
+        s.push('\u{2026}');
+        s
     }
 }
