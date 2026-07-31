@@ -318,6 +318,12 @@ struct App {
     tabs: Vec<Tab>,
     // ponytail: per-pane scroll kept as single field, inactive panes render at offset 0
     split_root: SplitNode,
+    // ponytail: no mouse hit-testing on the overlay rect; keyboard focus only
+    floating: Option<usize>,
+    // Split divider drag: Some(target) = dragging the divider whose first leaf
+    // is `target`; anchor is the last window-space mouse position.
+    dragging_divider: Option<usize>,
+    divider_anchor: (f32, f32),
     modifiers: ModifiersState,
     scroll_offset: usize,
     font_size: f32,
@@ -350,6 +356,9 @@ impl App {
             next_pane_id: 1,
             tabs: Vec::new(),
             split_root: SplitNode::Leaf(0),
+            floating: None,
+            dragging_divider: None,
+            divider_anchor: (0.0, 0.0),
             modifiers: ModifiersState::empty(),
             scroll_offset: 0,
             font_size: 14.0,
@@ -459,7 +468,8 @@ impl App {
         self.next_pane_id = 1;
 
         let session_path = session::session_file_path();
-        if let Some(records) = session::load_session(&session_path) {
+        if let Some((records, layout)) = session::load_session(&session_path) {
+            let mut restored_ids = Vec::new();
             if records.len() > 1 {
                 for record in records.iter().skip(1) {
                     let cmd = if record.cmd.is_empty() {
@@ -483,10 +493,14 @@ impl App {
                                 },
                             );
                             self.tabs.push(Tab::new(id));
+                            restored_ids.push(id);
                         }
                         Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
                     }
                 }
+            }
+            if layout.is_some() {
+                self.split_root = SplitNode::from_ids(&restored_ids);
             }
         }
 
@@ -621,6 +635,61 @@ impl App {
         self.scroll_offset = 0;
         self.resize_panes_to_rects();
         if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Toggle active pane between split-tree and floating overlay (Ctrl+Shift+F).
+    fn toggle_floating_pane(&mut self) {
+        let active = self.active_pane;
+        if self.floating == Some(active) {
+            // Dock: re-insert at first remaining tree leaf.
+            // ponytail: original slot lost (insert_leaf only splits a parent) — root-ish
+            // placement is the accepted ceiling.
+            self.floating = None;
+            if !self.split_root.leaves().contains(&active) {
+                let parent = *self.split_root.leaves().first().unwrap_or(&active);
+                self.split_root
+                    .insert_leaf(active, SplitDir::Vertical, parent, 0.5);
+            }
+            self.resize_panes_to_rects();
+        } else {
+            // Dock whatever was floating (one float at a time), then float active.
+            if let Some(prev) = self.floating.take() {
+                if !self.split_root.leaves().contains(&prev) {
+                    let parent = *self.split_root.leaves().first().unwrap_or(&prev);
+                    self.split_root
+                        .insert_leaf(prev, SplitDir::Vertical, parent, 0.5);
+                }
+            }
+            if self.split_root.leaves().len() > 1 {
+                self.split_root.remove_leaf(active);
+                self.floating = Some(active);
+                self.resize_panes_to_rects();
+            } else {
+                // ponytail: last visible pane stays in tree AND floats (overlay wins when
+                // drawn twice); zero visible panes not allowed.
+                self.floating = Some(active);
+            }
+        }
+        let Some(renderer) = &self.renderer else {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            return;
+        };
+        if let Some(window) = &self.window {
+            // Resize floating pane to overlay dims so cells don't overflow the box.
+            if let Some(id) = self.floating {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    let tab_h = renderer.cell_size()[1];
+                    let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+                    let cols = renderer.cols_for(window.inner_size().width as f32 * 0.7);
+                    let rows = renderer.rows_for(content_h * 0.7);
+                    pane.parser.screen_mut().resize(cols, rows);
+                    let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+                }
+            }
             window.request_redraw();
         }
     }
@@ -1006,9 +1075,16 @@ impl App {
 
         let rects = self.split_root.compute_rects();
         if rects.len() <= 1 {
-            if let Some(pane) = self.panes.get(&self.active_pane) {
+            // Render the tree leaf, not the floating pane (it renders last as overlay).
+            let tree_id = rects.keys().next().copied().unwrap_or(self.active_pane);
+            if let Some(pane) = self.panes.get(&tree_id) {
+                let is_active = tree_id == self.active_pane;
                 renderer.set_viewport(0.0, tab_h);
-                renderer.render_screen(pane.parser.screen(), self.scroll_offset, self.selection)?;
+                renderer.render_screen(
+                    pane.parser.screen(),
+                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active { self.selection } else { None },
+                )?;
             }
         } else {
             let mut ordered: Vec<(usize, (f32, f32, f32, f32))> = rects.into_iter().collect();
@@ -1021,6 +1097,22 @@ impl App {
                 let py = ny * content_h + tab_h;
                 let is_active = id == self.active_pane;
                 renderer.set_viewport(px, py);
+                renderer.render_screen(
+                    pane.parser.screen(),
+                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active { self.selection } else { None },
+                )?;
+            }
+        }
+
+        // Floating pane overlay — drawn last, on top of all split leaves.
+        if let Some(id) = self.floating {
+            if let Some(pane) = self.panes.get(&id) {
+                let fw = win_size.width as f32 * 0.7;
+                let fx = (win_size.width as f32 - fw) / 2.0;
+                let fy = tab_h + content_h * 0.15;
+                let is_active = id == self.active_pane;
+                renderer.set_viewport(fx, fy);
                 renderer.render_screen(
                     pane.parser.screen(),
                     if is_active { self.scroll_offset } else { 0 },
@@ -1154,6 +1246,61 @@ impl App {
             );
             if x >= px && y >= py && x < px + pw && y < py + ph {
                 return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Pane id of the tab under a window-space x,y (must match draw_tab_bar's
+    /// layout: sorted pane ids, starts at col 1, span = chars+2, col += span+1).
+    fn tab_at_point(&self, x: f32, y: f32) -> Option<usize> {
+        let tab_h = self.tab_bar_height();
+        if y < 0.0 || y >= tab_h || self.panes.is_empty() {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let cell_w = renderer.cell_size()[0];
+        let mut ids: Vec<usize> = self.panes.keys().copied().collect();
+        ids.sort();
+        let mut col = 1usize;
+        for id in ids {
+            let title = self
+                .panes
+                .get(&id)
+                .map_or_else(String::new, |p| p.title.clone());
+            let span = title.chars().count().saturating_add(2);
+            let start_px = col as f32 * cell_w;
+            let end_px = (col + span) as f32 * cell_w;
+            if x >= start_px && x < end_px {
+                return Some(id);
+            }
+            col += span + 1;
+        }
+        None
+    }
+
+    /// The divider (if any) within `tolerance` pixels of x,y, as (target, dir).
+    fn divider_at_point(&self, x: f32, y: f32, tolerance: f32) -> Option<(usize, SplitDir)> {
+        if self.split_root.leaves().len() <= 1 || y < self.tab_bar_height() {
+            return None;
+        }
+        let window = self.window.as_ref()?;
+        let win_w = window.inner_size().width as f32;
+        let tab_h = self.tab_bar_height();
+        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+        for (dir, boundary, target) in self.split_root.dividers() {
+            let (px, py) = match dir {
+                SplitDir::Vertical => (boundary * win_w, y),
+                SplitDir::Horizontal => (x, tab_h + boundary * content_h),
+            };
+            let dx = (px - x).abs();
+            let dy = (py - y).abs();
+            let hit = match dir {
+                SplitDir::Vertical => dx <= tolerance && y >= tab_h,
+                SplitDir::Horizontal => dy <= tolerance,
+            };
+            if hit {
+                return Some((target, dir));
             }
         }
         None
@@ -1471,7 +1618,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested");
-                if let Err(e) = session::save_session(&session::session_file_path(), &self.panes) {
+                if let Err(e) = session::save_session(
+                    &session::session_file_path(),
+                    &self.panes,
+                    Some(&self.split_root),
+                ) {
                     error!("Failed to save session: {}", e);
                 }
                 for (_, pane) in &self.panes {
@@ -1597,6 +1748,11 @@ impl ApplicationHandler for App {
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyJ {
                             self.jump_to_block(1);
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyF {
+                            self.toggle_floating_pane();
+                            self.update_window_title();
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::Tab {
@@ -1801,6 +1957,38 @@ impl ApplicationHandler for App {
                 self.mouse_pos = (position.x as f32, position.y as f32);
                 let x = position.x as f32;
                 let y = position.y as f32;
+                // Split divider drag: resize from last position delta, then bail.
+                if let Some(target) = self.dragging_divider {
+                    let window = self.window.as_ref();
+                    let (win_w, content_h) = window.map_or((1.0, 1.0), |w| {
+                        let tab = self.tab_bar_height();
+                        (
+                            w.inner_size().width as f32,
+                            (w.inner_size().height as f32 - tab).max(0.0),
+                        )
+                    });
+                    let (ax, ay) = self.divider_anchor;
+                    let (dx, dy) = (x - ax, y - ay);
+                    // Find this target's current divider to resize against its real boundary.
+                    let found = self
+                        .split_root
+                        .dividers()
+                        .into_iter()
+                        .find(|(_, _, t)| *t == target);
+                    if let Some((dir, boundary, _)) = found {
+                        let delta = match dir {
+                            SplitDir::Vertical => dx / win_w,
+                            SplitDir::Horizontal => dy / content_h,
+                        };
+                        self.split_root.resize_leaf(target, boundary, delta);
+                    }
+                    self.divider_anchor = (x, y);
+                    self.resize_panes_to_rects();
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 // ponytail: focus-follows-mouse hardcoded ON; gate on config.mouse.focus_follows
                 // when the config gains a mouse section. Skipped during drag-select.
                 let hovered = self.pane_at_point(x, y);
@@ -1846,6 +2034,32 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self.mouse_pos;
+                // Left press may start a divider drag or a tab switch; release ends drags.
+                if button == MouseButton::Left && state == winit::event::ElementState::Pressed {
+                    if let Some(pane_id) = self.tab_at_point(x, y) {
+                        if pane_id != self.active_pane {
+                            self.active_pane = pane_id;
+                            self.scroll_offset = 0;
+                        }
+                        self.end_selection();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                    if let Some((target, _)) = self.divider_at_point(x, y, 8.0) {
+                        self.dragging_divider = Some(target);
+                        self.divider_anchor = (x, y);
+                        self.end_selection();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                        return;
+                    }
+                }
+                if button == MouseButton::Left && state == winit::event::ElementState::Released {
+                    self.dragging_divider = None;
+                }
                 let pane_id = self.pane_at_point(x, y).unwrap_or(self.active_pane);
                 let mouse_tracking = self
                     .panes

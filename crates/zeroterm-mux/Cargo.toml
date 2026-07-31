@@ -6,6 +6,7 @@ license = "MIT"
 description = "Tabs, splits, session management for ZeroTerm"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

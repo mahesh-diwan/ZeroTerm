@@ -673,6 +673,9 @@ impl Parser {
                     }
                 }
             }
+        } else if osc.starts_with("1337;") {
+            // iTerm2 inline image protocol
+            self.handle_iterm_image(&osc[5..]);
         }
     }
 
@@ -704,6 +707,54 @@ impl Parser {
             return;
         }
         if let Ok(decoded) = decode_base64(data_part) {
+            let id = self.screen.place_image(decoded.clone(), width, height);
+            self.pending_images.push(ImageFragment {
+                id,
+                data: decoded,
+                width,
+                height,
+            });
+        }
+    }
+
+    fn handle_iterm_image(&mut self, payload: &str) {
+        let body = match payload.strip_prefix("File=") {
+            Some(b) => b,
+            None => return,
+        };
+        let (header, data_part) = match body.split_once(':') {
+            Some(hd) => hd,
+            None => return,
+        };
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut inline = true;
+        for pair in header.split(';') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "width" => width = v.parse().unwrap_or(0),
+                    "height" => height = v.parse().unwrap_or(0),
+                    // inline=0 means download-only in iTerm; display nothing
+                    "inline" => inline = v == "1",
+                    _ => {}
+                }
+            }
+        }
+        if !inline || data_part.is_empty() {
+            return;
+        }
+        if let Ok(decoded) = decode_base64(data_part) {
+            if decoded.is_empty() {
+                return;
+            }
+            // ponytail: cursor cell only, no row advance by ceil(h/cell_h)
+            let (mut width, mut height) = if width == 0 || height == 0 {
+                png_dimensions(&decoded)
+            } else {
+                (width, height)
+            };
+            width = width.max(1);
+            height = height.max(1);
             let id = self.screen.place_image(decoded.clone(), width, height);
             self.pending_images.push(ImageFragment {
                 id,
@@ -809,6 +860,17 @@ impl Parser {
     pub fn take_clipboard_text(&mut self) -> Option<String> {
         self.clipboard_text.take()
     }
+}
+
+fn png_dimensions(data: &[u8]) -> (u32, u32) {
+    const SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    // IHDR: 8-byte signature + 4-byte length + 4-byte "IHDR", then width/height
+    if data.len() < 24 || data[..8] != SIG {
+        return (0, 0);
+    }
+    let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+    let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+    (w, h)
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {

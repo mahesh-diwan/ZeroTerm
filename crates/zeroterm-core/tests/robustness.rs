@@ -210,3 +210,109 @@ fn kitty_and_sixel_garbage() {
     parse_and_check(b"\x1bPq#;2;0;0;0;0~-{}#$@!?\x1b\\");
     parse_and_check(b"\x1bPq");
 }
+
+// --------------------- iTerm2 inline image (OSC 1337) ---------------------
+
+const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64(data: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Structurally-valid 2x3 8-bit RGBA PNG. CRCs are zeros — the parser only
+/// reads the IHDR dims, so checksums don't matter here.
+fn tiny_png() -> Vec<u8> {
+    let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(&[0, 0, 0, 13]); // IHDR chunk length
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&[0, 0, 0, 2]); // width
+    png.extend_from_slice(&[0, 0, 0, 3]); // height
+    png.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA
+    png.extend_from_slice(&[0, 0, 0, 0]); // CRC
+    png.extend_from_slice(&[0, 0, 0, 1]); // IDAT chunk length
+    png.extend_from_slice(b"IDAT");
+    png.push(0); // payload (irrelevant to dims parsing)
+    png.extend_from_slice(&[0, 0, 0, 0]); // CRC
+    png.extend_from_slice(&[0, 0, 0, 0]); // IEND chunk length
+    png.extend_from_slice(b"IEND");
+    png.extend_from_slice(&[0, 0, 0, 0]); // CRC
+    png
+}
+
+#[test]
+fn iterm1337_inline_png_places_image() {
+    let png = tiny_png();
+    let seq = format!(
+        "\x1b]1337;File=name=aW1nLnBuZw==;size={};inline=1:{}\x07",
+        png.len(),
+        b64(&png)
+    );
+    let mut p = Parser::new(80, 24);
+    p.parse(seq.as_bytes());
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1, "one pending image");
+    assert_eq!(imgs[0].data, png, "payload round-trips");
+    assert_eq!(imgs[0].width, 2, "dims auto-parsed from PNG IHDR");
+    assert_eq!(imgs[0].height, 3);
+    assert!(
+        p.screen().image_cells().contains_key(&(0, 0)),
+        "image at cursor"
+    );
+    assert!(p.screen().image_registry().contains_key(&imgs[0].id));
+}
+
+#[test]
+fn iterm1337_header_dims_override_png() {
+    let png = tiny_png();
+    let seq = format!(
+        "\x1b]1337;File=name=AA;size=1;width=7;height=9;inline=1:{}\x07",
+        b64(&png)
+    );
+    let mut p = Parser::new(80, 24);
+    p.parse(seq.as_bytes());
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0].width, 7, "header width wins");
+    assert_eq!(imgs[0].height, 9, "header height wins");
+}
+
+#[test]
+fn iterm1337_garbage_base64_ignored() {
+    let mut p = Parser::new(80, 24);
+    // '!' is not base64 -> decodes to empty -> skipped
+    p.parse(b"\x1b]1337;File=name=AA;size=99;inline=1:!!!!\x07");
+    assert!(p.take_pending_images().is_empty());
+    assert!(p.screen().image_registry().is_empty());
+}
+
+#[test]
+fn iterm1337_malformed_ignored() {
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b]1337;File=name=AA;size=99\x07"); // no colon separator
+    p.parse(b"\x1b]1337;File=name=AA;size=99:\x07"); // empty payload
+    p.parse(b"\x1b]1337;notafile\x07"); // missing File= prefix
+    p.parse(b"\x1b]1337;File=name=AA;size=1;inline=0:QUFB\x07"); // download-only
+    assert!(p.take_pending_images().is_empty());
+    assert!(p.screen().image_registry().is_empty());
+}

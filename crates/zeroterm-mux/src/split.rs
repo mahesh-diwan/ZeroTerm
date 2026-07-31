@@ -2,13 +2,15 @@
 
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDir {
     Vertical,
     Horizontal,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SplitNode {
     Leaf(usize),
     Split {
@@ -38,6 +40,34 @@ impl SplitNode {
                 children.iter().flat_map(SplitNode::leaves).collect()
             }
         }
+    }
+
+    /// Rebuild a tree from a flat pane-id list (pane order preserved, left to right).
+    /// Empty list -> Leaf(0) so the default pane still renders.
+    pub fn from_ids(ids: &[usize]) -> Self {
+        fn build(ids: &[usize], depth: usize) -> SplitNode {
+            match ids.len() {
+                0 => SplitNode::Leaf(0),
+                1 => SplitNode::Leaf(ids[0]),
+                n => {
+                    let mid = n / 2;
+                    let dir = if depth % 2 == 0 {
+                        SplitDir::Vertical
+                    } else {
+                        SplitDir::Horizontal
+                    };
+                    SplitNode::Split {
+                        dir,
+                        ratio: 0.5,
+                        children: vec![
+                            build(&ids[..mid], depth + 1),
+                            build(&ids[mid..], depth + 1),
+                        ],
+                    }
+                }
+            }
+        }
+        build(ids, 0)
     }
 
     pub fn compute_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
@@ -94,6 +124,145 @@ impl SplitNode {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Divider lines as (dir, normalized boundary position, first-leaf target).
+    /// Boundary position is in the normalized 0..1 content space (x for Vertical,
+    /// y for Horizontal), matching compute_rects. DFS order, outermost first.
+    pub fn dividers(&self) -> Vec<(SplitDir, f32, usize)> {
+        let mut out = Vec::new();
+        self.collect_dividers(0.0, 0.0, 1.0, 1.0, &mut out);
+        out
+    }
+
+    fn collect_dividers(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        out: &mut Vec<(SplitDir, f32, usize)>,
+    ) {
+        match self {
+            SplitNode::Leaf(_) => {}
+            SplitNode::Split {
+                dir,
+                children,
+                ratio,
+            } => {
+                let n = children.len().max(1);
+                match dir {
+                    SplitDir::Vertical => {
+                        let first_w = w * ratio;
+                        let target = children[0].leaves()[0];
+                        out.push((SplitDir::Vertical, x + first_w, target));
+                        let rest_w = if n > 1 {
+                            (w - first_w) / (n - 1) as f32
+                        } else {
+                            0.0
+                        };
+                        let mut cx = x;
+                        for (i, child) in children.iter().enumerate() {
+                            let cw = if i == 0 { first_w } else { rest_w };
+                            child.collect_dividers(cx, y, cw, h, out);
+                            cx += cw;
+                        }
+                    }
+                    SplitDir::Horizontal => {
+                        let first_h = h * ratio;
+                        let target = children[0].leaves()[0];
+                        out.push((SplitDir::Horizontal, y + first_h, target));
+                        let rest_h = if n > 1 {
+                            (h - first_h) / (n - 1) as f32
+                        } else {
+                            0.0
+                        };
+                        let mut cy = y;
+                        for (i, child) in children.iter().enumerate() {
+                            let ch = if i == 0 { first_h } else { rest_h };
+                            child.collect_dividers(x, cy, w, ch, out);
+                            cy += ch;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adjust `ratio` of the split whose divider sits at `boundary` and whose
+    /// first-leaf is `target`. `delta` is the normalized move amount (positive
+    /// grows the first child). Clamps ratio to 0.15..0.85.
+    pub fn resize_leaf(&mut self, target: usize, boundary: f32, delta: f32) -> bool {
+        self.resize_walk(0.0, 0.0, 1.0, 1.0, target, boundary, delta)
+    }
+
+    fn resize_walk(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        target: usize,
+        boundary: f32,
+        delta: f32,
+    ) -> bool {
+        match self {
+            SplitNode::Leaf(_) => false,
+            SplitNode::Split {
+                dir,
+                children,
+                ratio,
+            } => {
+                let n = children.len().max(1);
+                let r = *ratio;
+                let (first_len, rest_len, divider_pos) = match dir {
+                    SplitDir::Vertical => (
+                        w * r,
+                        if n > 1 {
+                            (w - w * r) / (n - 1) as f32
+                        } else {
+                            0.0
+                        },
+                        x + w * r,
+                    ),
+                    SplitDir::Horizontal => (
+                        h * r,
+                        if n > 1 {
+                            (h - h * r) / (n - 1) as f32
+                        } else {
+                            0.0
+                        },
+                        y + h * r,
+                    ),
+                };
+                if (divider_pos - boundary).abs() < 0.001 && children[0].leaves()[0] == target {
+                    *ratio = (*ratio + delta).clamp(0.15, 0.85);
+                    return true;
+                }
+                let mut cx = x;
+                let mut cy = y;
+                for (i, child) in children.iter_mut().enumerate() {
+                    let (cw, ch) = match dir {
+                        SplitDir::Vertical => {
+                            let cw = if i == 0 { first_len } else { rest_len };
+                            (cw, h)
+                        }
+                        SplitDir::Horizontal => {
+                            let ch = if i == 0 { first_len } else { rest_len };
+                            (w, ch)
+                        }
+                    };
+                    if child.resize_walk(cx, cy, cw, ch, target, boundary, delta) {
+                        return true;
+                    }
+                    match dir {
+                        SplitDir::Vertical => cx += cw,
+                        SplitDir::Horizontal => cy += ch,
+                    }
+                }
+                false
             }
         }
     }
@@ -208,6 +377,16 @@ mod tests {
     }
 
     #[test]
+    fn from_ids_preserves_order_and_defaults() {
+        assert_eq!(
+            SplitNode::from_ids(&[1, 2, 3, 4]).leaves(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(SplitNode::from_ids(&[7]).leaves(), vec![7]);
+        assert_eq!(SplitNode::from_ids(&[]).leaves(), vec![0]);
+    }
+
+    #[test]
     fn vertical_rects_side_by_side() {
         let mut root = SplitNode::Leaf(1);
         root.insert_leaf(2, SplitDir::Vertical, 1, 0.5);
@@ -223,6 +402,28 @@ mod tests {
         let rects = root.compute_rects();
         assert_eq!(rects[&1], (0.0, 0.0, 1.0, 0.5));
         assert_eq!(rects[&2], (0.0, 0.5, 1.0, 0.5));
+    }
+
+    #[test]
+    fn resize_leaf_adjusts_matching_divider() {
+        let mut root = SplitNode::Leaf(1);
+        root.insert_leaf(2, SplitDir::Vertical, 1, 0.5);
+        // Divider for split 1|2 sits at x=0.5, target leaf 1.
+        assert!(root.resize_leaf(1, 0.5, 0.2));
+        let rects = root.compute_rects();
+        assert!((rects[&1].2 - 0.7).abs() < 1e-6);
+        // Wrong boundary or wrong target -> no-op.
+        assert!(!root.resize_leaf(2, 0.5, 0.2));
+        assert!(!root.resize_leaf(1, 0.9, 0.2));
+    }
+
+    #[test]
+    fn dividers_lists_boundaries_outermost_first() {
+        let mut root = SplitNode::Leaf(1);
+        root.insert_leaf(2, SplitDir::Vertical, 1, 0.5);
+        let divs = root.dividers();
+        assert_eq!(divs.len(), 1);
+        assert_eq!(divs[0], (SplitDir::Vertical, 0.5, 1));
     }
 
     #[test]
