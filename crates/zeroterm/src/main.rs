@@ -78,6 +78,11 @@ fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
     (i - 1).min(cols.saturating_sub(1))
 }
 
+/// Readline word characters: alphanumerics and the underscore.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 /// Load every `*.wasm` file from `plugins_dir` into a sandboxed [`Plugin`],
 /// keyed by file stem. Load failures are logged, never fatal.
 fn load_plugins(plugins_dir: &Path) -> HashMap<String, Plugin> {
@@ -502,6 +507,51 @@ impl EditingState {
 
     fn end(&mut self) {
         self.cursor = self.buffer.len();
+    }
+
+    /// Start of the current or previous word (readline M-b).
+    fn word_left(&mut self) {
+        self.cursor = self.word_boundary_backward(self.cursor);
+    }
+
+    /// End of the next word (readline M-f).
+    fn word_right(&mut self) {
+        self.cursor = self.word_boundary_forward(self.cursor);
+    }
+
+    /// Delete the word after the cursor (readline M-d).
+    fn delete_word_after(&mut self) {
+        let end = self.word_boundary_forward(self.cursor);
+        self.buffer.drain(self.cursor..end);
+    }
+
+    /// Delete the word before the cursor (readline M-backspace / M-h).
+    fn delete_word_before(&mut self) {
+        let start = self.word_boundary_backward(self.cursor);
+        self.buffer.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn word_boundary_backward(&self, col: usize) -> usize {
+        let mut i = col.min(self.buffer.len());
+        while i > 0 && !is_word_char(self.buffer[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && is_word_char(self.buffer[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+
+    fn word_boundary_forward(&self, col: usize) -> usize {
+        let mut i = col.min(self.buffer.len());
+        while i < self.buffer.len() && !is_word_char(self.buffer[i]) {
+            i += 1;
+        }
+        while i < self.buffer.len() && is_word_char(self.buffer[i]) {
+            i += 1;
+        }
+        i
     }
 
     /// Full line (prompt + buffer), what Enter submits to the shell.
@@ -1419,14 +1469,19 @@ impl App {
     }
 
     fn start_editing(&mut self) {
-        // The shell's readline may already hold a partial line the user typed
-        // before toggling. Kill it (Ctrl+U) so the local buffer is the sole
-        // source of truth on Enter; Ctrl+U is a no-op on an empty line.
-        if !self.current_line().trim().is_empty() {
+        // Seed the buffer with whatever the shell's readline already holds so
+        // the line under the cursor appears in the editor. The shell line is
+        // killed (Ctrl+U) so the local buffer is the sole source of truth on
+        // Enter; Ctrl+U is a no-op on an empty line.
+        let line = self.current_line();
+        let mut state = EditingState::new();
+        state.buffer.extend(line.chars());
+        state.cursor = state.buffer.len();
+        if !state.buffer.is_empty() {
             self.write_pty(b"\x15");
         }
         self.scroll_offset = 0;
-        self.editing = Some(EditingState::new());
+        self.editing = Some(state);
     }
 
     /// Handle a key while the line editor is active. Returns true when the key
@@ -1455,6 +1510,29 @@ impl App {
                 self.write_pty(&data);
             }
             KeyCode::Escape => self.editing = None,
+            // Word moves and deletes (readline M-b / M-f / M-d / M-backspace).
+            KeyCode::KeyB if alt && !ctrl => self.editing.as_mut().unwrap().word_left(),
+            KeyCode::KeyF if alt && !ctrl => self.editing.as_mut().unwrap().word_right(),
+            KeyCode::KeyD if alt && !ctrl => self.editing.as_mut().unwrap().delete_word_after(),
+            KeyCode::Backspace if alt && !ctrl => {
+                self.editing.as_mut().unwrap().delete_word_before()
+            }
+            // Cursor / kill chords (readline C-a / C-e / C-k).
+            KeyCode::KeyA if ctrl && !alt => self.editing.as_mut().unwrap().home(),
+            KeyCode::KeyE if ctrl && !alt => self.editing.as_mut().unwrap().end(),
+            KeyCode::KeyK if ctrl && !alt => {
+                let state = self.editing.as_mut().unwrap();
+                state.buffer.truncate(state.cursor);
+            }
+            // Cancel like Esc, discarding the buffer without touching the shell.
+            KeyCode::KeyC if ctrl && !alt => self.editing = None,
+            KeyCode::KeyD if ctrl && !alt => {
+                if self.editing.as_ref().unwrap().buffer.is_empty() {
+                    self.editing = None;
+                } else {
+                    return true;
+                }
+            }
             KeyCode::Backspace => self.editing.as_mut().unwrap().backspace(),
             KeyCode::Delete => self.editing.as_mut().unwrap().delete(),
             KeyCode::ArrowLeft => self.editing.as_mut().unwrap().left(),
@@ -2776,6 +2854,57 @@ mod tests {
         // display places the block cursor at the edit position
         e.home();
         assert_eq!(e.display(), "[edit] ▌el_lo");
+    }
+
+    #[test]
+    fn editing_readline_bindings() {
+        let mut e = EditingState::new();
+        for c in "hello world".chars() {
+            e.insert(c);
+        }
+        e.home();
+        e.word_right();
+        assert_eq!(e.cursor, 5); // end of "hello"
+        e.word_right();
+        assert_eq!(e.cursor, 11); // end of "world"
+        e.word_left();
+        assert_eq!(e.cursor, 6); // start of "world"
+        e.word_left();
+        assert_eq!(e.cursor, 0); // start of "hello"
+        e.word_left(); // clamp at start
+        assert_eq!(e.cursor, 0);
+        e.home();
+        e.delete_word_after();
+        assert_eq!(e.line(), " world");
+        e.delete_word_after();
+        assert_eq!(e.line(), "");
+        e.delete_word_after(); // clamp on empty buffer
+        assert_eq!(e.line(), "");
+
+        let mut e = EditingState::new();
+        for c in "hello world".chars() {
+            e.insert(c);
+        }
+        e.delete_word_before();
+        assert_eq!(e.line(), "hello ");
+        e.delete_word_before();
+        assert_eq!(e.line(), "");
+        e.delete_word_before(); // clamp at start
+        assert_eq!(e.line(), "");
+
+        // Ctrl+K deletes to end of buffer, Ctrl+C cancels editing.
+        let mut app = App::new();
+        app.editing = Some(EditingState::new());
+        for c in "hello world".chars() {
+            app.editing.as_mut().unwrap().insert(c);
+        }
+        app.editing.as_mut().unwrap().home();
+        app.editing.as_mut().unwrap().word_right();
+        assert!(app.handle_editing_key(KeyCode::KeyK, true, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "hello");
+        assert!(app.editing.is_some());
+        assert!(app.handle_editing_key(KeyCode::KeyC, true, false));
+        assert!(app.editing.is_none());
     }
 
     #[test]

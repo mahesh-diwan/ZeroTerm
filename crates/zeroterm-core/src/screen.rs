@@ -1,6 +1,7 @@
 //! Screen buffer with scrollback, cursor, and rendering support
 
 use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
+use crate::highlight::highlight_line;
 use crate::image_decode::{FrameData, MAX_ANIM_FRAMES};
 use std::collections::{HashMap, VecDeque};
 use unicode_width::UnicodeWidthChar;
@@ -250,6 +251,33 @@ impl Screen {
 
         let width = ch.width().unwrap_or(1).max(1);
         self.cursor.col = (self.cursor.col + width).min(self.size.cols);
+
+        self.highlight_row(self.cursor.row);
+    }
+
+    /// Recompute syntax highlighting for one buffer row, writing class indexes
+    /// into its cells. Called after every write to the cursor row; tags ride
+    /// along on the cells when the row scrolls into scrollback.
+    fn highlight_row(&mut self, row: usize) {
+        let cols = self.size.cols;
+        let buffer = self.current_buffer_mut();
+        let Some(row_buf) = buffer.get_mut(row) else {
+            return;
+        };
+        let chars: Vec<char> = row_buf.iter().map(|c| c.ch).collect();
+        let hl = highlight_line(&chars);
+        for (cell, class) in row_buf.iter_mut().take(cols).zip(hl) {
+            cell.syntax_color = class.unwrap_or(0);
+        }
+    }
+
+    /// Recompute syntax highlighting for every visible buffer row. Used to
+    /// re-tag rows after bulk rewrites; scrollback rows are already tagged at
+    /// write time and are not re-scanned here.
+    pub fn highlight_all_rows(&mut self) {
+        for r in 0..self.size.rows {
+            self.highlight_row(r);
+        }
     }
 
     pub fn cursor_up(&mut self, n: usize) {

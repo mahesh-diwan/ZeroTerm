@@ -23,9 +23,8 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             suffix: ""
-          # windows-latest intentionally omitted: crates/zeroterm/src/main.rs
-          # references zeroterm_ssh (a cfg(unix)-only dependency), so the app
-          # does not build on Windows yet. Re-add once main.rs is portable.
+          # windows-latest is handled by the separate `windows` job below, so a
+          # first-time Windows build can't block the linux/macos release.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -55,6 +54,36 @@ jobs:
           name: zeroterm-${{ matrix.target }}-packages
           path: |
             target/release/zeroterm${{ matrix.suffix }}
+            dist/*
+          if-no-files-found: ignore
+
+  # Windows build is separate from the build matrix so it cannot block the
+  # linux/macos release: the app's native deps (mlua-sys, ring) were never
+  # verified on a real Windows host. This job proves `cargo build -p zeroterm`
+  # on a Windows runner and ships the zip; the MSI stays optional (WiX isn't
+  # installed on the runner, and scripts/windows_installer.wxs still needs a
+  # real UpgradeCode before it can ship).
+  windows:
+    name: Build (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --locked -p zeroterm
+      - name: Package for Windows (zip)
+        run: scripts\package_windows.bat
+        shell: cmd
+        env:
+          VERSION: ${{ github.ref_name }}
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroterm-windows
+          path: |
+            target/release/zeroterm.exe
             dist/*
           if-no-files-found: ignore
 

@@ -50,7 +50,7 @@ pub fn highlight_line(chars: &[char]) -> Vec<Option<u8>> {
                     *slot = Some(HL_NUMBER);
                 }
             }
-            c if c.is_alphabetic() => {
+            c if c.is_ascii_alphabetic() => {
                 let start = i;
                 while i < chars.len() && chars[i].is_ascii_alphanumeric() {
                     i += 1;
@@ -128,5 +128,15 @@ mod tests {
         assert_eq!(c.syntax_color, 0);
         assert!(c.is_empty());
         assert_eq!(crate::cell::Cell::new('a').syntax_color, 0);
+    }
+
+    #[test]
+    fn non_ascii_alphabetic_does_not_loop() {
+        // CJK/accented chars are alphabetic (is_alphabetic) but not ASCII
+        // words; the scanner must skip them, not spin forever.
+        let hl = line("echo \u{7897} hi");
+        assert_eq!(hl[0], Some(HL_KEYWORD)); // echo
+        assert_eq!(hl[5], None); // 碗 is not a keyword
+        assert_eq!(hl[hl.len() - 1], None); // "hi" is not in the keyword list
     }
 }
