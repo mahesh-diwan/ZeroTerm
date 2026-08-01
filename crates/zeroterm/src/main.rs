@@ -14,7 +14,7 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
 use zeroterm_ai::client::AiClient;
-use zeroterm_config::Config;
+use zeroterm_config::{Config, KeybindingsConfig};
 use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
@@ -50,6 +50,31 @@ fn block_output_text(screen: &zeroterm_core::screen::Screen, block: &CommandBloc
         text.push('\n');
     }
     text.trim_end().to_string()
+}
+
+fn word_left(chars: &[char], col: usize) -> usize {
+    let mut i = col.saturating_sub(1);
+    while i > 0 && chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i -= 1;
+    }
+    while i > 0 && chars.get(i - 1).is_some_and(|c| !c.is_whitespace()) {
+        i -= 1;
+    }
+    i
+}
+
+fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
+    let mut i = col;
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return col;
+    }
+    while i < chars.len() && !chars[i].is_whitespace() {
+        i += 1;
+    }
+    (i - 1).min(cols.saturating_sub(1))
 }
 
 enum PtyCommand {
@@ -345,6 +370,7 @@ struct App {
     host_picker: HostPicker,
     sync_active: bool,
     last_sync_clear: std::time::Instant,
+    last_anim_frame: std::time::Instant,
 }
 
 #[allow(dead_code)]
@@ -382,6 +408,7 @@ impl App {
             host_picker: HostPicker::new(),
             sync_active: false,
             last_sync_clear: std::time::Instant::now(),
+            last_anim_frame: std::time::Instant::now(),
         }
     }
 
@@ -410,6 +437,7 @@ impl App {
         info!("Initializing ZeroTerm");
 
         let config = Config::load(None).unwrap_or_default();
+        info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
         let window_attrs = WindowAttributes::default()
             .with_title("ZeroTerm v0.2.0")
@@ -1373,6 +1401,98 @@ impl App {
         }
     }
 
+    fn keybindings(&self) -> KeybindingsConfig {
+        self.config
+            .as_ref()
+            .map_or_else(KeybindingsConfig::default, |c| c.keybindings.clone())
+    }
+
+    fn line_chars(&self, global_row: usize) -> Option<Vec<char>> {
+        let pane = self.active_pane()?;
+        let screen = pane.parser.screen();
+        let scrollback = screen.scrollback();
+        let total = scrollback.len();
+        let visible = screen.buffer();
+        let line = if global_row < total {
+            &scrollback[total - 1 - global_row]
+        } else {
+            visible.get(global_row - total)?
+        };
+        Some(line.iter().map(|c| c.ch).collect())
+    }
+
+    fn shift_arrow_extend(&mut self, code: KeyCode, ctrl: bool) -> bool {
+        if !self.keybindings().shift_arrows_select {
+            return false;
+        }
+        let (cursor_row, cursor_col, cols, total_rows) = {
+            let Some(pane) = self.active_pane() else {
+                return false;
+            };
+            let screen = pane.parser.screen();
+            let visible_rows = screen.buffer().len();
+            let cols = if visible_rows > 0 {
+                screen.buffer()[0].len()
+            } else {
+                0
+            };
+            if cols == 0 {
+                return false;
+            }
+            let cursor = screen.cursor();
+            let cursor_row = screen.scrollback().len() + cursor.row;
+            (
+                cursor_row,
+                cursor.col,
+                cols,
+                screen.scrollback().len() + visible_rows,
+            )
+        };
+        let (mut end_row, mut end_col) = match &self.selection {
+            Some(s) if s.active => (s.end_row, s.end_col),
+            _ => {
+                self.scroll_offset = 0;
+                (cursor_row, cursor_col)
+            }
+        };
+        if ctrl {
+            if let Some(chars) = self.line_chars(end_row) {
+                end_col = match code {
+                    KeyCode::ArrowLeft => word_left(&chars, end_col),
+                    KeyCode::ArrowRight => word_right(&chars, end_col, cols),
+                    _ => end_col,
+                };
+            }
+        } else {
+            match code {
+                KeyCode::ArrowLeft if end_col > 0 => end_col -= 1,
+                KeyCode::ArrowLeft if end_row > 0 => {
+                    end_row -= 1;
+                    end_col = cols - 1;
+                }
+                KeyCode::ArrowRight if end_col + 1 < cols => end_col += 1,
+                KeyCode::ArrowRight if end_row + 1 < total_rows => {
+                    end_row += 1;
+                    end_col = 0;
+                }
+                KeyCode::ArrowUp => end_row = end_row.saturating_sub(1),
+                KeyCode::ArrowDown if end_row + 1 < total_rows => end_row += 1,
+                _ => {}
+            }
+        }
+        let sel = self.selection.get_or_insert(Selection {
+            start_row: cursor_row,
+            start_col: cursor_col,
+            end_row: cursor_row,
+            end_col: cursor_col,
+            active: true,
+        });
+        sel.end_row = end_row;
+        sel.end_col = end_col;
+        sel.active = true;
+        true
+    }
+
     fn start_selection(&mut self, x: f32, y: f32) {
         let Some(pane_id) = self.pane_at_point(x, y) else {
             return;
@@ -1820,37 +1940,48 @@ impl ApplicationHandler for App {
 
                 match &event.physical_key {
                     PhysicalKey::Code(code) => {
-                        // Handle scrollback navigation with Shift modifier
+                        // Handle scrollback navigation + selection extend with Shift modifier
                         let shift = self.modifiers.shift_key();
-                        if shift && !ctrl && !alt {
+                        if shift && !alt {
                             match code {
-                                KeyCode::PageUp => {
+                                KeyCode::PageUp if !ctrl => {
                                     self.scroll_up(20);
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
                                     return;
                                 }
-                                KeyCode::PageDown => {
+                                KeyCode::PageDown if !ctrl => {
                                     self.scroll_down(20);
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
                                     return;
                                 }
-                                KeyCode::Home => {
+                                KeyCode::Home if !ctrl => {
                                     self.scroll_offset = self.max_scroll_offset();
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
                                     return;
                                 }
-                                KeyCode::End => {
+                                KeyCode::End if !ctrl => {
                                     self.scroll_offset = 0;
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
                                     return;
+                                }
+                                KeyCode::ArrowLeft
+                                | KeyCode::ArrowRight
+                                | KeyCode::ArrowUp
+                                | KeyCode::ArrowDown => {
+                                    if self.shift_arrow_extend(*code, ctrl) {
+                                        if let Some(window) = &self.window {
+                                            window.request_redraw();
+                                        }
+                                        return;
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1945,6 +2076,7 @@ impl ApplicationHandler for App {
                             _ => vec![],
                         };
                         if !seq.is_empty() {
+                            self.clear_selection();
                             self.write_pty(&seq);
                         }
                     }
@@ -1954,6 +2086,7 @@ impl ApplicationHandler for App {
                 // Handle printable text (IME text input)
                 if let Some(text) = &event.text {
                     if !text.is_empty() && !ctrl && !alt {
+                        self.clear_selection();
                         self.write_pty(text.as_bytes());
                     }
                 }
@@ -1970,6 +2103,12 @@ impl ApplicationHandler for App {
 
                 if let Err(e) = self.render() {
                     error!("Render error: {}", e);
+                }
+                if let Some(delay) = self.renderer.as_mut().and_then(|r| r.next_frame_delay()) {
+                    self.last_anim_frame = std::time::Instant::now() + delay;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -2113,6 +2252,23 @@ impl ApplicationHandler for App {
                         }
                     } else {
                         self.end_selection();
+                        // Click-to-position: send CSI CUP so the shell moves its cursor.
+                        if self.keybindings().click_to_position
+                            && self.scroll_offset == 0
+                            && y >= self.tab_bar_height()
+                            && self.pane_at_point(x, y) == Some(self.active_pane)
+                        {
+                            if let Some((global_row, col)) =
+                                self.screen_to_cell(self.active_pane, x, y)
+                            {
+                                let row = global_row.saturating_sub(
+                                    self.panes
+                                        .get(&self.active_pane)
+                                        .map_or(0, |p| p.parser.screen().scrollback().len()),
+                                );
+                                self.write_pty(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+                            }
+                        }
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -2174,4 +2330,18 @@ fn main() -> Result<()> {
     event_loop.run_app(&mut app)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{word_left, word_right};
+
+    #[test]
+    fn word_bounds() {
+        let line: Vec<char> = "  hello world  ".chars().collect();
+        assert_eq!(word_left(&line, 7), 2);
+        assert_eq!(word_left(&line, 12), 8);
+        assert_eq!(word_right(&line, 2, 20), 6);
+        assert_eq!(word_right(&line, 8, 20), 12);
+    }
 }

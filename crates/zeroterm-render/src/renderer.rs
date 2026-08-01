@@ -424,7 +424,10 @@ pub struct Renderer {
     image_texture: Option<wgpu::Texture>,
     image_view: Option<wgpu::TextureView>,
     has_image: bool,
-    pending_images: Vec<(u32, Vec<u8>, u32, u32)>,
+    image_frames: Vec<(Vec<u8>, u32, u32, u64)>,
+    anim_frame_index: usize,
+    anim_last_swap: std::time::Instant,
+    is_animated: bool,
 }
 
 impl Renderer {
@@ -762,7 +765,10 @@ impl Renderer {
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
             has_image: false,
-            pending_images: Vec::new(),
+            image_frames: Vec::new(),
+            anim_frame_index: 0,
+            anim_last_swap: std::time::Instant::now(),
+            is_animated: false,
         })
     }
 
@@ -1217,50 +1223,104 @@ impl Renderer {
         if reg.is_empty() || self.has_image {
             return;
         }
-        self.pending_images.clear();
-        for img in reg.values() {
-            self.pending_images.push((0, img.rgba_data.clone(), img.width, img.height));
+        let img = match reg.values().max_by_key(|img| img.id) {
+            Some(img) => img,
+            None => return,
+        };
+        self.image_frames.clear();
+        if img.frames.is_empty() {
+            self.image_frames.push((img.rgba_data.clone(), img.width, img.height, 0));
+        } else {
+            for f in &img.frames {
+                self.image_frames.push((f.rgba.clone(), f.width, f.height, f.delay_ms));
+            }
         }
-        let (_, ref rgba, width, height) = self.pending_images.last().unwrap();
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Kitty Image Texture"),
-            size: wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.queue.write_texture(
-            wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            rgba,
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(*height) },
-            wgpu::Extent3d { width: *width, height: *height, depth_or_array_layers: 1 },
-        );
-        let new_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Atlas Bind Group"),
-            layout: &self.atlas_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.glyph_atlas.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.glyph_atlas.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-            ],
-        });
-        self.image_texture = Some(texture);
-        self.image_view = Some(view);
-        self.atlas_bind_group = new_bind_group;
+        let (rgba, width, height, _) = self.image_frames[0].clone();
+        self.upload_image_texture(&rgba, width, height);
+        self.is_animated = self.image_frames.len() > 1;
+        self.anim_frame_index = 0;
+        self.anim_last_swap = std::time::Instant::now();
         self.has_image = true;
+    }
+
+    /// Upload RGBA bytes into the image texture (recreating it when the size
+    /// changes) and re-point the atlas bind group's image binding at it.
+    fn upload_image_texture(&mut self, rgba: &[u8], width: u32, height: u32) {
+        let size_mismatch = match &self.image_texture {
+            Some(t) => t.width() != width || t.height() != height,
+            None => true,
+        };
+        if size_mismatch {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Image Texture"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let new_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Atlas Bind Group"),
+                layout: &self.atlas_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.glyph_atlas.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.glyph_atlas.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                ],
+            });
+            self.image_texture = Some(texture);
+            self.image_view = Some(view);
+            self.atlas_bind_group = new_bind_group;
+        }
+        let texture = self.image_texture.as_ref().expect("image texture set");
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Progress the animation if the current frame's delay has elapsed and
+    /// return how long until the next swap, or `None` for static images.
+    /// The caller should request a redraw whenever this returns `Some`.
+    pub fn next_frame_delay(&mut self) -> Option<std::time::Duration> {
+        if !self.is_animated {
+            return None;
+        }
+        let (_, _, _, delay_ms) = self.image_frames.get(self.anim_frame_index)?;
+        let delay = std::time::Duration::from_millis((*delay_ms).max(1));
+        if self.anim_last_swap.elapsed() >= delay {
+            self.anim_frame_index = (self.anim_frame_index + 1) % self.image_frames.len();
+            self.anim_last_swap = std::time::Instant::now();
+            if let Some((rgba, width, height, _)) = self.image_frames.get(self.anim_frame_index).cloned() {
+                self.upload_image_texture(&rgba, width, height);
+            }
+            Some(delay)
+        } else {
+            Some(delay.saturating_sub(self.anim_last_swap.elapsed()))
+        }
     }
 
     pub fn reload_font(&mut self, font_path: Option<String>) {

@@ -464,3 +464,98 @@ fn dec_2026_sets_sync_flag() {
     p.parse(b"\x1b[?2026l");
     assert!(!p.sync_output(), "DECRST 2026 disables");
 }
+
+// --------------------- Animated image support (Phase 3.3) ---------------------
+
+fn make_gif_2frame() -> Vec<u8> {
+    use image::{codecs::gif::GifEncoder, Delay, Frame, Rgba, RgbaImage};
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut enc = GifEncoder::new(&mut buf);
+        let frame = |r: u8, g: u8, b: u8| {
+            Frame::from_parts(
+                RgbaImage::from_pixel(2, 2, Rgba([r, g, b, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(100, 1),
+            )
+        };
+        enc.encode_frames(vec![frame(255, 0, 0), frame(0, 255, 0)])
+            .unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn gif_animation_decodes_frames() {
+    let gif = make_gif_2frame();
+    assert!(gif.starts_with(b"GIF8"), "encoder wrote a GIF");
+    let decoded = zeroterm_core::image_decode::decode_frames(&gif).unwrap();
+    assert!(decoded.is_animated, "multi-frame GIF flagged animated");
+    assert_eq!(decoded.frames.len(), 2, "two frames decoded");
+    for f in &decoded.frames {
+        assert_eq!((f.width, f.height), (2, 2), "canvas-sized frames");
+        assert_eq!(f.rgba.len(), 2 * 2 * 4, "RGBA payload per frame");
+    }
+    assert!(
+        decoded.frames.iter().any(|f| f.delay_ms > 0),
+        "frame delay present"
+    );
+}
+
+#[test]
+fn static_png_still_renders() {
+    use image::{ExtendedColorType, ImageFormat, Rgba, RgbaImage};
+    let img = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::write_buffer_with_format(
+        &mut buf,
+        img.as_raw(),
+        1,
+        1,
+        ExtendedColorType::Rgba8,
+        ImageFormat::Png,
+    )
+    .unwrap();
+    let png = buf.into_inner();
+
+    let seq = format!(
+        "\x1b]1337;File=name=AA;size={};inline=1:{}\x07",
+        png.len(),
+        b64(&png)
+    );
+    let mut p = Parser::new(80, 24);
+    p.parse(seq.as_bytes());
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1, "one pending image");
+    assert_eq!((imgs[0].width, imgs[0].height), (1, 1), "dims from decode");
+    assert_eq!(imgs[0].frames.len(), 1, "single static frame");
+    assert_eq!(imgs[0].frames[0].rgba, vec![255, 0, 0, 255], "decoded RGBA");
+    let reg = p.screen().image_registry();
+    let stored = reg.get(&imgs[0].id).unwrap();
+    assert_eq!(
+        stored.rgba_data,
+        vec![255, 0, 0, 255],
+        "registry holds RGBA"
+    );
+}
+
+#[test]
+fn iterm1337_animated_gif_places_frames() {
+    let gif = make_gif_2frame();
+    let seq = format!(
+        "\x1b]1337;File=name=AA;size={};inline=1:{}\x07",
+        gif.len(),
+        b64(&gif)
+    );
+    let mut p = Parser::new(80, 24);
+    p.parse(seq.as_bytes());
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0].frames.len(), 2, "both GIF frames propagated");
+    assert_eq!(imgs[0].width, 2, "dims auto-parsed from GIF canvas");
+    assert_eq!(imgs[0].height, 2);
+    let reg = p.screen().image_registry();
+    let stored = reg.get(&imgs[0].id).unwrap();
+    assert_eq!(stored.frames.len(), 2, "registry stores all frames");
+}

@@ -11,6 +11,11 @@ thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 unicode-width = { workspace = true }
 portable-pty = { workspace = true }
+image = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+
+[[bench]]
+name = "parser_bench"
+harness = false

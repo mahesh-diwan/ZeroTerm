@@ -302,6 +302,74 @@ EOF
 	log_success "App bundle created: ${app_dir}"
 }
 
+# Detect the currently installed version (best-effort; zeroterm --version is a Rust-side TODO)
+get_installed_version() {
+	local bin out ver
+	bin="$(command -v "${BINARY_NAME}" 2>/dev/null)" || return 1
+	out=$("${bin}" --version 2>/dev/null || "${bin}" -V 2>/dev/null) || return 1
+	ver=$(printf '%s\n' "${out}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+	[[ -n "${ver}" ]] || return 1
+	printf '%s\n' "${ver}"
+}
+
+# Returns 0 when $1 is a newer version than $2 (dotted numeric compare, portable)
+version_gt() {
+	local a b
+	a="${1#v}"
+	b="${2#v}"
+	[[ "$a" == "$b" ]] && return 1
+	IFS='.' read -ra a_parts <<<"$a"
+	IFS='.' read -ra b_parts <<<"$b"
+	local i
+	for i in "${!a_parts[@]}"; do
+		local ai bi
+		ai="${a_parts[$i]}"
+		bi="${b_parts[$i]:-0}"
+		if ((ai > bi)); then
+			return 0
+		elif ((ai < bi)); then
+			return 1
+		fi
+	done
+	((${#a_parts[@]} > ${#b_parts[@]}))
+}
+
+# Auto-update: compare installed vs latest release, reinstall when newer
+upgrade_zeroterm() {
+	local installed latest platform
+	installed=""
+	if installed=$(get_installed_version); then
+		log_info "Installed version: ${installed}"
+	else
+		log_warn "Could not detect installed version (zeroterm --version is a Rust-side TODO)"
+		log_info "Proceeding with a fresh install of the latest release"
+	fi
+
+	latest=$(get_latest_version || true)
+	if [[ -z "$latest" ]]; then
+		log_error "Could not determine the latest release version"
+		exit 1
+	fi
+	log_info "Latest version: ${latest}"
+
+	if [[ -n "$installed" ]] && ! version_gt "$latest" "$installed"; then
+		log_success "ZeroTerm is already up to date (${installed})"
+		return 0
+	fi
+
+	platform=$(detect_platform)
+	install_binary "$platform" "$latest"
+	setup_path
+	verify_install
+
+	case "$platform" in
+	linux-*) install_desktop_entry ;;
+	darwin-*) install_app_bundle ;;
+	esac
+
+	log_success "ZeroTerm updated to ${latest}"
+}
+
 # Remove the PATH line this installer added
 remove_path_line() {
 	local shell_rc=""
@@ -341,16 +409,24 @@ uninstall() {
 main() {
 	local UNINSTALL=false
 	local PURGE=false
+	local UPGRADE=false
 	for arg in "$@"; do
 		case "$arg" in
 		--uninstall | -u) UNINSTALL=true ;;
 		--purge) PURGE=true ;;
+		--update) UPGRADE=true ;;
+		upgrade) UPGRADE=true ;;
 		--verbose) set -x ;;
 		esac
 	done
 
 	if [ "$UNINSTALL" = true ]; then
 		uninstall
+		exit 0
+	fi
+
+	if [ "$UPGRADE" = true ]; then
+		upgrade_zeroterm
 		exit 0
 	fi
 

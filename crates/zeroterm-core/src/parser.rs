@@ -1,6 +1,7 @@
 //! VT100/ANSI parser - hand-written state machine
 
 use crate::cell::UnderlineStyle;
+use crate::image_decode::{self, FrameData};
 
 const MAX_CSI_PARAMS: usize = 32;
 const MAX_CSI_PARAM_DIGITS: usize = 32;
@@ -44,6 +45,8 @@ pub struct ImageFragment {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Decoded RGBA frames; empty when the payload is not a decodable image.
+    pub frames: Vec<FrameData>,
 }
 
 #[derive(Debug, Default)]
@@ -781,12 +784,24 @@ impl Parser {
             return;
         }
         if let Ok(decoded) = decode_base64(data_part) {
-            let id = self.screen.place_image(decoded.clone(), width, height);
+            if decoded.is_empty() {
+                return;
+            }
+            let frames = image_decode::decode_frames(&decoded)
+                .map(|d| d.frames)
+                .unwrap_or_default();
+            let id = if frames.is_empty() {
+                self.screen.place_image(decoded.clone(), width, height)
+            } else {
+                self.screen
+                    .place_image_frames(frames.clone(), width, height)
+            };
             self.pending_images.push(ImageFragment {
                 id,
                 data: decoded,
                 width,
                 height,
+                frames,
             });
         }
     }
@@ -821,20 +836,45 @@ impl Parser {
             if decoded.is_empty() {
                 return;
             }
-            // ponytail: cursor cell only, no row advance by ceil(h/cell_h)
-            let (mut width, mut height) = if width == 0 || height == 0 {
-                png_dimensions(&decoded)
-            } else {
-                (width, height)
+            // Decode into RGBA frames; on failure fall back to dimension
+            // sniffing only (pre-existing behavior for non-image payloads).
+            let (mut width, mut height, frames) = match image_decode::decode_frames(&decoded) {
+                Ok(d) => {
+                    let dims = d
+                        .frames
+                        .first()
+                        .map(|f| (f.width, f.height))
+                        .unwrap_or((0, 0));
+                    let (w, h) = if width == 0 || height == 0 {
+                        dims
+                    } else {
+                        (width, height)
+                    };
+                    (w, h, d.frames)
+                }
+                Err(_) => {
+                    let (w, h) = if width == 0 || height == 0 {
+                        png_dimensions(&decoded)
+                    } else {
+                        (width, height)
+                    };
+                    (w, h, Vec::new())
+                }
             };
             width = width.max(1);
             height = height.max(1);
-            let id = self.screen.place_image(decoded.clone(), width, height);
+            let id = if frames.is_empty() {
+                self.screen.place_image(decoded.clone(), width, height)
+            } else {
+                self.screen
+                    .place_image_frames(frames.clone(), width, height)
+            };
             self.pending_images.push(ImageFragment {
                 id,
                 data: decoded,
                 width,
                 height,
+                frames,
             });
         }
     }
@@ -988,6 +1028,7 @@ impl Parser {
             data: rgba,
             width,
             height,
+            frames: Vec::new(),
         });
     }
 

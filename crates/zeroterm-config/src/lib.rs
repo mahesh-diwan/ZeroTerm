@@ -4,7 +4,7 @@ pub mod config;
 pub mod gui;
 pub mod lua;
 
-pub use config::Config;
+pub use config::{Config, KeybindingsConfig};
 
 #[cfg(test)]
 mod tests;

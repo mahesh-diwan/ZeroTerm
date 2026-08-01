@@ -35,6 +35,24 @@ pub struct Config {
     pub ai: AiConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
+    pub keybindings: KeybindingsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeybindingsConfig {
+    pub vim_mode: bool,
+    pub shift_arrows_select: bool,
+    pub click_to_position: bool,
+}
+
+impl Default for KeybindingsConfig {
+    fn default() -> Self {
+        Self {
+            vim_mode: false,
+            shift_arrows_select: true,
+            click_to_position: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +91,7 @@ impl Default for Config {
             ai: AiConfig::default(),
             sync: SyncConfig::default(),
             ssh: SshConfig::default(),
+            keybindings: KeybindingsConfig::default(),
         }
     }
 }
@@ -146,6 +165,15 @@ impl Config {
                         self.ssh.auto_connect = v;
                     }
                 }
+                "vim_mode" | "keybindings.vim_mode" => {
+                    self.keybindings.vim_mode = value.parse().unwrap_or(false);
+                }
+                "shift_arrows_select" | "keybindings.shift_arrows_select" => {
+                    self.keybindings.shift_arrows_select = value.parse().unwrap_or(true);
+                }
+                "click_to_position" | "keybindings.click_to_position" => {
+                    self.keybindings.click_to_position = value.parse().unwrap_or(true);
+                }
                 _ => {}
             }
         }
@@ -184,6 +212,7 @@ impl Config {
         self.ai = new_config.ai;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
+        self.keybindings = new_config.keybindings;
         Ok(())
     }
 }

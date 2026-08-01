@@ -19,7 +19,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: ""
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
             suffix: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -27,32 +27,36 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: zeroterm-${{ matrix.target }}
-          path: target/release/zeroterm${{ matrix.suffix }}
-
-  appimage:
-    runs-on: ubuntu-latest
-    needs: [build]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install appimagetool
+        run: cargo build --release -p zeroterm
+      - name: Check binary size (50MB gate)
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
-          sudo chmod +x /usr/local/bin/appimagetool
-      - name: Build AppImage
-        run: bash scripts/build-appimage.sh
-      - name: Upload AppImage
+          SIZE=$(stat -c%s target/release/zeroterm)
+          echo "Binary size: $((SIZE / 1024 / 1024)) MB"
+          if [ "$SIZE" -ge $((50 * 1024 * 1024)) ]; then
+            echo "::error::zeroterm is ${SIZE} bytes, exceeds the 50MB gate"
+            exit 1
+          fi
+      - name: Package for Linux (AppImage)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/make_appimage.sh
+      - name: Package for macOS (.app bundle)
+        if: matrix.os == 'macos-latest'
+        run: bash scripts/make_macos_app.sh
+      - name: Package for Windows (zip + MSI)
+        if: matrix.os == 'windows-latest'
+        run: .\scripts\package_windows.bat
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zeroterm-x86_64.AppImage
-          path: zeroterm-*.AppImage
+          name: zeroterm-${{ matrix.target }}-packages
+          path: |
+            target/release/zeroterm${{ matrix.suffix }}
+            dist/*
+          if-no-files-found: ignore
 
   flatpak:
     runs-on: ubuntu-latest

@@ -32,7 +32,8 @@ package_binary() {
 
 	echo "Packaging ${archive_name}..."
 
-	local temp_dir=$(mktemp -d)
+	local temp_dir
+	temp_dir=$(mktemp -d)
 	cp "${BUILD_DIR}/${binary_name}" "${temp_dir}/"
 
 	# Include README and LICENSE
@@ -68,6 +69,22 @@ windows-x86_64)
 *)
 	echo "Unknown platform: ${HOST_PLATFORM}"
 	exit 1
+	;;
+esac
+
+# Best-effort platform extras; skipped when the packager or its tools are missing
+case "$HOST_PLATFORM" in
+linux-*)
+	if [[ -f "${REPO_ROOT}/scripts/make_appimage.sh" ]]; then
+		echo "==> Building AppImage..."
+		"${REPO_ROOT}/scripts/make_appimage.sh" || echo "Warning: AppImage build skipped (script exited non-zero)"
+	fi
+	;;
+darwin-*)
+	if [[ -f "${REPO_ROOT}/scripts/make_macos_app.sh" ]]; then
+		echo "==> Building macOS .app bundle..."
+		"${REPO_ROOT}/scripts/make_macos_app.sh" || echo "Warning: .app build skipped (script exited non-zero)"
+	fi
 	;;
 esac
 

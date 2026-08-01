@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ZeroTerm WiX installer template (WiX Toolset v3, candle/light).
+     Replace UpgradeCode with a fixed GUID (generate once, never change it).
+     Build: candle scripts\windows_installer.wxs && light -o dist\zeroterm.msi *.wixobj
+     Version must be numeric like 0.2.0 (leading 'v' removed). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="ZeroTerm" Language="1033" Version="0.2.0"
+           Manufacturer="ZeroTerm Developers" UpgradeCode="PUT-YOUR-GUID-HERE">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
+    <MediaTemplate EmbedCab="yes"/>
+    <Feature Id="MainFeature" Title="ZeroTerm" Level="1">
+      <ComponentGroupRef Id="AppFiles"/>
+    </Feature>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLFOLDER" Name="ZeroTerm"/>
+      </Directory>
+    </Directory>
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="ZerotermExe" Guid="*">
+        <File Id="ZerotermExeFile" Source="target\release\zeroterm.exe" KeyPath="yes"/>
+      </Component>
+      <Component Id="ZerotermReadme" Guid="*">
+        <File Id="ZerotermReadmeFile" Source="README.md" KeyPath="yes"/>
+      </Component>
+    </ComponentGroup>
+  </Product>
+</Wix>

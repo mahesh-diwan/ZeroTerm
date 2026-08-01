@@ -1,7 +1,9 @@
 //! Screen buffer with scrollback, cursor, and rendering support
 
 use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
+use crate::image_decode::{FrameData, MAX_ANIM_FRAMES};
 use std::collections::{HashMap, VecDeque};
+use unicode_width::UnicodeWidthChar;
 
 const MAX_IMAGES: usize = 64;
 const MAX_IMAGE_BYTES: usize = 100 << 20;
@@ -34,7 +36,10 @@ pub struct ImageData {
     pub id: u32,
     pub width: u32,
     pub height: u32,
+    /// Frame 0 RGBA (back-compat; single-frame images like sixel).
     pub rgba_data: Vec<u8>,
+    /// All decoded frames for animated images; empty for the fallback path.
+    pub frames: Vec<FrameData>,
 }
 
 pub struct Screen {
@@ -250,7 +255,8 @@ impl Screen {
             }
         }
 
-        self.cursor.col += 1;
+        let width = ch.width().unwrap_or(1).max(1) as usize;
+        self.cursor.col = (self.cursor.col + width).min(self.size.cols);
     }
 
     pub fn cursor_up(&mut self, n: usize) {
@@ -811,14 +817,33 @@ impl Screen {
     }
 
     pub fn place_image(&mut self, rgba_data: Vec<u8>, width: u32, height: u32) -> u32 {
+        let frames = vec![FrameData {
+            width,
+            height,
+            rgba: rgba_data,
+            delay_ms: 0,
+        }];
+        self.place_image_frames(frames, width, height)
+    }
+
+    pub fn place_image_frames(
+        &mut self,
+        mut frames: Vec<FrameData>,
+        width: u32,
+        height: u32,
+    ) -> u32 {
         let id = self.next_image_id;
         self.next_image_id += 1;
+        let total_bytes: u64 = frames.iter().map(|f| f.rgba.len() as u64).sum();
         if width == 0
             || height == 0
             || (width as u64) * (height as u64) * 4 > MAX_IMAGE_BYTES as u64
-            || rgba_data.len() > MAX_IMAGE_BYTES
+            || total_bytes > MAX_IMAGE_BYTES as u64
         {
             return id;
+        }
+        if frames.len() > MAX_ANIM_FRAMES {
+            frames.truncate(MAX_ANIM_FRAMES);
         }
         while self.image_registry.len() >= MAX_IMAGES {
             let oldest = self.image_registry.keys().min().copied();
@@ -830,6 +855,10 @@ impl Screen {
                 None => break,
             }
         }
+        let rgba_data = match frames.first() {
+            Some(f) => f.rgba.clone(),
+            None => Vec::new(),
+        };
         self.image_registry.insert(
             id,
             ImageData {
@@ -837,6 +866,7 @@ impl Screen {
                 width,
                 height,
                 rgba_data,
+                frames,
             },
         );
         let cursor_row = self.cursor.row;
