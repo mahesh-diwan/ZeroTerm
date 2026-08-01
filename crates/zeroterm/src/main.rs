@@ -166,6 +166,8 @@ fn spawn_pty_process(
     Ok((pty_rx, pty_tx))
 }
 
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_ssh_process(
     host: &str,
     port: u16,
@@ -872,6 +874,7 @@ impl App {
         }
     }
 
+    #[cfg(unix)]
     fn connect_ssh(&mut self, host: &str, user: &str, port: u16) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
@@ -930,15 +933,18 @@ impl App {
     }
 
     fn open_host_picker(&mut self) {
-        let aliases = zeroterm_ssh::client::ssh_aliases();
-        if aliases.is_empty() {
-            return;
+        #[cfg(unix)]
+        {
+            let aliases = zeroterm_ssh::client::ssh_aliases();
+            if aliases.is_empty() {
+                return;
+            }
+            self.host_picker.open(aliases);
+            if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+                self.host_picker.save_screen(pane.parser.screen());
+            }
+            self.draw_host_picker();
         }
-        self.host_picker.open(aliases);
-        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
-            self.host_picker.save_screen(pane.parser.screen());
-        }
-        self.draw_host_picker();
     }
 
     fn draw_host_picker(&mut self) {
@@ -967,20 +973,23 @@ impl App {
     }
 
     fn pick_host(&mut self) {
-        let Some(alias) = self.host_picker.selected() else {
+        #[cfg(unix)]
+        {
+            let Some(alias) = self.host_picker.selected() else {
+                self.close_host_picker();
+                return;
+            };
             self.close_host_picker();
-            return;
-        };
-        self.close_host_picker();
-        let user = self
-            .config
-            .as_ref()
-            .map_or_else(String::new, |c| c.ssh.user.clone());
-        let port = self.config.as_ref().map_or(22, |c| c.ssh.port);
-        if let Err(e) = self.connect_ssh(&alias, &user, port) {
-            error!("SSH connect failed: {}", e);
+            let user = self
+                .config
+                .as_ref()
+                .map_or_else(String::new, |c| c.ssh.user.clone());
+            let port = self.config.as_ref().map_or(22, |c| c.ssh.port);
+            if let Err(e) = self.connect_ssh(&alias, &user, port) {
+                error!("SSH connect failed: {}", e);
+            }
+            self.update_window_title();
         }
-        self.update_window_title();
     }
 
     fn ai_explain(&self) {
@@ -1933,6 +1942,7 @@ impl ApplicationHandler for App {
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyS {
+                            #[cfg(unix)]
                             if let Some(config) = &self.config {
                                 if !config.ssh.host.is_empty() {
                                     let host = config.ssh.host.clone();

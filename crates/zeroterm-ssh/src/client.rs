@@ -1,8 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use anyhow::Context;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::TcpStream;
 
 /// One `Host <alias>` block from an ssh config file.
 #[derive(Debug, Clone, Default)]
@@ -86,10 +91,16 @@ fn expand_home(path: &str) -> String {
     p.to_string()
 }
 
+#[cfg(unix)]
 pub struct SshSession {
     session: Option<ssh2::Session>,
     channel: Option<ssh2::Channel>,
 }
+
+/// Non-unix stub so the crate compiles on Windows/macOS-other targets with an
+/// identical API surface. connect() always fails; the rest are no-ops.
+#[cfg(not(unix))]
+pub struct SshSession;
 
 impl Default for SshSession {
     fn default() -> Self {
@@ -97,6 +108,7 @@ impl Default for SshSession {
     }
 }
 
+#[cfg(unix)]
 impl SshSession {
     pub fn new() -> Self {
         Self {
@@ -203,6 +215,40 @@ impl SshSession {
             let _ = ch.wait_close();
         }
         drop(self.session.take());
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+impl SshSession {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn connect(
+        &mut self,
+        _host: &str,
+        _port: u16,
+        _user: &str,
+        _password: Option<&str>,
+        _key_path: Option<&Path>,
+    ) -> Result<()> {
+        anyhow::bail!("SSH is not supported on this platform")
+    }
+
+    pub fn write(&mut self, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn read(&mut self, _buf: &mut [u8]) -> Result<usize> {
+        Ok(0)
+    }
+
+    pub fn resize(&mut self, _cols: u32, _rows: u32) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn disconnect(&mut self) -> Result<()> {
         Ok(())
     }
 }

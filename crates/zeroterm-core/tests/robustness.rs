@@ -325,6 +325,87 @@ fn tiny_png() -> Vec<u8> {
     png
 }
 
+/// Mirror of the app's copy_selection extraction (main.rs) against the real
+/// screen data model: global rows -> scrollback (reversed) / buffer rows.
+fn extract_selection(screen: &Screen, sel: (usize, usize, usize, usize)) -> String {
+    let scrollback = screen.scrollback();
+    let buffer = screen.buffer();
+    let visible_rows = buffer.len();
+    let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+    let (start_row, start_col, end_row, end_col) =
+        if sel.0 < sel.2 || (sel.0 == sel.2 && sel.1 <= sel.3) {
+            (sel.0, sel.1, sel.2, sel.3)
+        } else {
+            (sel.2, sel.3, sel.0, sel.1)
+        };
+
+    let mut text = String::new();
+    let total_scrollback = scrollback.len();
+    let total_rows = total_scrollback + visible_rows;
+
+    for r in start_row..=end_row.min(total_rows - 1) {
+        let line = if r < total_scrollback {
+            &scrollback[total_scrollback - 1 - r]
+        } else {
+            &buffer[r - total_scrollback]
+        };
+
+        let line_start = if r == start_row { start_col } else { 0 };
+        let line_end = if r == end_row { end_col + 1 } else { cols };
+
+        for cell in line.iter().take(line_end.min(line.len())).skip(line_start) {
+            text.push(cell.ch);
+        }
+        if r < end_row {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+#[test]
+fn backward_selection_extracts_full_span() {
+    // 8 lines through a 3-row screen: 6 rows in scrollback (newest first,
+    // scrollback[0]) + 3 visible (line6, line7, blank).
+    fn build() -> Parser {
+        let mut p = Parser::new(10, 3);
+        for i in 0..8 {
+            p.parse(format!("line{i}ABCD").as_bytes());
+            p.parse(b"\r\n");
+        }
+        p
+    }
+    let p = build();
+    let screen = p.screen();
+    let sb = screen.scrollback().len();
+    assert_eq!(sb, 6, "scrollback holds 6 rows, got {sb}");
+
+    // Backward drag: lower-right (global row 7, col 9) up to upper-left
+    // (global row 2, col 0). Global row g maps to oldest scrollback + g,
+    // so rows 2..=7 are line2, line3, ..., line7.
+    let text = extract_selection(screen, (7, 9, 2, 0));
+    let lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    assert_eq!(
+        lines.len(),
+        6,
+        "full 6-row span extracted, got {}: {text:?}",
+        lines.len()
+    );
+    assert_eq!(lines[0], "line2ABCD", "topmost selected row content");
+    assert_eq!(lines[5], "line7ABCD", "bottommost selected row content");
+
+    // Backward drag crossing the scrollback/visible boundary: lower-right
+    // (global row 7 = buffer line7) up to upper-left (global row 5 = last
+    // scrollback line). Rows 5..=7 -> line5, line6, line7.
+    let p2 = build();
+    let text = extract_selection(p2.screen(), (7, 9, 5, 0));
+    let lines: Vec<String> = text.lines().map(|l| l.trim_end().to_string()).collect();
+    assert_eq!(lines.len(), 3, "boundary-crossing backward span: {text:?}");
+    assert_eq!(lines[0], "line5ABCD", "scrollback row first");
+    assert_eq!(lines[2], "line7ABCD", "visible row last");
+}
+
 #[test]
 fn sixel_palette_and_pixels_render_color() {
     // Set palette reg 0 to red (100%), then draw a 1x1 red pixel.
