@@ -22,6 +22,7 @@ use zeroterm_core::screen::{CommandBlock, Size as PtySize};
 use zeroterm_core::Parser;
 use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
+use zeroterm_plugin::{Plugin, PluginConfig, PluginHost};
 use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
 use zeroterm_sync::daemon::SyncDaemon;
 
@@ -75,6 +76,43 @@ fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
         i += 1;
     }
     (i - 1).min(cols.saturating_sub(1))
+}
+
+/// Load every `*.wasm` file from `plugins_dir` into a sandboxed [`Plugin`],
+/// keyed by file stem. Load failures are logged, never fatal.
+fn load_plugins(plugins_dir: &Path) -> HashMap<String, Plugin> {
+    let mut plugins = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return plugins;
+    };
+    let host = match PluginHost::new() {
+        Ok(host) => host,
+        Err(e) => {
+            warn!("Plugin host init failed: {}", e);
+            return plugins;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        let config = PluginConfig {
+            name: name.clone(),
+            ..PluginConfig::default()
+        };
+        match host.load(&path, config) {
+            Ok(plugin) => {
+                info!("Loaded plugin `{}`", name);
+                plugins.insert(name, plugin);
+            }
+            Err(e) => error!("Failed to load plugin `{}`: {}", name, e),
+        }
+    }
+    plugins
 }
 
 enum PtyCommand {
@@ -407,6 +445,7 @@ struct App {
     last_sync_clear: std::time::Instant,
     last_anim_frame: std::time::Instant,
     event_proxy: Option<EventLoopProxy<()>>,
+    plugins: HashMap<String, Plugin>,
 }
 
 #[allow(dead_code)]
@@ -446,6 +485,7 @@ impl App {
             last_sync_clear: std::time::Instant::now(),
             last_anim_frame: std::time::Instant::now(),
             event_proxy: None,
+            plugins: HashMap::new(),
         }
     }
 
@@ -602,6 +642,7 @@ impl App {
         // Start config file watcher
         let config_path = Config::default_config_path();
         let config_dir = config_path.parent().unwrap().to_path_buf();
+        self.plugins = load_plugins(&config_dir.join("plugins"));
         let changed = self.config_changed.clone();
 
         std::thread::spawn(move || {
@@ -1271,6 +1312,47 @@ impl App {
     fn write_pty(&self, data: &[u8]) {
         if let Some(pane) = self.panes.get(&self.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
+        }
+    }
+
+    /// Text of the line the cursor sits on, up to the cursor column.
+    fn current_line(&self) -> String {
+        let Some(pane) = self.active_pane() else {
+            return String::new();
+        };
+        let screen = pane.parser.screen();
+        let col = screen.cursor().col;
+        let row = screen.scrollback().len() + screen.cursor().row;
+        let mut chars = self.line_chars(row).unwrap_or_default();
+        chars.truncate(col);
+        while chars.last().is_some_and(|c| c.is_whitespace()) {
+            chars.pop();
+        }
+        chars.into_iter().collect()
+    }
+
+    /// Run a loaded plugin against the current line and write its stdout into
+    /// the active pane as if typed at a fresh prompt. Errors land dimmed via a
+    /// leading red escape. No-op when the pane/plugin is missing.
+    fn run_plugin(&mut self, name: &str) {
+        let input = self.current_line();
+        let result = {
+            let Some(plugin) = self.plugins.get_mut(name) else {
+                return;
+            };
+            plugin.call(input.as_bytes())
+        };
+        let data = match result {
+            Ok(out) => {
+                let mut data = b"\r\n".to_vec();
+                data.extend_from_slice(&out);
+                data
+            }
+            Err(e) => format!("\r\n\u{1b}[31mplugin {}: {}\u{1b}[0m", name, e).into_bytes(),
+        };
+        self.write_pty(&data);
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -1955,6 +2037,14 @@ impl ApplicationHandler for App {
                                 } else {
                                     self.open_host_picker();
                                 }
+                            }
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyB {
+                            if let Some(name) = self.plugins.keys().min().cloned() {
+                                self.run_plugin(&name);
+                            } else {
+                                warn!("No plugins loaded; put *.wasm files in the plugins dir to enable");
                             }
                             return;
                         }

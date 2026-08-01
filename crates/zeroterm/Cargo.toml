@@ -20,6 +20,7 @@ zeroterm-mux = { path = "../zeroterm-mux" }
 zeroterm-config = { path = "../zeroterm-config" }
 zeroterm-ai = { path = "../zeroterm-ai" }
 zeroterm-sync = { path = "../zeroterm-sync" }
+zeroterm-plugin = { path = "../zeroterm-plugin" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 notify = { version = "7", features = ["macos_kqueue"] }
 serde = { workspace = true, features = ["derive"] }
