@@ -2,6 +2,7 @@
 //! Feed hostile/weird byte sequences; assert no panic and screen invariants.
 
 use zeroterm_core::parser::Parser;
+use zeroterm_core::screen::Screen;
 
 fn assert_screen_ok(p: &Parser) {
     let s = p.screen();
@@ -32,6 +33,41 @@ fn check_after_resize(bytes: &[u8]) {
     }
 }
 
+// Deterministic xorshift PRNG: no rand dep, same stream every run.
+struct Xs(u64);
+impl Xs {
+    fn next(&mut self) -> u8 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 33) as u8
+    }
+}
+
+#[test]
+fn fuzz_random_bytes_no_panic() {
+    let mut rng = Xs(0x9E3779B97F4A7C15);
+    for round in 0..500 {
+        let len = 1 + (rng.next() as usize % 128);
+        let mut buf = vec![0u8; len];
+        for b in &mut buf {
+            *b = rng.next();
+        }
+        let mut p = Parser::new(80, 24);
+        for chunk in buf.chunks(1 + rng.next() as usize % 13) {
+            p.parse(chunk);
+            assert_screen_ok(&p);
+        }
+        if round % 10 == 0 {
+            p.screen_mut()
+                .resize(30 + rng.next() as usize % 100, 5 + rng.next() as usize % 40);
+            assert_screen_ok(&p);
+        }
+    }
+}
+
 #[test]
 fn utf8_valid_multibyte() {
     parse_and_check("héllo wörld".as_bytes());
@@ -39,6 +75,35 @@ fn utf8_valid_multibyte() {
     parse_and_check("🎉🎊".as_bytes());
     parse_and_check("𝔘𝔫𝔦𝔠𝔬𝔡𝔢".as_bytes());
     parse_and_check("mixed € and 中 and 🎉 on one line".as_bytes());
+}
+
+#[test]
+fn osc_title_with_utf8_sets_title() {
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b]0;caf\xc3\xa9\x07");
+    assert_eq!(p.screen().title(), "café");
+}
+
+#[test]
+fn utf8_renders_non_ascii_chars() {
+    let mut p = Parser::new(80, 24);
+    p.parse("héllo".as_bytes());
+    let buf = p.screen().buffer();
+    assert_eq!(buf[0][0].ch, 'h');
+    assert_eq!(buf[0][1].ch, 'é');
+    assert_eq!(buf[0][2].ch, 'l');
+    // 3-byte (€) and 4-byte (🎉) sequences
+    let mut p = Parser::new(80, 24);
+    p.parse("a€".as_bytes());
+    assert_eq!(p.screen().buffer()[0][1].ch, '€');
+    let mut p = Parser::new(80, 24);
+    p.parse("a🎉".as_bytes());
+    assert_eq!(p.screen().buffer()[0][1].ch, '🎉');
+    // Split across parse() calls (streaming PTY reads)
+    let mut p = Parser::new(80, 24);
+    p.parse(&[b'a', 0xC3]);
+    p.parse(&[0xA9]);
+    assert_eq!(p.screen().buffer()[0][1].ch, 'é');
 }
 
 #[test]
@@ -261,6 +326,21 @@ fn tiny_png() -> Vec<u8> {
 }
 
 #[test]
+fn sixel_palette_and_pixels_render_color() {
+    // Set palette reg 0 to red (100%), then draw a 1x1 red pixel.
+    let seq = "\x1bPqP0;100;0;0#0~\x1b\\";
+    let mut p = Parser::new(80, 24);
+    p.parse(seq.as_bytes());
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1, "one sixel image");
+    assert_eq!(imgs[0].width, 1);
+    assert_eq!(imgs[0].height, 6, "'~' sets all 6 bits");
+    // RGBA data: [r, g, b, a] — all 6 rows red
+    let red = vec![255, 0, 0, 255];
+    assert_eq!(imgs[0].data, red.repeat(6), "red from palette");
+}
+
+#[test]
 fn iterm1337_inline_png_places_image() {
     let png = tiny_png();
     let seq = format!(
@@ -315,4 +395,72 @@ fn iterm1337_malformed_ignored() {
     p.parse(b"\x1b]1337;File=name=AA;size=1;inline=0:QUFB\x07"); // download-only
     assert!(p.take_pending_images().is_empty());
     assert!(p.screen().image_registry().is_empty());
+}
+
+#[test]
+fn csi_params_capped_at_32() {
+    let mut input = b"\x1b[".to_vec();
+    for i in 1..=150 {
+        input.extend(format!("{};", i).as_bytes());
+    }
+    input.push(b'm');
+    let mut p = Parser::new(80, 24);
+    p.parse(&input);
+    assert_screen_ok(&p);
+    p.screen_mut().resize(40, 10);
+    assert_screen_ok(&p);
+}
+
+#[test]
+fn osc_buffer_capped() {
+    let mut input = b"\x1b]0;".to_vec();
+    input.extend(std::iter::repeat(b'a').take(2 * 1024 * 1024));
+    input.push(0x07);
+    let mut p = Parser::new(80, 24);
+    p.parse(&input);
+    assert_screen_ok(&p);
+    assert_eq!(p.screen().title(), "a".repeat((1 << 20) - 2));
+}
+
+#[test]
+fn sixel_dimensions_capped() {
+    let mut input = b"\x1bPq#0".to_vec();
+    input.extend(std::iter::repeat(b'~').take(20_000));
+    input.extend(b"\x1b\\");
+    let mut p = Parser::new(80, 24);
+    p.parse(&input);
+    assert_screen_ok(&p);
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1, "one truncated sixel image");
+    assert_eq!(imgs[0].width, 8192, "width clamped to MAX_SIXEL_W");
+    assert_eq!(imgs[0].height, 6);
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1bPq#0!99999999~$!99999999~\x1b\\");
+    assert_screen_ok(&p);
+    let imgs = p.take_pending_images();
+    assert_eq!(imgs.len(), 1);
+    assert_eq!(imgs[0].width, 8192, "repeat count clamped");
+    assert_eq!(imgs[0].height, 12, "two bands");
+}
+
+#[test]
+fn image_registry_capped_at_64() {
+    let mut s = Screen::new(80, 24);
+    for _ in 0..80 {
+        s.place_image(vec![0u8; 4], 1, 1);
+    }
+    assert!(s.image_registry().len() <= 64, "registry capped");
+    assert!(s.image_cells().len() <= 64, "cell map capped");
+    let id = s.place_image(vec![0u8; 4], 1, 1);
+    assert!(s.image_registry().contains_key(&id), "newest kept");
+}
+
+#[test]
+fn dec_2026_sets_sync_flag() {
+    let mut p = Parser::new(80, 24);
+    assert!(!p.sync_output(), "defaults off");
+    p.parse(b"\x1b[?2026h");
+    assert!(p.sync_output(), "DECSET 2026 enables");
+    p.parse(b"\x1b[?2026l");
+    assert!(!p.sync_output(), "DECRST 2026 disables");
 }

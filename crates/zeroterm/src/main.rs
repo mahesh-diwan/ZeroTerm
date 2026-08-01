@@ -77,11 +77,11 @@ fn spawn_pty_process(
     let mut process = backend.spawn(shell, &shell_refs, None)?;
     process.resize(PtySize { cols, rows })?;
 
-    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
 
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 65536];
         loop {
             while let Ok(cmd) = input_rx.try_recv() {
                 match cmd {
@@ -126,7 +126,7 @@ fn spawn_ssh_process(
     let password = password.map(|s| s.to_string());
     let key_path = key_path.map(|p| p.to_path_buf());
 
-    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
+    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
 
     std::thread::spawn(move || {
@@ -140,7 +140,7 @@ fn spawn_ssh_process(
                 output_tx.send(format!("\r\n\x1b[31mSSH resize: {}\x1b[0m\r\n", e).into_bytes());
         }
 
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 65536];
         loop {
             while let Ok(cmd) = input_rx.try_recv() {
                 match cmd {
@@ -343,6 +343,8 @@ struct App {
     font_path: Option<String>,
     settings: SettingsMenu,
     host_picker: HostPicker,
+    sync_active: bool,
+    last_sync_clear: std::time::Instant,
 }
 
 #[allow(dead_code)]
@@ -378,6 +380,8 @@ impl App {
             font_path: None,
             settings: SettingsMenu::new(&SettingsContext::default()),
             host_picker: HostPicker::new(),
+            sync_active: false,
+            last_sync_clear: std::time::Instant::now(),
         }
     }
 
@@ -990,8 +994,18 @@ impl App {
                                 pane.title = new_title.clone();
                                 title_changed = Some(new_title);
                             }
+                            if pane.parser.sync_output() {
+                                if !self.sync_active {
+                                    self.sync_active = true;
+                                    self.last_sync_clear = std::time::Instant::now();
+                                }
+                            } else {
+                                self.sync_active = false;
+                            }
+                            got_data = !self.sync_active;
+                        } else {
+                            got_data = true;
                         }
-                        got_data = true;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -1022,6 +1036,11 @@ impl App {
             if let Some(window) = &self.window {
                 window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
             }
+        }
+        if self.sync_active
+            && self.last_sync_clear.elapsed() > std::time::Duration::from_millis(1000)
+        {
+            got_data = true;
         }
         got_data
     }

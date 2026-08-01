@@ -2,6 +2,16 @@
 
 use crate::cell::UnderlineStyle;
 
+const MAX_CSI_PARAMS: usize = 32;
+const MAX_CSI_PARAM_DIGITS: usize = 32;
+const MAX_CSI_INTERMEDIATES: usize = 2;
+const MAX_OSC_BUFFER: usize = 1 << 20;
+const MAX_DCS_BUFFER: usize = 1 << 22;
+const MAX_APC_BUFFER: usize = 4096;
+const MAX_SIXEL_W: u32 = 8192;
+const MAX_SIXEL_H: u32 = 8192;
+const MAX_SIXEL_BYTES: usize = 100 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParserState {
     Ground,
@@ -49,17 +59,23 @@ impl CsiParams {
     }
 
     fn add_digit(&mut self, digit: char) {
-        self.current.push(digit);
+        if self.current.len() < MAX_CSI_PARAM_DIGITS {
+            self.current.push(digit);
+        }
     }
 
     fn commit_param(&mut self) {
         let val = self.current.parse().ok();
-        self.params.push(val);
+        if self.params.len() < MAX_CSI_PARAMS {
+            self.params.push(val);
+        }
         self.current.clear();
     }
 
     fn add_intermediate(&mut self, ch: char) {
-        self.intermediates.push(ch);
+        if self.intermediates.len() < MAX_CSI_INTERMEDIATES {
+            self.intermediates.push(ch);
+        }
     }
 
     fn get(&self, idx: usize, default: i64) -> i64 {
@@ -80,17 +96,20 @@ impl CsiParams {
 pub struct Parser {
     state: ParserState,
     csi: CsiParams,
-    osc_buffer: String,
-    dcs_buffer: String,
+    osc_buffer: Vec<u8>,
+    dcs_buffer: Vec<u8>,
     screen: crate::screen::Screen,
     after_newline: bool,
     command_buf: String,
     collecting_command: bool,
     mouse_tracking: MouseTrackingMode,
     bracketed_paste: bool,
+    sync_output: bool,
     pub pending_images: Vec<ImageFragment>,
     apc_buffer: String,
     clipboard_text: Option<String>,
+    // Incomplete UTF-8 sequence accumulation (streaming PTY reads split code points)
+    utf8_pending: Vec<u8>,
 }
 
 impl Parser {
@@ -98,17 +117,19 @@ impl Parser {
         Self {
             state: ParserState::Ground,
             csi: CsiParams::new(),
-            osc_buffer: String::new(),
-            dcs_buffer: String::new(),
+            osc_buffer: Vec::new(),
+            dcs_buffer: Vec::new(),
             screen: crate::screen::Screen::new(cols, rows),
             after_newline: false,
             command_buf: String::new(),
             collecting_command: false,
             mouse_tracking: MouseTrackingMode::Off,
             bracketed_paste: false,
+            sync_output: false,
             pending_images: Vec::new(),
             apc_buffer: String::new(),
             clipboard_text: None,
+            utf8_pending: Vec::new(),
         }
     }
 
@@ -138,6 +159,10 @@ impl Parser {
         self.bracketed_paste
     }
 
+    pub fn sync_output(&self) -> bool {
+        self.sync_output
+    }
+
     fn handle_byte(&mut self, byte: u8) {
         match self.state {
             ParserState::Ground => self.handle_ground(byte),
@@ -158,9 +183,16 @@ impl Parser {
 
     fn handle_ground(&mut self, byte: u8) {
         match byte {
-            0x00..=0x17 | 0x19 | 0x1C..=0x1F | 0x18 | 0x1A | 0x7F => self.execute_control(byte),
-            0x1B => self.state = ParserState::Escape,
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F | 0x18 | 0x1A | 0x7F => {
+                self.utf8_pending.clear();
+                self.execute_control(byte);
+            }
+            0x1B => {
+                self.utf8_pending.clear();
+                self.state = ParserState::Escape;
+            }
             0x20..=0x7E => {
+                self.utf8_pending.clear();
                 let ch = byte as char;
                 if self.after_newline {
                     if matches!(ch, '$' | '%' | '#' | '>') {
@@ -175,7 +207,28 @@ impl Parser {
                 }
                 self.screen.put_char(ch);
             }
-            0x80..=0xFF => {} // UTF-8 continuation bytes handled by caller
+            // UTF-8 lead/continuation bytes: accumulate, emit on complete sequence.
+            // Max code point is 4 bytes; anything longer or invalid is dropped.
+            0x80..=0xFF => {
+                self.utf8_pending.push(byte);
+                if self.utf8_pending.len() > 4 {
+                    self.utf8_pending.clear();
+                    return;
+                }
+                match std::str::from_utf8(&self.utf8_pending) {
+                    Ok(s) if !s.is_empty() => {
+                        let ch = s.chars().next().unwrap();
+                        self.utf8_pending.clear();
+                        self.after_newline = false;
+                        if self.collecting_command {
+                            self.command_buf.push(ch);
+                        }
+                        self.screen.put_char(ch);
+                    }
+                    // Still accumulating (or invalid) — wait for more bytes.
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -285,10 +338,15 @@ impl Parser {
         match byte {
             0x07 | 0x1B => {
                 let buffer = std::mem::take(&mut self.osc_buffer);
-                self.handle_osc(&buffer);
+                let osc = String::from_utf8_lossy(&buffer);
+                self.handle_osc(&osc);
                 self.state = ParserState::Ground;
             }
-            0x20..=0x7E => self.osc_buffer.push(byte as char),
+            0x20..=0xFF => {
+                if self.osc_buffer.len() < MAX_OSC_BUFFER {
+                    self.osc_buffer.push(byte);
+                }
+            }
             _ => {}
         }
     }
@@ -313,6 +371,7 @@ impl Parser {
             }
             0x40..=0x7E => {
                 self.csi.commit_param();
+                self.dcs_buffer.push(byte);
                 self.state = ParserState::DcsPassthrough;
             }
             _ => self.state = ParserState::Ground,
@@ -330,6 +389,7 @@ impl Parser {
             }
             0x40..=0x7E => {
                 self.csi.commit_param();
+                self.dcs_buffer.push(byte);
                 self.state = ParserState::DcsPassthrough;
             }
             _ => self.state = ParserState::Ground,
@@ -341,6 +401,7 @@ impl Parser {
             0x20..=0x2F => self.csi.add_intermediate(byte as char),
             0x40..=0x7E => {
                 self.csi.commit_param();
+                self.dcs_buffer.push(byte);
                 self.state = ParserState::DcsPassthrough;
             }
             _ => self.state = ParserState::Ground,
@@ -351,10 +412,15 @@ impl Parser {
         match byte {
             0x1B => {
                 let buffer = std::mem::take(&mut self.dcs_buffer);
-                self.handle_dcs_string(&buffer);
+                let dcs = String::from_utf8_lossy(&buffer);
+                self.handle_dcs_string(&dcs);
                 self.state = ParserState::Ground;
             }
-            _ => self.dcs_buffer.push(byte as char),
+            _ => {
+                if self.dcs_buffer.len() < MAX_DCS_BUFFER {
+                    self.dcs_buffer.push(byte);
+                }
+            }
         }
     }
 
@@ -371,7 +437,11 @@ impl Parser {
                 self.handle_apc(&buffer);
                 self.state = ParserState::Ground;
             }
-            0x20..=0x7E => self.apc_buffer.push(byte as char),
+            0x20..=0x7E => {
+                if self.apc_buffer.len() < MAX_APC_BUFFER {
+                    self.apc_buffer.push(byte as char);
+                }
+            }
             _ => {}
         }
     }
@@ -423,7 +493,10 @@ impl Parser {
         let private = intermediates
             .iter()
             .any(|&c| c == '?' || c == '>' || c == '<' || c == '=');
-        let intermediate: String = intermediates.iter().collect();
+        let intermediate: String = intermediates
+            .iter()
+            .filter(|&&c| c != '?' && c != '>' && c != '<' && c != '=')
+            .collect();
 
         match (final_byte, private, intermediate.as_str()) {
             // Cursor movement
@@ -637,6 +710,7 @@ impl Parser {
                     self.screen.set_mouse_tracking(set);
                 }
                 2004 => self.bracketed_paste = set,
+                2026 => self.sync_output = set,
                 1049 => self.screen.set_alternate_screen(set),
                 _ => {}
             }
@@ -766,65 +840,129 @@ impl Parser {
     }
 
     fn handle_dcs_string(&mut self, data: &str) {
-        if data.starts_with("q") || data.starts_with("0;1;q") {
-            self.handle_sixel(data);
+        if data.starts_with("q") {
+            self.handle_sixel(&data[1..]);
         }
     }
 
     fn handle_sixel(&mut self, data: &str) {
-        let palette: [(u8, u8, u8); 256] = [(0, 0, 0); 256];
+        let mut palette: [(u8, u8, u8); 256] = [(0, 0, 0); 256];
         let mut pal_idx: u8 = 0;
         let mut pixels: Vec<Vec<u32>> = Vec::new();
         let mut x: u32 = 0;
         let mut y: u32 = 0;
         let mut max_x: u32 = 0;
-        // ponytail: bare-bones stair-step parser, skips palette init cmds
-        for ch in data.chars() {
-            match ch {
-                '#' => {
-                    pal_idx = 0;
-                }
+        let mut last_data: Option<u8> = None;
+        let mut written: u64 = 0;
+        let bytes: Vec<char> = data.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                // `Pc;r;g;b` — set color register c (r,g,b are 0-100 percent).
                 'P' => {
-                    pal_idx = 0;
-                }
-                ';' | ':' | '$' => {
-                    if ch == '$' {
-                        x = 0;
-                        y += 6;
+                    if i + 1 < bytes.len() {
+                        i += 1;
+                        let mut idx: u8 = 0;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            idx = idx.saturating_mul(10).saturating_add(bytes[i] as u8 - b'0');
+                            i += 1;
+                        }
+                        let mut comps: [u32; 3] = [0; 3];
+                        let mut ci = 0;
+                        while ci < 3 && i < bytes.len() {
+                            if bytes[i] == ';' {
+                                i += 1;
+                            }
+                            if i < bytes.len() && bytes[i] == '#' {
+                                // Hex form `Pc;#RRGGBB`
+                                let mut hex = String::new();
+                                i += 1;
+                                while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                                    hex.push(bytes[i]);
+                                    i += 1;
+                                }
+                                comps[ci] = u32::from_str_radix(&hex, 16).unwrap_or(0);
+                                ci += 1;
+                                continue;
+                            }
+                            let mut v = 0u32;
+                            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                                v = v
+                                    .saturating_mul(10)
+                                    .saturating_add(bytes[i] as u32 - '0' as u32);
+                                i += 1;
+                            }
+                            comps[ci] = v;
+                            ci += 1;
+                        }
+                        let to8 = |v: u32| (v * 255 / 100).min(255) as u8;
+                        palette[idx as usize] = (to8(comps[0]), to8(comps[1]), to8(comps[2]));
                     }
                 }
-                '-' => {
+                // `#n` — select palette register n.
+                '#' => {
+                    i += 1;
+                    let mut idx: u8 = 0;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        idx = idx.saturating_mul(10).saturating_add(bytes[i] as u8 - b'0');
+                        i += 1;
+                    }
+                    pal_idx = idx;
+                }
+                ';' | ':' => i += 1,
+                '$' | '-' => {
                     x = 0;
                     y += 6;
+                    i += 1;
                 }
-                c if ('?'..='~').contains(&c) => {
-                    let sixel = (c as u8) - 63;
-                    for bit in 0..6 {
-                        if (sixel >> bit) & 1 != 0 {
-                            let py = y + bit;
-                            while pixels.len() <= py as usize {
-                                pixels.push(Vec::new());
-                            }
-                            let row = &mut pixels[py as usize];
-                            while row.len() <= x as usize {
-                                row.push(0);
-                            }
-                            let (r, g, b) = palette[pal_idx as usize];
-                            row[x as usize] =
-                                0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                '!' => {
+                    i += 1;
+                    let mut n: u64 = 0;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        n = n
+                            .saturating_mul(10)
+                            .saturating_add(bytes[i] as u64 - '0' as u64);
+                        i += 1;
+                    }
+                    let n = n.min(MAX_SIXEL_W as u64);
+                    if let Some(rep) = last_data {
+                        for _ in 0..n {
+                            draw_sixel(
+                                &mut pixels,
+                                &mut x,
+                                &mut max_x,
+                                &mut written,
+                                y,
+                                rep,
+                                &palette,
+                                pal_idx,
+                            );
                         }
                     }
-                    x += 1;
-                    if x > max_x {
-                        max_x = x;
-                    }
                 }
-                _ => {}
+                c if ('?'..='~').contains(&c) => {
+                    last_data = Some(c as u8);
+                    draw_sixel(
+                        &mut pixels,
+                        &mut x,
+                        &mut max_x,
+                        &mut written,
+                        y,
+                        c as u8,
+                        &palette,
+                        pal_idx,
+                    );
+                    i += 1;
+                }
+                _ => i += 1,
             }
         }
         let height = pixels.len() as u32;
-        let width = max_x;
+        let width = max_x.min(MAX_SIXEL_W);
         if width == 0 || height == 0 {
+            return;
+        }
+        if (width as u64) * (height as u64) * 4 > MAX_SIXEL_BYTES as u64 {
             return;
         }
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
@@ -856,9 +994,42 @@ impl Parser {
     pub fn take_pending_images(&mut self) -> Vec<ImageFragment> {
         std::mem::take(&mut self.pending_images)
     }
-
     pub fn take_clipboard_text(&mut self) -> Option<String> {
         self.clipboard_text.take()
+    }
+}
+
+fn draw_sixel(
+    pixels: &mut Vec<Vec<u32>>,
+    x: &mut u32,
+    max_x: &mut u32,
+    written: &mut u64,
+    y: u32,
+    data_byte: u8,
+    palette: &[(u8, u8, u8); 256],
+    pal_idx: u8,
+) {
+    let sixel = data_byte - 63;
+    for bit in 0..6 {
+        if (sixel >> bit) & 1 != 0 {
+            let py = y + bit;
+            if py < MAX_SIXEL_H && *x < MAX_SIXEL_W && *written < (MAX_SIXEL_BYTES as u64 / 4) {
+                while pixels.len() <= py as usize {
+                    pixels.push(Vec::new());
+                }
+                let row = &mut pixels[py as usize];
+                while row.len() <= *x as usize {
+                    row.push(0);
+                }
+                let (r, g, b) = palette[pal_idx as usize];
+                row[*x as usize] = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                *written += 1;
+            }
+        }
+    }
+    *x += 1;
+    if *x > *max_x {
+        *max_x = *x;
     }
 }
 

@@ -55,12 +55,66 @@ detect_platform() {
 # Get latest release version
 get_latest_version() {
 	local version
-	version=$(curl -fsSL "${GITHUB_API}/releases/latest" 2>/dev/null | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)
+	version=$(curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused "${GITHUB_API}/releases/latest" 2>/dev/null | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4)
 	if [[ -z "$version" ]]; then
 		log_warn "Could not fetch latest release, trying fallback..."
-		version=$(curl -fsSL "${GITHUB_API}/releases" 2>/dev/null | grep -o '"tag_name": "[^"]*' | head -1 | cut -d'"' -f4)
+		version=$(curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused "${GITHUB_API}/releases" 2>/dev/null | grep -o '"tag_name": "[^"]*' | head -1 | cut -d'"' -f4)
 	fi
 	echo "$version"
+}
+
+# Download with pacman-style progress animation (stderr must be a TTY)
+show_progress() {
+	local dest="$1" url="$2"
+	local pid i
+	local -a spinner=('ᗧ·······' '·ᗧ······' '··ᗧ·····' '···ᗧ····' '····ᗧ···' '·····ᗧ··' '······ᗧ·' '·······ᗧ')
+
+	if [[ ! -t 2 ]]; then
+		curl -fL --retry 3 --retry-delay 2 --retry-connrefused -fsSL -o "$dest" "$url"
+		return
+	fi
+
+	curl -fL --retry 3 --retry-delay 2 --retry-connrefused -fsSL -o "$dest" "$url" &
+	pid=$!
+	i=0
+	while kill -0 "$pid" 2>/dev/null; do
+		printf '\r  %s  ' "${spinner[$((i % 8))]}" >&2
+		i=$((i + 1))
+		sleep 0.12
+	done
+	printf '\r\033[K' >&2
+	wait "$pid"
+}
+
+# Best-effort SHA-256 verification; skipped when no checksum is published
+verify_checksum() {
+	local file="$1" url="$2"
+	local sum_cmd expected actual sum_file="${file}.sha256"
+
+	if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
+		log_warn "No sha256 tool found, skipping checksum verification"
+		return 0
+	fi
+
+	if ! curl -fL --retry 3 --retry-delay 2 --retry-connrefused -fsSL -o "$sum_file" "${url}.sha256" 2>/dev/null; then
+		log_warn "No checksum published for this release, skipping verification"
+		return 0
+	fi
+
+	if command -v sha256sum &>/dev/null; then
+		sum_cmd="sha256sum"
+	else
+		sum_cmd="shasum -a 256"
+	fi
+	actual=$($sum_cmd "$file" | awk '{print $1}')
+	expected=$(awk '{print $1}' "$sum_file")
+
+	if [[ "$actual" != "$expected" ]]; then
+		log_error "Checksum mismatch! Expected ${expected}, got ${actual}"
+		rm -f "$file"
+		return 1
+	fi
+	log_success "Checksum verified"
 }
 
 # Download and install binary
@@ -90,17 +144,35 @@ install_binary() {
 	temp_dir=$(mktemp -d)
 	trap 'rm -rf "${temp_dir:-}"' EXIT
 
-	if ! curl -fsSL -o "${temp_dir}/${asset_name}" "${download_url}"; then
+	if ! show_progress "${temp_dir}/${asset_name}" "${download_url}"; then
 		log_error "Failed to download ${download_url}"
 		log_info "Building from source instead..."
 		build_from_source
 		return
 	fi
 
+	if ! verify_checksum "${temp_dir}/${asset_name}" "${download_url}"; then
+		log_warn "Checksum verification failed, building from source instead..."
+		build_from_source
+		return
+	fi
+
 	log_info "Extracting..."
 	case "$asset_name" in
-	*.tar.gz) tar -xzf "${temp_dir}/${asset_name}" -C "${temp_dir}" ;;
-	*.zip) unzip -q "${temp_dir}/${asset_name}" -d "${temp_dir}" ;;
+	*.tar.gz)
+		command -v tar &>/dev/null || {
+			log_error "tar not found, cannot extract"
+			exit 1
+		}
+		tar -xzf "${temp_dir}/${asset_name}" -C "${temp_dir}"
+		;;
+	*.zip)
+		command -v unzip &>/dev/null || {
+			log_error "unzip not found, cannot extract"
+			exit 1
+		}
+		unzip -q "${temp_dir}/${asset_name}" -d "${temp_dir}"
+		;;
 	esac
 
 	# Find the binary
@@ -230,12 +302,34 @@ EOF
 	log_success "App bundle created: ${app_dir}"
 }
 
+# Remove the PATH line this installer added
+remove_path_line() {
+	local shell_rc=""
+	case "${SHELL##*/}" in
+	bash) shell_rc="${HOME}/.bashrc" ;;
+	zsh) shell_rc="${HOME}/.zshrc" ;;
+	fish) shell_rc="${HOME}/.config/fish/config.fish" ;;
+	*) shell_rc="${HOME}/.profile" ;;
+	esac
+
+	[[ -f "$shell_rc" ]] || return 0
+
+	if [[ "${SHELL##*/}" == fish ]]; then
+		sed -i.bak "\|set -gx PATH ${INSTALL_DIR} \\\$PATH|d" "$shell_rc"
+	else
+		sed -i.bak "\|export PATH=\"${INSTALL_DIR}:\\\$PATH\"|d" "$shell_rc"
+	fi
+	rm -f "${shell_rc}.bak"
+	log_success "Removed PATH line from ${shell_rc}"
+}
+
 # Uninstall
 uninstall() {
 	log_info "Uninstalling ZeroTerm..."
 	rm -f "${INSTALL_DIR}/zeroterm"
 	rm -f "${DESKTOP_DIR}/zeroterm.desktop"
 	rm -rf "${APP_BUNDLE_DIR}/ZeroTerm.app"
+	remove_path_line
 	if [ "$PURGE" = true ]; then
 		rm -rf "${CONFIG_DIR}"
 		log_info "Config removed: ${CONFIG_DIR}"
@@ -251,6 +345,7 @@ main() {
 		case "$arg" in
 		--uninstall | -u) UNINSTALL=true ;;
 		--purge) PURGE=true ;;
+		--verbose) set -x ;;
 		esac
 	done
 

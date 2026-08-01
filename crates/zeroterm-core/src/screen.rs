@@ -3,6 +3,9 @@
 use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
 use std::collections::{HashMap, VecDeque};
 
+const MAX_IMAGES: usize = 64;
+const MAX_IMAGE_BYTES: usize = 100 << 20;
+
 #[derive(Debug, Clone)]
 pub struct CommandBlock {
     pub id: usize,
@@ -810,6 +813,23 @@ impl Screen {
     pub fn place_image(&mut self, rgba_data: Vec<u8>, width: u32, height: u32) -> u32 {
         let id = self.next_image_id;
         self.next_image_id += 1;
+        if width == 0
+            || height == 0
+            || (width as u64) * (height as u64) * 4 > MAX_IMAGE_BYTES as u64
+            || rgba_data.len() > MAX_IMAGE_BYTES
+        {
+            return id;
+        }
+        while self.image_registry.len() >= MAX_IMAGES {
+            let oldest = self.image_registry.keys().min().copied();
+            match oldest {
+                Some(old) => {
+                    self.image_registry.remove(&old);
+                    self.image_cells.retain(|_, v| *v != old);
+                }
+                None => break,
+            }
+        }
         self.image_registry.insert(
             id,
             ImageData {

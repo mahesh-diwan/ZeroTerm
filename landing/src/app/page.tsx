@@ -83,32 +83,76 @@ function AnimatedSection({ children, className = '', delay = 0 }: { children: Re
 
 // ─── Terminal Demo ──────────────────────────────────────────────────────────
 
-const terminalLines = [
-  { text: 'user@zeroterm:~$ ', cmd: true },
-  { text: 'zeroterm --version', cmd: true },
-  { text: 'ZeroTerm v0.2.0 (rustc 1.81)', cmd: false },
-  { text: 'user@zeroterm:~$ ', cmd: true },
-  { text: 'echo "GPU accelerated"', cmd: true },
-  { text: 'GPU accelerated', cmd: false },
-  { text: 'user@zeroterm:~$ ', cmd: true },
-  { text: 'cat /proc/cpuinfo | grep cores', cmd: true },
-  { text: 'cpu cores        : 8', cmd: false },
-  { text: 'user@zeroterm:~$ ', cmd: true },
-  { text: 'ssh prod-server', cmd: true },
-  { text: 'Connected to prod-server (persistent session)', cmd: false },
-  { text: 'user@prod:~$ ', cmd: true },
+type DemoLine =
+  | { kind: 'cmd'; prompt: string; cmd: string }
+  | { kind: 'out'; out: string; accent?: boolean };
+
+const demoLines: DemoLine[] = [
+  { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'zeroterm --version' },
+  { kind: 'out', out: 'ZeroTerm v0.2.0 (rustc 1.81)' },
+  { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'echo "GPU accelerated"' },
+  { kind: 'out', out: 'GPU accelerated' },
+  { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'cat /proc/cpuinfo | grep cores' },
+  { kind: 'out', out: 'cpu cores        : 8' },
+  { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'ssh prod-server' },
+  { kind: 'out', out: 'Connected to prod-server (persistent session)', accent: true },
+  { kind: 'cmd', prompt: 'user@prod:~', cmd: '' },
 ];
 
+const lineStart: number[] = (() => {
+  const starts: number[] = [];
+  let idx = 0;
+  for (const line of demoLines) {
+    starts.push(idx);
+    idx += 1 + (line.kind === 'cmd' ? line.cmd.length : 0);
+  }
+  return starts;
+})();
+
+const delays = (() => {
+  const d: number[] = [];
+  for (const line of demoLines) {
+    if (line.kind === 'cmd') {
+      d.push(150 + Math.random() * 120);
+      for (let k = 0; k < line.cmd.length; k++) d.push(24 + Math.random() * 16);
+    } else {
+      d.push(160 + Math.random() * 120);
+    }
+  }
+  return d;
+})();
+
+const HOLD_MS = 2600;
+
 function TerminalDemo() {
-  const [visible, setVisible] = useState(1);
+  const [tick, setTick] = useState(0);
+  const [run, setRun] = useState(0);
 
   useEffect(() => {
-    const timers: ReturnType<typeof setTimeout>[] = [];
-    terminalLines.forEach((_, i) => {
-      timers.push(setTimeout(() => setVisible(i + 1), i * 350 + 500));
-    });
-    return () => timers.forEach(clearTimeout);
-  }, []);
+    let timer: ReturnType<typeof setTimeout>;
+    const step = (t: number) => {
+      setTick(t);
+      if (t < delays.length) {
+        timer = setTimeout(() => step(t + 1), delays[t]);
+      } else {
+        timer = setTimeout(() => {
+          setTick(0);
+          setRun((r) => r + 1);
+        }, HOLD_MS);
+      }
+    };
+    step(0);
+    return () => clearTimeout(timer);
+  }, [run]);
+
+  let cursorLine = -1;
+  let cursorChars = 0;
+  demoLines.forEach((line, i) => {
+    if (line.kind === 'cmd' && tick > lineStart[i]) {
+      cursorLine = i;
+      cursorChars = Math.min(Math.max(tick - lineStart[i] - 1, 0), line.cmd.length);
+    }
+  });
 
   return (
     <div className="rounded-xl border border-border overflow-hidden bg-[#06060c] shadow-2xl shadow-accent-dim/20">
@@ -120,26 +164,28 @@ function TerminalDemo() {
       </div>
       <div className="p-4 min-h-[280px]">
         <pre className="text-sm leading-relaxed font-mono">
-          {terminalLines.slice(0, visible).map((line, i) => (
-            <div
-              key={i}
-              className={`transition-opacity duration-300 ${i < visible ? 'opacity-100' : 'opacity-0'}`}
-            >
-              {line.cmd ? (
-                <span>
-                  {i === 0 || terminalLines[i - 1]?.cmd === false ? (
-                    <span className="text-accent">$ </span>
-                  ) : null}
-                  <span className="text-fg-muted/80">{line.text.replace(/^user@.*?\$ /, '')}</span>
-                </span>
-              ) : (
-                <span className="text-fg/90">{line.text}</span>
-              )}
-            </div>
-          ))}
-          {visible >= terminalLines.length && (
-            <span className="inline-block w-2 h-4 bg-accent/80 animate-cursor ml-1" />
-          )}
+          {demoLines.map((line, i) => {
+            const start = lineStart[i];
+            if (tick <= start) return null;
+            if (line.kind === 'cmd') {
+              const chars = Math.min(Math.max(tick - start - 1, 0), line.cmd.length);
+              return (
+                <div key={i}>
+                  <span className="text-fg-muted/80">{line.prompt}</span>
+                  <span className="text-accent">$ </span>
+                  <span className="text-fg/80">{line.cmd.slice(0, chars)}</span>
+                  {i === cursorLine && (
+                    <span className="inline-block w-2 h-4 bg-accent/80 animate-cursor ml-1 align-middle" />
+                  )}
+                </div>
+              );
+            }
+            return (
+              <div key={i}>
+                <span className={line.accent ? 'text-accent' : 'text-fg'}>{line.out}</span>
+              </div>
+            );
+          })}
         </pre>
       </div>
     </div>

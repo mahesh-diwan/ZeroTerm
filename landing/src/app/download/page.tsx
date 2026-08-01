@@ -52,6 +52,143 @@ function CommandCopy({ cmd, label }: { cmd: string; label: string }) {
   );
 }
 
+const DOWNLOAD_FILE = 'zeroterm-v0.1.0-linux-x86_64.tar.gz';
+const TOTAL_MB = 24.8;
+const DL_LINE = `Downloading ${DOWNLOAD_FILE}`;
+const EX_LINE = 'Extracting...';
+const INSTALL_LINE = 'Installing to ~/.local/bin';
+
+type Phase = 'type-dl' | 'download' | 'type-ex' | 'extract' | 'type-install' | 'done';
+
+const TYPE_TARGET: Partial<Record<Phase, string>> = {
+  'type-dl': DL_LINE,
+  'type-ex': EX_LINE,
+  'type-install': INSTALL_LINE,
+};
+
+function PacmanBar({ pct, len, mouth, dim }: { pct: number; len: number; mouth: boolean; dim?: boolean }) {
+  const i = Math.min(len - 1, Math.floor((pct / 100) * len));
+  const rest = Math.max(0, len - i - 1);
+  return (
+    <span className={dim ? 'opacity-50' : ''}>
+      <span className="text-[var(--fg-muted)]">[{' '.repeat(i)}</span>
+      <span className="text-[var(--accent)]">{mouth ? 'ᗧ' : 'ᗣ'}</span>
+      <span className="text-[var(--fg-muted)]">{'·'.repeat(rest)}]</span>
+    </span>
+  );
+}
+
+function PacmanDownloadDemo() {
+  const [phase, setPhase] = useState<Phase>('type-dl');
+  const [typed, setTyped] = useState(0);
+  const [pct, setPct] = useState(0);
+  const [dlDone, setDlDone] = useState(false);
+  const [exDone, setExDone] = useState(false);
+
+  useEffect(() => {
+    const target = TYPE_TARGET[phase];
+    if (!target) return;
+    if (typed < target.length) {
+      const id = setTimeout(() => setTyped(typed + 1), 18);
+      return () => clearTimeout(id);
+    }
+    const id = setTimeout(() => {
+      if (phase === 'type-dl') setPhase('download');
+      else if (phase === 'type-ex') setPhase('extract');
+      else setPhase('done');
+    }, 300);
+    return () => clearTimeout(id);
+  }, [phase, typed]);
+
+  useEffect(() => {
+    if (phase !== 'download' && phase !== 'extract') return;
+    const step = phase === 'download' ? 0.5 : 2;
+    const id = setInterval(() => setPct((p) => Math.min(100, p + step)), 40);
+    return () => clearInterval(id);
+  }, [phase]);
+
+  useEffect(() => {
+    if (pct < 100) return;
+    if (phase === 'download') {
+      setPhase('type-ex');
+      setTyped(0);
+      setDlDone(true);
+    } else if (phase === 'extract') {
+      setPhase('type-install');
+      setTyped(0);
+      setExDone(true);
+    }
+    setPct(0);
+  }, [phase, pct]);
+
+  useEffect(() => {
+    if (phase !== 'done') return;
+    const id = setTimeout(() => {
+      setPhase('type-dl');
+      setTyped(0);
+      setPct(0);
+      setDlDone(false);
+      setExDone(false);
+    }, 4000);
+    return () => clearTimeout(id);
+  }, [phase]);
+
+  const mouth = phase === 'download' || phase === 'extract'
+    ? Math.floor(pct / (phase === 'download' ? 2 : 6)) % 2 === 0
+    : true;
+  const speed = 3.8 + 1.4 * (pct / 100);
+  const downloaded = TOTAL_MB * (pct / 100);
+  const typing = TYPE_TARGET[phase];
+
+  return (
+    <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6 mb-16">
+      <h2 className="text-2xl font-bold mb-1">Watch it install</h2>
+      <p className="text-sm text-[var(--fg-muted)] mb-6">A live preview of the ZeroTerm download flow.</p>
+      <div className="rounded-xl border border-[var(--border)] overflow-hidden bg-[#06060c]">
+        <div className="flex items-center gap-1.5 px-4 py-2.5 bg-[var(--bg)] border-b border-[var(--border)]">
+          <div className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
+          <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/80" />
+          <div className="w-2.5 h-2.5 rounded-full bg-green-500/80" />
+          <span className="ml-3 text-xs text-[var(--fg-muted)] font-mono">zeroterm install</span>
+        </div>
+        <div className="p-4 min-h-[190px] font-mono text-sm leading-7 whitespace-pre text-[var(--fg)]">
+          <div>{phase === 'type-dl' ? typing : DL_LINE}</div>
+          {phase === 'download' && (
+            <div>
+              <PacmanBar pct={pct} len={12} mouth={mouth} /> {Math.floor(pct)}% {speed.toFixed(1)} MB/s  {downloaded.toFixed(1)} MB / {TOTAL_MB} MB
+            </div>
+          )}
+          {dlDone && phase !== 'download' && (
+            <div>
+              <PacmanBar pct={100} len={12} mouth={false} dim /> 100%  5.2 MB/s  {TOTAL_MB} MB / {TOTAL_MB} MB
+            </div>
+          )}
+          {(exDone || phase === 'type-ex') && <div>{phase === 'type-ex' ? typing : EX_LINE}</div>}
+          {phase === 'extract' && (
+            <div>
+              <PacmanBar pct={pct} len={6} mouth={mouth} /> {Math.floor(pct)}%
+            </div>
+          )}
+          {exDone && phase !== 'extract' && (
+            <div>
+              <PacmanBar pct={100} len={6} mouth={false} dim /> 100%
+            </div>
+          )}
+          {exDone && phase !== 'extract' && <div>{phase === 'type-install' ? typing : INSTALL_LINE}</div>}
+          {phase === 'done' && (
+            <div>
+              <span className="text-green-500">✓</span> Done. Run 'zeroterm'
+            </div>
+          )}
+          {(phase === 'type-dl' || phase === 'type-ex' || phase === 'type-install') && (
+            <span className="inline-block w-2 h-4 bg-[var(--accent)] animate-cursor ml-1" />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function DownloadPage() {
   return (
     <div className="min-h-screen">
@@ -86,6 +223,7 @@ export default function DownloadPage() {
               </div>
             ))}
           </div>
+          <PacmanDownloadDemo />
           <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl p-6">
             <h2 className="text-2xl font-bold mb-6">Release Notes</h2>
             {releaseNotes.map((r) => (
