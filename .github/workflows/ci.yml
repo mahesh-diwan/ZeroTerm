@@ -1,21 +1,39 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+  pull_request:
+
 jobs:
   build:
+    name: Build & test (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            cargo_exclude: ""
+          - os: macos-latest
+            cargo_exclude: ""
+          - os: windows-latest
+            # zeroterm (main.rs wires zeroterm-ssh, a cfg(unix)-only dep) and
+            # zeroterm-ssh (uses ssh2, cfg(unix)-only) are unix-only today.
+            # The remaining crates are Windows-portable. Revisit once the app
+            # binary builds on Windows.
+            cargo_exclude: "--exclude zeroterm --exclude zeroterm-ssh"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          components: [fmt, clippy]
+      - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --locked --workspace ${{ matrix.cargo_exclude }}
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace ${{ matrix.cargo_exclude }}
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets ${{ matrix.cargo_exclude }} -- -D warnings

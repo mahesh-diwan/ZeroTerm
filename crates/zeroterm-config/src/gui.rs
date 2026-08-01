@@ -2,6 +2,12 @@
 
 pub struct SettingsPanel;
 
+impl Default for SettingsPanel {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl SettingsPanel {
     pub fn new() -> Self {
         Self

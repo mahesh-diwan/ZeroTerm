@@ -122,9 +122,9 @@ impl Color {
 
     pub fn from_ansi_216(idx: u8) -> Color {
         let idx = idx - 16;
-        let r = (idx / 36) as u8;
-        let g = ((idx % 36) / 6) as u8;
-        let b = (idx % 6) as u8;
+        let r = idx / 36;
+        let g = (idx % 36) / 6;
+        let b = idx % 6;
         let map = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
         Color {
             r: map(r),

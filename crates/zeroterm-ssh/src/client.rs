@@ -91,6 +91,12 @@ pub struct SshSession {
     channel: Option<ssh2::Channel>,
 }
 
+impl Default for SshSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SshSession {
     pub fn new() -> Self {
         Self {

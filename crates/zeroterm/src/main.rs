@@ -2321,7 +2321,30 @@ fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    info!("Starting ZeroTerm v0.1.0");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--version" | "-V" => {
+                println!("zeroterm {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("ZeroTerm - GPU-accelerated terminal emulator");
+                println!();
+                println!("Usage: zeroterm [OPTIONS]");
+                println!();
+                println!("Options:");
+                println!("  --version, -V  Print version and exit");
+                println!("  --help, -h     Print help and exit");
+                println!("  upgrade        Update to the latest release");
+                return Ok(());
+            }
+            "upgrade" => return upgrade(),
+            _ => {}
+        }
+    }
+
+    info!("Starting ZeroTerm v{}", env!("CARGO_PKG_VERSION"));
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -2329,6 +2352,21 @@ fn main() -> Result<()> {
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
 
+    Ok(())
+}
+
+fn upgrade() -> Result<()> {
+    if Path::new("install.sh").is_file() {
+        let status = std::process::Command::new("bash")
+            .arg("install.sh")
+            .arg("upgrade")
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    println!("Update ZeroTerm with:");
+    println!(
+        "  curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/install.sh | bash -s -- upgrade"
+    );
     Ok(())
 }
 

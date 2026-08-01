@@ -8,6 +8,7 @@ members = [
     "crates/zeroterm-ai",
     "crates/zeroterm-sync",
     "crates/zeroterm-ssh",
+    "crates/zeroterm-plugin",
     "crates/zeroterm",
 ]
 
@@ -35,6 +36,9 @@ zeroize = "1.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 criterion = "0.5"
 dirs = "5.0"
+wasmtime = "28"
+wasmtime-wasi = { version = "28", features = ["preview1"] }
+wat = "1"
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
 
 [workspace.package]

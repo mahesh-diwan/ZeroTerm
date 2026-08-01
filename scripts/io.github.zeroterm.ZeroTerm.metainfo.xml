@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop">
+  <id>io.github.zeroterm.ZeroTerm</id>
+  <name>ZeroTerm</name>
+  <summary>GPU-accelerated terminal emulator</summary>
+  <description>
+    <p>ZeroTerm is a modern, GPU-accelerated terminal emulator built with Rust and wgpu.</p>
+  </description>
+  <categories>
+    <category>TerminalEmulator</category>
+  </categories>
+  <url type="homepage">https://github.com/zeroterm/zeroterm</url>
+  <project_license>MIT</project_license>
+</component>

@@ -129,8 +129,8 @@ install_binary() {
 	case "$platform" in
 	linux-x86_64) asset_name="${BINARY_NAME}-${version}-linux-x86_64.tar.gz" ;;
 	linux-aarch64) asset_name="${BINARY_NAME}-${version}-linux-aarch64.tar.gz" ;;
-	darwin-x86_64) asset_name="${BINARY_NAME}-${version}-macos-x86_64.tar.gz" ;;
-	darwin-aarch64) asset_name="${BINARY_NAME}-${version}-macos-aarch64.tar.gz" ;;
+	darwin-x86_64) asset_name="${BINARY_NAME}-${version}-macos-x86_64.zip" ;;
+	darwin-aarch64) asset_name="${BINARY_NAME}-${version}-macos-arm64.zip" ;;
 	windows-x86_64) asset_name="${BINARY_NAME}-${version}-windows-x86_64.zip" ;;
 	*)
 		log_error "No prebuilt binary for platform: $platform"

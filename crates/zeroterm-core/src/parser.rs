@@ -345,10 +345,8 @@ impl Parser {
                 self.handle_osc(&osc);
                 self.state = ParserState::Ground;
             }
-            0x20..=0xFF => {
-                if self.osc_buffer.len() < MAX_OSC_BUFFER {
-                    self.osc_buffer.push(byte);
-                }
+            0x20..=0xFF if self.osc_buffer.len() < MAX_OSC_BUFFER => {
+                self.osc_buffer.push(byte);
             }
             _ => {}
         }
@@ -440,10 +438,8 @@ impl Parser {
                 self.handle_apc(&buffer);
                 self.state = ParserState::Ground;
             }
-            0x20..=0x7E => {
-                if self.apc_buffer.len() < MAX_APC_BUFFER {
-                    self.apc_buffer.push(byte as char);
-                }
+            0x20..=0x7E if self.apc_buffer.len() < MAX_APC_BUFFER => {
+                self.apc_buffer.push(byte as char);
             }
             _ => {}
         }
@@ -454,7 +450,7 @@ impl Parser {
             0x07 => self.screen.bell(),        // BEL
             0x08 => self.screen.cursor_left(), // BS
             0x09 => self.screen.tab(),         // HT
-            0x0A | 0x0B | 0x0C => {
+            0x0A..=0x0C => {
                 self.screen.linefeed(); // LF, VT, FF
                 self.after_newline = true;
             }
@@ -605,13 +601,11 @@ impl Parser {
                                     i += 4;
                                 }
                             }
-                            5 => {
+                            5 if i + 2 < self.csi.param_count() => {
                                 // 256-color
-                                if i + 2 < self.csi.param_count() {
-                                    let idx = self.csi.get(i + 2, 0) as u8;
-                                    self.screen.set_fg_256(idx);
-                                    i += 2;
-                                }
+                                let idx = self.csi.get(i + 2, 0) as u8;
+                                self.screen.set_fg_256(idx);
+                                i += 2;
                             }
                             _ => {}
                         }
@@ -634,13 +628,11 @@ impl Parser {
                                     i += 4;
                                 }
                             }
-                            5 => {
+                            5 if i + 2 < self.csi.param_count() => {
                                 // 256-color
-                                if i + 2 < self.csi.param_count() {
-                                    let idx = self.csi.get(i + 2, 0) as u8;
-                                    self.screen.set_bg_256(idx);
-                                    i += 2;
-                                }
+                                let idx = self.csi.get(i + 2, 0) as u8;
+                                self.screen.set_bg_256(idx);
+                                i += 2;
                             }
                             _ => {}
                         }
@@ -737,22 +729,18 @@ impl Parser {
             // Color palette - ignored for now
         } else if osc.starts_with("8;") {
             // Hyperlink - ignored for now
-        } else if osc.starts_with("52;") {
-            let payload = &osc[3..];
+        } else if let Some(payload) = osc.strip_prefix("52;") {
             if let Some(semicolon) = payload.find(';') {
                 let base64_data = &payload[semicolon + 1..];
                 if !base64_data.is_empty() {
-                    match decode_base64(base64_data) {
-                        Ok(data) => {
-                            self.clipboard_text = Some(String::from_utf8_lossy(&data).to_string());
-                        }
-                        Err(_) => (), // silently ignore malformed base64
+                    if let Ok(data) = decode_base64(base64_data) {
+                        self.clipboard_text = Some(String::from_utf8_lossy(&data).to_string());
                     }
                 }
             }
-        } else if osc.starts_with("1337;") {
+        } else if let Some(payload) = osc.strip_prefix("1337;") {
             // iTerm2 inline image protocol
-            self.handle_iterm_image(&osc[5..]);
+            self.handle_iterm_image(payload);
         }
     }
 
@@ -880,8 +868,8 @@ impl Parser {
     }
 
     fn handle_dcs_string(&mut self, data: &str) {
-        if data.starts_with("q") {
-            self.handle_sixel(&data[1..]);
+        if let Some(data) = data.strip_prefix("q") {
+            self.handle_sixel(data);
         }
     }
 
@@ -1040,6 +1028,9 @@ impl Parser {
     }
 }
 
+// 8 positional args is the natural sixel-state signature; clippy's 7-arg cap
+// isn't worth wrapping these in a struct here.
+#[allow(clippy::too_many_arguments)]
 fn draw_sixel(
     pixels: &mut Vec<Vec<u32>>,
     x: &mut u32,

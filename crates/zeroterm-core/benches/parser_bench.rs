@@ -52,6 +52,46 @@ fn newline_storm() -> Vec<u8> {
     vec![b'\n'; 10_000]
 }
 
+fn vim_session() -> Vec<u8> {
+    let mut v = Vec::new();
+    for _ in 0..200 {
+        v.extend_from_slice(b"\x1b[1;7m-- INSERT --\x1b[0m\r\n");
+        for line in 0..24 {
+            v.extend_from_slice(b"\x1b[38;5;70m");
+            v.extend_from_slice(b"fn main() { println!(\"hi\"); } // ");
+            v.extend_from_slice(format!("line {line}\r\n").as_bytes());
+            v.extend_from_slice(b"\x1b[0m");
+        }
+        v.extend_from_slice(b"\x1b[5;10H\x1b[K\x1b[P");
+        v.extend_from_slice(b"\x1b[2L\x1b[2M");
+        v.extend_from_slice(b"\x1b[10;5H\x1b[10C\x1b[2;15r");
+        v.extend_from_slice(b"\x1b7\x1b[24;1H\x1b[0m~ \x1b8");
+        v.extend_from_slice(b"\x1b[H\x1b[2J");
+    }
+    v
+}
+
+fn four_k_fill() -> Vec<u8> {
+    let mut v = Vec::with_capacity(64_800 * 2);
+    let line = b"the quick brown fox jumps over the lazy dog 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for _ in 0..(64_800 / line.len()) {
+        v.extend_from_slice(line);
+        v.push(b'\n');
+    }
+    v
+}
+
+fn progress_rewrite() -> Vec<u8> {
+    let mut v = Vec::new();
+    for i in 0..400 {
+        v.extend_from_slice(b"\x1b[G\x1b[K");
+        v.extend_from_slice(format!("Progress: {}% [", i * 100 / 400).as_bytes());
+        v.extend_from_slice(&b"#".repeat(i % 40));
+        v.extend_from_slice(b"]\r");
+    }
+    v
+}
+
 fn bench_plain(c: &mut Criterion) {
     let data = plain_text();
     let mut g = c.benchmark_group("parse_plain_text");
@@ -107,12 +147,48 @@ fn bench_scroll(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_vim(c: &mut Criterion) {
+    let data = vim_session();
+    let mut g = c.benchmark_group("parse_vim_session");
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    g.bench_function("mixed_csi_scroll_edits", |b| {
+        let mut p = Parser::new(COLS, ROWS);
+        b.iter(|| p.parse(black_box(&data)));
+    });
+    g.finish();
+}
+
+fn bench_4k_fill(c: &mut Criterion) {
+    let data = four_k_fill();
+    let mut g = c.benchmark_group("parse_4k_fill");
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    g.bench_function("64800_cells_plus_scroll", |b| {
+        let mut p = Parser::new(COLS, ROWS);
+        b.iter(|| p.parse(black_box(&data)));
+    });
+    g.finish();
+}
+
+fn bench_progress(c: &mut Criterion) {
+    let data = progress_rewrite();
+    let mut g = c.benchmark_group("parse_progress_rewrite");
+    g.throughput(Throughput::Bytes(data.len() as u64));
+    g.bench_function("cursor_rewrite_burst", |b| {
+        let mut p = Parser::new(COLS, ROWS);
+        b.iter(|| p.parse(black_box(&data)));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_plain,
     bench_mixed,
     bench_csi,
     bench_osc_sixel,
-    bench_scroll
+    bench_scroll,
+    bench_vim,
+    bench_4k_fill,
+    bench_progress
 );
 criterion_main!(benches);

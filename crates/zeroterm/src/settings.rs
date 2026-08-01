@@ -57,6 +57,7 @@ pub struct SettingsContext {
     pub theme: String,
 }
 
+#[derive(Default)]
 pub struct SettingsMenu {
     pub open: bool,
     pub items: Vec<SettingsItem>,
@@ -64,19 +65,6 @@ pub struct SettingsMenu {
     saved_cells: Option<Vec<Vec<Cell>>>,
     saved_top: Option<usize>,
     saved_cursor: Option<Cursor>,
-}
-
-impl Default for SettingsMenu {
-    fn default() -> Self {
-        Self {
-            open: false,
-            items: Vec::new(),
-            cursor: 0,
-            saved_cells: None,
-            saved_top: None,
-            saved_cursor: None,
-        }
-    }
 }
 
 impl SettingsMenu {
@@ -235,9 +223,7 @@ impl SettingsMenu {
                 .as_bytes(),
             );
             out.extend_from_slice(text.as_bytes());
-            for _ in 0..pad {
-                out.push(b' ');
-            }
+            out.extend(std::iter::repeat_n(b' ', pad));
             out.extend_from_slice(b"\x1b[0m");
         }
         out

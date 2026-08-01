@@ -1,4 +1,5 @@
 name: Release
+
 on:
   push:
     tags:
@@ -11,9 +12,10 @@ on:
 
 jobs:
   build:
+    name: Build (${{ matrix.os }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -21,16 +23,17 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             suffix: ""
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            suffix: ".exe"
+          # windows-latest intentionally omitted: crates/zeroterm/src/main.rs
+          # references zeroterm_ssh (a cfg(unix)-only dependency), so the app
+          # does not build on Windows yet. Re-add once main.rs is portable.
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release -p zeroterm
+        run: cargo build --release --locked -p zeroterm
       - name: Check binary size (50MB gate)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -46,9 +49,6 @@ jobs:
       - name: Package for macOS (.app bundle)
         if: matrix.os == 'macos-latest'
         run: bash scripts/make_macos_app.sh
-      - name: Package for Windows (zip + MSI)
-        if: matrix.os == 'windows-latest'
-        run: .\scripts\package_windows.bat
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -61,6 +61,7 @@ jobs:
   flatpak:
     runs-on: ubuntu-latest
     needs: [build]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install Flatpak and deps
@@ -83,9 +84,11 @@ jobs:
   deb:
     runs-on: ubuntu-latest
     needs: [build]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build .deb package
         run: bash scripts/build-deb.sh
       - name: Upload .deb
@@ -97,9 +100,11 @@ jobs:
   rpm:
     runs-on: ubuntu-latest
     needs: [build]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install rpm tools
         run: |
           sudo apt-get update
@@ -114,6 +119,7 @@ jobs:
 
   systemd-unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Upload systemd unit

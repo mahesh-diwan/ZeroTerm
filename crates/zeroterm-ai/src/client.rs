@@ -79,8 +79,8 @@ impl AiClient {
             .await
             .map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
 
-        let parsed: OllamaResponse = serde_json::from_str(&text)
-            .map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
+        let parsed: OllamaResponse =
+            serde_json::from_str(&text).map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
 
         Ok(parsed.response)
     }
@@ -114,8 +114,8 @@ impl AiClient {
             .await
             .map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
 
-        let parsed: OllamaResponse = serde_json::from_str(&text)
-            .map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
+        let parsed: OllamaResponse =
+            serde_json::from_str(&text).map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
 
         Ok(parsed.response)
     }

@@ -203,13 +203,13 @@ fn csi_with_missing_final_byte() {
 #[test]
 fn osc_and_dcs_without_terminator() {
     let mut osc = b"\x1b]0;".to_vec();
-    osc.extend(std::iter::repeat(b'a').take(4096));
+    osc.extend(std::iter::repeat_n(b'a', 4096));
     parse_and_check(&osc);
     let mut dcs = b"\x1bPq".to_vec();
-    dcs.extend(std::iter::repeat(b'!').take(4096));
+    dcs.extend(std::iter::repeat_n(b'!', 4096));
     parse_and_check(&dcs);
     let mut apc = b"\x1b_G".to_vec();
-    apc.extend(std::iter::repeat(b'=').take(4096));
+    apc.extend(std::iter::repeat_n(b'=', 4096));
     parse_and_check(&apc);
 }
 
@@ -236,7 +236,7 @@ fn params_with_leading_zeros() {
 #[test]
 fn screen_integrity_after_garbage() {
     let mut corpus = Vec::new();
-    for opener in [b'\x1b', b'\x1b', b'\x1b'] {
+    for opener in *b"\x1b\x1b\x1b" {
         corpus.push(opener);
     }
     corpus.extend(b"[?1049h");
@@ -336,7 +336,7 @@ fn sixel_palette_and_pixels_render_color() {
     assert_eq!(imgs[0].width, 1);
     assert_eq!(imgs[0].height, 6, "'~' sets all 6 bits");
     // RGBA data: [r, g, b, a] — all 6 rows red
-    let red = vec![255, 0, 0, 255];
+    let red = [255, 0, 0, 255];
     assert_eq!(imgs[0].data, red.repeat(6), "red from palette");
 }
 
@@ -414,7 +414,7 @@ fn csi_params_capped_at_32() {
 #[test]
 fn osc_buffer_capped() {
     let mut input = b"\x1b]0;".to_vec();
-    input.extend(std::iter::repeat(b'a').take(2 * 1024 * 1024));
+    input.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024));
     input.push(0x07);
     let mut p = Parser::new(80, 24);
     p.parse(&input);
@@ -425,7 +425,7 @@ fn osc_buffer_capped() {
 #[test]
 fn sixel_dimensions_capped() {
     let mut input = b"\x1bPq#0".to_vec();
-    input.extend(std::iter::repeat(b'~').take(20_000));
+    input.extend(std::iter::repeat_n(b'~', 20_000));
     input.extend(b"\x1b\\");
     let mut p = Parser::new(80, 24);
     p.parse(&input);

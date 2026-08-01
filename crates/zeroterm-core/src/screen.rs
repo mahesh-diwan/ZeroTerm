@@ -68,6 +68,7 @@ pub struct Screen {
     mouse_tracking: bool,
     tabs: Vec<bool>,
     bell_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    #[allow(clippy::type_complexity)] // callback box type; a named alias adds noise
     title_callback: Option<Box<dyn Fn(&str) + Send + Sync>>,
     ident_callback: Option<Box<dyn Fn() + Send + Sync>>,
     status_callback: Option<Box<dyn Fn() + Send + Sync>>,
@@ -137,11 +138,7 @@ impl Screen {
 
         let mut new_buffer = vec![vec![Cell::default(); cols]; rows];
 
-        let row_start = if rows > self.size.rows {
-            0
-        } else {
-            self.size.rows - rows
-        };
+        let row_start = self.size.rows.saturating_sub(rows);
         let col_end = cols.min(self.size.cols);
 
         for (r, row) in self.buffer.iter().skip(row_start).enumerate() {
@@ -154,11 +151,7 @@ impl Screen {
 
         if let Some(ref mut alt) = self.alt_buffer {
             let mut new_alt = vec![vec![Cell::default(); cols]; rows];
-            let row_start = if rows > self.size.rows {
-                0
-            } else {
-                self.size.rows - rows
-            };
+            let row_start = self.size.rows.saturating_sub(rows);
             let col_end = cols.min(self.size.cols);
 
             for (r, row) in alt.iter().skip(row_start).enumerate() {
@@ -255,7 +248,7 @@ impl Screen {
             }
         }
 
-        let width = ch.width().unwrap_or(1).max(1) as usize;
+        let width = ch.width().unwrap_or(1).max(1);
         self.cursor.col = (self.cursor.col + width).min(self.size.cols);
     }
 
@@ -320,7 +313,7 @@ impl Screen {
     }
 
     pub fn linefeed(&mut self) {
-        if self.cursor.row + 1 >= self.scroll_bottom() + 1 {
+        if self.cursor.row + 1 > self.scroll_bottom() {
             self.scroll_up(1);
         } else {
             self.cursor.row += 1;
@@ -420,8 +413,8 @@ impl Screen {
                 for r in row..=bottom {
                     let start = if r == row { col } else { 0 };
                     if let Some(row_buf) = self.current_buffer_mut().get_mut(r) {
-                        for c in start..cols {
-                            row_buf[c] = Cell::default();
+                        for cell in row_buf.iter_mut().take(cols).skip(start) {
+                            *cell = Cell::default();
                         }
                     }
                 }
@@ -432,8 +425,8 @@ impl Screen {
                 for r in top..=row {
                     let end = if r == row { col + 1 } else { cols };
                     if let Some(row_buf) = self.current_buffer_mut().get_mut(r) {
-                        for c in 0..end {
-                            row_buf[c] = Cell::default();
+                        for cell in row_buf.iter_mut().take(end) {
+                            *cell = Cell::default();
                         }
                     }
                 }
@@ -441,8 +434,8 @@ impl Screen {
             2 | 3 => {
                 for r in top..=bottom {
                     if let Some(row_buf) = self.current_buffer_mut().get_mut(r) {
-                        for c in 0..cols {
-                            row_buf[c] = Cell::default();
+                        for cell in row_buf.iter_mut().take(cols) {
+                            *cell = Cell::default();
                         }
                     }
                 }
@@ -459,18 +452,18 @@ impl Screen {
         if let Some(row_buf) = self.current_buffer_mut().get_mut(row) {
             match mode {
                 0 => {
-                    for c in col..cols {
-                        row_buf[c] = Cell::default();
+                    for cell in row_buf.iter_mut().take(cols).skip(col) {
+                        *cell = Cell::default();
                     }
                 }
                 1 => {
-                    for c in 0..=col {
-                        row_buf[c] = Cell::default();
+                    for cell in row_buf.iter_mut().take(col + 1) {
+                        *cell = Cell::default();
                     }
                 }
                 2 => {
-                    for c in 0..cols {
-                        row_buf[c] = Cell::default();
+                    for cell in row_buf.iter_mut().take(cols) {
+                        *cell = Cell::default();
                     }
                 }
                 _ => {}

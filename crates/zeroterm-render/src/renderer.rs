@@ -89,12 +89,24 @@ struct QuadVertex {
 }
 
 const QUAD_VERTS: [QuadVertex; 6] = [
-    QuadVertex { position: [0.0, 0.0] },
-    QuadVertex { position: [1.0, 0.0] },
-    QuadVertex { position: [0.0, 1.0] },
-    QuadVertex { position: [1.0, 0.0] },
-    QuadVertex { position: [1.0, 1.0] },
-    QuadVertex { position: [0.0, 1.0] },
+    QuadVertex {
+        position: [0.0, 0.0],
+    },
+    QuadVertex {
+        position: [1.0, 0.0],
+    },
+    QuadVertex {
+        position: [0.0, 1.0],
+    },
+    QuadVertex {
+        position: [1.0, 0.0],
+    },
+    QuadVertex {
+        position: [1.0, 1.0],
+    },
+    QuadVertex {
+        position: [0.0, 1.0],
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -122,7 +134,12 @@ struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, font_size: f32, font_path: Option<String>) -> Result<Self> {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        font_size: f32,
+        font_path: Option<String>,
+    ) -> Result<Self> {
         let font_data = Self::load_font(font_path.clone())?;
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -197,7 +214,11 @@ impl GlyphAtlas {
             let descent = metrics.descent * scale;
             let leading = metrics.leading * scale;
             atlas.cell_height = (ascent + descent + leading).ceil();
-            let mut scaler = atlas.scale_context.builder(font).size(atlas.font_size).build();
+            let mut scaler = atlas
+                .scale_context
+                .builder(font)
+                .size(atlas.font_size)
+                .build();
             let charmap = font.charmap();
             if let Some(img) = Render::new(&[Source::Outline])
                 .format(swash::zeno::Format::Alpha)
@@ -244,7 +265,14 @@ impl GlyphAtlas {
         let key = ch as u32;
         if let Some(info) = self.glyph_cache.get(&key) {
             let uv = self.info_to_uv(info);
-            return (uv.0, uv.1, uv.2, uv.3, info.width as f32, info.height as f32);
+            return (
+                uv.0,
+                uv.1,
+                uv.2,
+                uv.3,
+                info.width as f32,
+                info.height as f32,
+            );
         }
 
         let font = match FontRef::from_index(&self.font_data, 0) {
@@ -255,7 +283,11 @@ impl GlyphAtlas {
         let charmap = font.charmap();
         let glyph_id = charmap.map(key);
 
-        let mut scaler = self.scale_context.builder(font).size(self.font_size).build();
+        let mut scaler = self
+            .scale_context
+            .builder(font)
+            .size(self.font_size)
+            .build();
 
         let image = Render::new(&[Source::Outline])
             .format(swash::zeno::Format::Alpha)
@@ -266,7 +298,14 @@ impl GlyphAtlas {
                 let info = self.pack_glyph(&img, device, queue);
                 self.glyph_cache.insert(key, info);
                 let uv = self.info_to_uv(&info);
-                (uv.0, uv.1, uv.2, uv.3, info.width as f32, info.height as f32)
+                (
+                    uv.0,
+                    uv.1,
+                    uv.2,
+                    uv.3,
+                    info.width as f32,
+                    info.height as f32,
+                )
             }
             _ => self.fallback_uv(),
         }
@@ -354,7 +393,14 @@ impl GlyphAtlas {
 
     fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32) {
         // 1x1 transparent pixel — alpha=0, bg shows through
-        (0.0, 0.0, 1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32, 0.0, 0.0)
+        (
+            0.0,
+            0.0,
+            1.0 / ATLAS_SIZE as f32,
+            1.0 / ATLAS_SIZE as f32,
+            0.0,
+            0.0,
+        )
     }
 
     fn clear_atlas(&mut self, queue: &wgpu::Queue) {
@@ -431,7 +477,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, font_size: f32, opacity: f64, font_path: Option<String>) -> Result<Self> {
+    pub async fn new(
+        window: Arc<Window>,
+        font_size: f32,
+        opacity: f64,
+        font_path: Option<String>,
+    ) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -470,7 +521,10 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let alpha_mode = if surface_caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+        let alpha_mode = if surface_caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+        {
             wgpu::CompositeAlphaMode::PostMultiplied
         } else {
             surface_caps.alpha_modes[0]
@@ -563,7 +617,9 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Buffer(uniform_buffer.as_entire_buffer_binding()),
+                    resource: wgpu::BindingResource::Buffer(
+                        uniform_buffer.as_entire_buffer_binding(),
+                    ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -609,7 +665,11 @@ impl Renderer {
         // Placeholder 1x1 texture for image_texture binding
         let placeholder_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Placeholder Image Texture"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -619,10 +679,23 @@ impl Renderer {
         });
         let placeholder_view = placeholder_tex.create_view(&wgpu::TextureViewDescriptor::default());
         queue.write_texture(
-            wgpu::ImageCopyTexture { texture: &placeholder_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyTexture {
+                texture: &placeholder_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             &[0u8; 4],
-            wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
 
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -644,13 +717,11 @@ impl Renderer {
             ],
         });
 
-        let vertex_attributes = [
-            wgpu::VertexAttribute {
-                offset: 0,
-                shader_location: 0,
-                format: wgpu::VertexFormat::Float32x2,
-            },
-        ];
+        let vertex_attributes = [wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x2,
+        }];
         let vertex_buffer_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<QuadVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -699,7 +770,12 @@ impl Renderer {
             cache: None,
         });
 
-        log::info!("Renderer initialized: {}x{} (cell buffer capacity: {} cells)", size.width, size.height, cell_buffer_capacity);
+        log::info!(
+            "Renderer initialized: {}x{} (cell buffer capacity: {} cells)",
+            size.width,
+            size.height,
+            cell_buffer_capacity
+        );
 
         let tab_bar_buffer = {
             let cells = vec![CellData::zeroed(); cols as usize];
@@ -795,11 +871,12 @@ impl Renderer {
             self.cell_buffer_capacity = new_cols * new_rows;
             self.cell_buffer = {
                 let cell_data = vec![CellData::zeroed(); self.cell_buffer_capacity];
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Cell Data Buffer"),
-                    contents: bytemuck::cast_slice(&cell_data),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                })
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Cell Data Buffer"),
+                        contents: bytemuck::cast_slice(&cell_data),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    })
             };
             self.uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Uniform + Storage Bind Group"),
@@ -807,21 +884,26 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::Buffer(self.uniform_buffer.as_entire_buffer_binding()),
+                        resource: wgpu::BindingResource::Buffer(
+                            self.uniform_buffer.as_entire_buffer_binding(),
+                        ),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Buffer(self.cell_buffer.as_entire_buffer_binding()),
+                        resource: wgpu::BindingResource::Buffer(
+                            self.cell_buffer.as_entire_buffer_binding(),
+                        ),
                     },
                 ],
             });
             self.tab_bar_buffer = {
                 let cells = vec![CellData::zeroed(); new_cols];
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Tab Bar Cell Buffer"),
-                    contents: bytemuck::cast_slice(&cells),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                })
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Tab Bar Cell Buffer"),
+                        contents: bytemuck::cast_slice(&cells),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    })
             };
             self.tab_bar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Tab Bar Bind Group"),
@@ -1023,18 +1105,18 @@ impl Renderer {
             let bg = if is_active { ACTIVE_BG } else { INACTIVE_BG };
             let fg = if is_active { FG } else { FG_DIM };
             let end = (col + span).min(cols);
-            for c in col..end {
-                batch[c].bg = bg;
-                batch[c].fg = fg;
+            for cell in batch.iter_mut().take(end).skip(col) {
+                cell.bg = bg;
+                cell.fg = fg;
             }
             for (k, ch) in title.chars().enumerate() {
                 let c = col + 1 + k;
                 if c >= cols {
                     break;
                 }
-                let (u0, v0, u1, v1, gw, gh) = self
-                    .glyph_atlas
-                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+                let (u0, v0, u1, v1, gw, gh) =
+                    self.glyph_atlas
+                        .get_or_insert_glyph(ch, &self.device, &self.queue);
                 batch[c].glyph_uv_min = [u0, v0];
                 batch[c].glyph_uv_max = [u1, v1];
                 batch[c].glyph_size = [gw, gh];
@@ -1052,8 +1134,11 @@ impl Renderer {
             cols: cols as u32,
             rows: 1,
         };
-        self.queue
-            .write_buffer(&self.tab_bar_uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue.write_buffer(
+            &self.tab_bar_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
 
         let view = self.current_view.as_ref().unwrap();
         let encoder = self.current_encoder.as_mut().unwrap();
@@ -1081,7 +1166,12 @@ impl Renderer {
         Ok(())
     }
 
-    fn update_cell_data(&mut self, screen: &CoreScreen, scroll_offset: usize, selection: Option<Selection>) -> Result<()> {
+    fn update_cell_data(
+        &mut self,
+        screen: &CoreScreen,
+        scroll_offset: usize,
+        selection: Option<Selection>,
+    ) -> Result<()> {
         let buffer = screen.buffer();
         let visible_rows = buffer.len();
         let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
@@ -1104,7 +1194,10 @@ impl Renderer {
             std::collections::HashMap::new();
         for block in screen.blocks() {
             divider_rows.insert(block.start_line);
-            divider_meta.insert(block.start_line, screen.block_metadata(block).chars().collect());
+            divider_meta.insert(
+                block.start_line,
+                screen.block_metadata(block).chars().collect(),
+            );
         }
 
         let mut batch = vec![CellData::zeroed(); visible_rows * cols];
@@ -1129,7 +1222,10 @@ impl Renderer {
             let fg = cell.fg;
             let bg = cell.bg;
 
-            let is_cursor_cell = cursor_visible && scroll_offset == 0 && dirty_row == cursor.row && dirty_col == cursor_col;
+            let is_cursor_cell = cursor_visible
+                && scroll_offset == 0
+                && dirty_row == cursor.row
+                && dirty_col == cursor_col;
             let (fg, bg, cell_attrs) = if is_cursor_cell {
                 match cursor_shape {
                     zeroterm_core::cell::CursorShape::Block => (bg, fg, cell.attrs),
@@ -1146,22 +1242,42 @@ impl Renderer {
 
             let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
 
-            let mut attrs = ((cell_attrs.bold as u32) << 0)
+            let mut attrs = (cell_attrs.bold as u32)
                 | ((cell_attrs.italic as u32) << 1)
-                | (((cell_attrs.underline != zeroterm_core::cell::UnderlineStyle::None) as u32) << 2)
+                | (((cell_attrs.underline != zeroterm_core::cell::UnderlineStyle::None) as u32)
+                    << 2)
                 | ((cell_attrs.strikethrough as u32) << 3)
                 | ((cell_attrs.dim as u32) << 4)
                 | ((cell_attrs.blink as u32) << 5)
                 | ((cell_attrs.reverse as u32) << 6)
                 | ((cell_attrs.invisible as u32) << 7)
-                | (if is_cursor_cell && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar) { 0x100u32 } else { 0 })
+                | (if is_cursor_cell
+                    && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar)
+                {
+                    0x100u32
+                } else {
+                    0
+                })
                 | (if is_selected { 0x200u32 } else { 0 });
-            if screen.image_cells().contains_key(&(combined_idx, dirty_col)) {
+            if screen
+                .image_cells()
+                .contains_key(&(combined_idx, dirty_col))
+            {
                 attrs |= ATTR_HAS_IMAGE;
             }
 
-            let fg_color = [fg.r as f32 / 255.0, fg.g as f32 / 255.0, fg.b as f32 / 255.0, 1.0];
-            let bg_color = [bg.r as f32 / 255.0, bg.g as f32 / 255.0, bg.b as f32 / 255.0, 1.0];
+            let fg_color = [
+                fg.r as f32 / 255.0,
+                fg.g as f32 / 255.0,
+                fg.b as f32 / 255.0,
+                1.0,
+            ];
+            let bg_color = [
+                bg.r as f32 / 255.0,
+                bg.g as f32 / 255.0,
+                bg.b as f32 / 255.0,
+                1.0,
+            ];
 
             let mut ch = cell.ch;
             if divider_rows.contains(&dirty_row) {
@@ -1186,9 +1302,9 @@ impl Renderer {
                 }
             }
 
-            let (u0, v0, u1, v1, gw, gh) = self
-                .glyph_atlas
-                .get_or_insert_glyph(ch, &self.device, &self.queue);
+            let (u0, v0, u1, v1, gw, gh) =
+                self.glyph_atlas
+                    .get_or_insert_glyph(ch, &self.device, &self.queue);
 
             batch[dirty_row * cols + dirty_col] = CellData {
                 glyph_uv_min: [u0, v0],
@@ -1202,7 +1318,8 @@ impl Renderer {
             };
         }
 
-        self.queue.write_buffer(&self.cell_buffer, 0, bytemuck::cast_slice(&batch));
+        self.queue
+            .write_buffer(&self.cell_buffer, 0, bytemuck::cast_slice(&batch));
 
         Ok(())
     }
@@ -1229,10 +1346,12 @@ impl Renderer {
         };
         self.image_frames.clear();
         if img.frames.is_empty() {
-            self.image_frames.push((img.rgba_data.clone(), img.width, img.height, 0));
+            self.image_frames
+                .push((img.rgba_data.clone(), img.width, img.height, 0));
         } else {
             for f in &img.frames {
-                self.image_frames.push((f.rgba.clone(), f.width, f.height, f.delay_ms));
+                self.image_frames
+                    .push((f.rgba.clone(), f.width, f.height, f.delay_ms));
             }
         }
         let (rgba, width, height, _) = self.image_frames[0].clone();
@@ -1253,7 +1372,11 @@ impl Renderer {
         if size_mismatch {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Image Texture"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -1298,7 +1421,11 @@ impl Renderer {
                 bytes_per_row: Some(width * 4),
                 rows_per_image: Some(height),
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -1314,7 +1441,9 @@ impl Renderer {
         if self.anim_last_swap.elapsed() >= delay {
             self.anim_frame_index = (self.anim_frame_index + 1) % self.image_frames.len();
             self.anim_last_swap = std::time::Instant::now();
-            if let Some((rgba, width, height, _)) = self.image_frames.get(self.anim_frame_index).cloned() {
+            if let Some((rgba, width, height, _)) =
+                self.image_frames.get(self.anim_frame_index).cloned()
+            {
                 self.upload_image_texture(&rgba, width, height);
             }
             Some(delay)

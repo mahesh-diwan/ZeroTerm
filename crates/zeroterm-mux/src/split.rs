@@ -51,7 +51,7 @@ impl SplitNode {
                 1 => SplitNode::Leaf(ids[0]),
                 n => {
                     let mid = n / 2;
-                    let dir = if depth % 2 == 0 {
+                    let dir = if depth.is_multiple_of(2) {
                         SplitDir::Vertical
                     } else {
                         SplitDir::Horizontal
@@ -198,6 +198,8 @@ impl SplitNode {
         self.resize_walk(0.0, 0.0, 1.0, 1.0, target, boundary, delta)
     }
 
+    // 7 recursive-geometry args; a context struct adds churn for no clarity.
+    #[allow(clippy::too_many_arguments)]
     fn resize_walk(
         &mut self,
         x: f32,

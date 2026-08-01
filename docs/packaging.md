@@ -13,12 +13,14 @@ ZeroTerm builds as a single binary: `cargo build --release -p zeroterm`.
 ## Auto-update
 
 `install.sh upgrade` / `install.sh --update` compares the installed version against the
-latest GitHub release and reinstalls when newer. If the installed binary cannot report a
-version it falls back to a fresh install of the latest release.
+latest GitHub release and reinstalls when newer. The binary supports version reporting
+and a self-upgrade entry point:
 
-> **Rust-side TODO:** the binary does not implement `--version`/`-V` yet, so upgrade
-> detection always falls back to reinstalling. Add `env!("CARGO_PKG_VERSION")` handling
-> in `crates/zeroterm/src/main.rs` to enable real version comparison.
+- `zeroterm --version` / `zeroterm -V` prints the build version from
+  `env!("CARGO_PKG_VERSION")` and exits without opening a window.
+- `zeroterm upgrade` runs `bash ./install.sh upgrade` when run from the repo checkout,
+  or prints the `curl -fsSL <install-url> | bash -s -- upgrade` one-liner otherwise.
+  Both routes reuse `install.sh`, which does the version comparison and reinstall.
 
 ## macOS
 
@@ -31,9 +33,9 @@ Developer account and is not run automatically. Steps: store credentials with
 `xcrun notarytool store-credentials`, submit the zip with `notarytool submit --wait`,
 then `xcrun stapler staple ZeroTerm.app`.
 
-> **Caveat:** `install.sh` expects macOS release assets named `zeroterm-<ver>-macos-<arch>.tar.gz`,
-> while `build-release.sh` currently emits `darwin` in the name. Align the naming before the
-> first tagged release, or the macOS installer download path will 404.
+> **Caveat:** `install.sh` expects macOS release assets named `zeroterm-<ver>-macos-<arch>.zip`
+> with `x86_64` / `arm64` arches, matching `scripts/make_macos_app.sh`. Keep the two naming
+> schemes in sync when changing release packaging, or the macOS installer download path 404s.
 
 ## Windows
 

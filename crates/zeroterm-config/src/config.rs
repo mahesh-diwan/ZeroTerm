@@ -26,7 +26,7 @@ impl Default for SshConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub font: FontConfig,
     pub colors: ColorConfig,
@@ -55,45 +55,14 @@ impl Default for KeybindingsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncConfig {
     pub server_url: String,
 }
 
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            server_url: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiConfig {
     pub endpoint: String,
-}
-
-impl Default for AiConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            font: FontConfig::default(),
-            colors: ColorConfig::default(),
-            shell: ShellConfig::default(),
-            window: WindowConfig::default(),
-            ai: AiConfig::default(),
-            sync: SyncConfig::default(),
-            ssh: SshConfig::default(),
-            keybindings: KeybindingsConfig::default(),
-        }
-    }
 }
 
 impl Config {
