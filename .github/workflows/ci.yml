@@ -16,11 +16,14 @@ jobs:
           - os: macos-latest
             cargo_exclude: ""
           - os: windows-latest
-            # zeroterm (main.rs wires zeroterm-ssh, a cfg(unix)-only dep) and
-            # zeroterm-ssh (uses ssh2, cfg(unix)-only) are unix-only today.
-            # The remaining crates are Windows-portable. Revisit once the app
-            # binary builds on Windows.
-            cargo_exclude: "--exclude zeroterm --exclude zeroterm-ssh"
+            # zeroterm-ssh is now Windows-portable (cfg(not(unix)) stub since
+            # 13ea948; ssh2 is cfg(unix)-gated), so it stays in the workspace.
+            # The zeroterm app binary still excludes itself here: main.rs is
+            # cfg(unix)-gated but its native deps (mlua-sys, ring) can't be
+            # verified from a non-Windows host, and the release pipeline must
+            # prove `cargo build -p zeroterm` on a real runner first. Drop this
+            # once the Windows app build is green.
+            cargo_exclude: "--exclude zeroterm"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:

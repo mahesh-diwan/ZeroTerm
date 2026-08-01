@@ -10,6 +10,7 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use zeroterm_core::cell::Color;
 use zeroterm_core::screen::Screen as CoreScreen;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1183,6 +1184,16 @@ impl Renderer {
         let total_scrollback = scrollback.len();
         let total_rows = total_scrollback + visible_rows;
 
+        // Highlight only the input line (last visible row) while at scroll 0.
+        let last_row_hl = if scroll_offset == 0 && visible_rows > 0 {
+            let last = &buffer[visible_rows - 1];
+            Some(zeroterm_core::highlight::highlight_line(
+                &last.iter().map(|c| c.ch).collect::<Vec<char>>(),
+            ))
+        } else {
+            None
+        };
+
         let end = total_rows.saturating_sub(scroll_offset);
         let start = end.saturating_sub(visible_rows);
 
@@ -1218,8 +1229,16 @@ impl Renderer {
 
             let cell = &line[dirty_col];
 
-            let fg = cell.fg;
+            let mut fg = cell.fg;
             let bg = cell.bg;
+
+            if dirty_row == visible_rows - 1 {
+                if let Some(Some(idx)) = last_row_hl.as_ref().and_then(|hl| hl.get(dirty_col)) {
+                    if let Some(c) = Self::highlight_color(*idx) {
+                        fg = c;
+                    }
+                }
+            }
 
             let is_cursor_cell = cursor_visible
                 && scroll_offset == 0
@@ -1452,6 +1471,21 @@ impl Renderer {
         if let Ok(data) = GlyphAtlas::load_font(font_path) {
             self.glyph_atlas.font_data = data;
             self.glyph_atlas.repack_ascii(&self.device, &self.queue);
+        }
+    }
+
+    /// Palette for `highlight` classes, reusing the core Color accents.
+    fn highlight_color(idx: u8) -> Option<Color> {
+        match idx {
+            zeroterm_core::highlight::HL_KEYWORD => Some(Color::CYAN),
+            zeroterm_core::highlight::HL_STRING => Some(Color::YELLOW),
+            zeroterm_core::highlight::HL_NUMBER => Some(Color::MAGENTA),
+            zeroterm_core::highlight::HL_COMMENT => Some(Color {
+                r: 0x80,
+                g: 0x80,
+                b: 0x80,
+            }),
+            _ => None,
         }
     }
 

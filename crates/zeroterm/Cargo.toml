@@ -32,12 +32,10 @@ zeroterm-ssh = { path = "../zeroterm-ssh" }
 [dev-dependencies]
 criterion = { workspace = true }
 
-# These lints fire only in main.rs (pane_cmd, HostPicker, keyboard handlers).
-# main.rs has in-flight changes from another agent and must not be touched here;
-# once it lands, these allows should be removed and the warnings fixed inline.
-[lints.rust]
-dead_code = "allow"
-
+# These clippy lints still fire in main.rs (HostPicker push, keyboard handlers,
+# copy_selection) and are allowed crate-wide until main.rs is touched to fix
+# them inline. dead_code needs no crate-level allow: main.rs carries explicit
+# #[allow(dead_code)] on App/impl App for the Windows cfg(unix) gap.
 [lints.clippy]
 same_item_push = "allow"
 unnecessary_map_or = "allow"

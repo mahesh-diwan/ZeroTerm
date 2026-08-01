@@ -1,6 +1,7 @@
 //! ZeroTerm Core - VT parser, screen buffer, cell model
 
 pub mod cell;
+pub mod highlight;
 pub mod image_decode;
 pub mod parser;
 pub mod pty;

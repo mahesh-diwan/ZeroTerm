@@ -182,6 +182,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attributes,
+    /// Highlight class index (0 = none/auto, see `highlight` module).
+    #[serde(default)]
+    pub syntax_color: u8,
 }
 
 impl Default for Cell {
@@ -191,6 +194,7 @@ impl Default for Cell {
             fg: Color::DEFAULT_FG,
             bg: Color::DEFAULT_BG,
             attrs: Attributes::default(),
+            syntax_color: 0,
         }
     }
 }
@@ -212,6 +216,7 @@ impl Cell {
             && self.fg == Color::DEFAULT_FG
             && self.bg == Color::DEFAULT_BG
             && self.attrs == Attributes::default()
+            && self.syntax_color == 0
     }
 }
 

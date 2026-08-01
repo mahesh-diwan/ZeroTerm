@@ -446,6 +446,81 @@ struct App {
     last_anim_frame: std::time::Instant,
     event_proxy: Option<EventLoopProxy<()>>,
     plugins: HashMap<String, Plugin>,
+    // Local line editor for the active pane. Some while editing: printable +
+    // editing keys are intercepted (not forwarded to the shell) and accumulated
+    // into the buffer until Enter submits the line or Esc discards it.
+    editing: Option<EditingState>,
+}
+
+/// Local single-line editor state (not readline): a char buffer plus a cursor,
+/// shown in the active pane's tab title while active. Enter submits
+/// `prompt + buffer` to the shell; Esc discards.
+struct EditingState {
+    buffer: Vec<char>,
+    cursor: usize,
+    prompt: String,
+}
+
+impl EditingState {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            cursor: 0,
+            prompt: String::new(),
+        }
+    }
+
+    fn insert(&mut self, c: char) {
+        self.buffer.insert(self.cursor, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.buffer.remove(self.cursor - 1);
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.buffer.len() {
+            self.buffer.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.buffer.len());
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
+
+    /// Full line (prompt + buffer), what Enter submits to the shell.
+    fn line(&self) -> String {
+        let mut s = self.prompt.clone();
+        s.extend(self.buffer.iter());
+        s
+    }
+
+    /// Tab-title rendering: prompt + buffer with a block cursor at the edit
+    /// position.
+    fn display(&self) -> String {
+        let mut s = String::from("[edit] ");
+        s.push_str(&self.prompt);
+        s.extend(self.buffer[..self.cursor].iter());
+        s.push('▌');
+        s.extend(self.buffer[self.cursor..].iter());
+        s
+    }
 }
 
 #[allow(dead_code)]
@@ -486,6 +561,7 @@ impl App {
             last_anim_frame: std::time::Instant::now(),
             event_proxy: None,
             plugins: HashMap::new(),
+            editing: None,
         }
     }
 
@@ -763,6 +839,7 @@ impl App {
         self.tabs.retain(|t| t.id != closed);
         let first = *self.panes.keys().next().unwrap_or(&0);
         self.active_pane = first;
+        self.editing = None;
         self.scroll_offset = 0;
         self.resize_panes_to_rects();
         if let Some(window) = &self.window {
@@ -1172,6 +1249,7 @@ impl App {
                 self.split_root.remove_leaf(*id);
                 if self.active_pane == *id {
                     self.active_pane = *self.panes.keys().next().unwrap_or(&0);
+                    self.editing = None;
                 }
             }
         }
@@ -1225,13 +1303,20 @@ impl App {
             .iter()
             .position(|&id| id == self.active_pane)
             .unwrap_or(0);
+        // While editing, the active tab shows the live buffer instead of the
+        // shell title. Editing is bound to the active pane and cleared on any
+        // pane switch, so this is only ever the pane that owns the editor.
+        let edit_display = self.editing.as_ref().map(|e| e.display());
         let tab_infos: Vec<TabInfo> = tab_ids
             .iter()
             .map(|&id| TabInfo {
-                title: self
-                    .panes
-                    .get(&id)
-                    .map_or_else(String::new, |p| p.title.clone()),
+                title: match &edit_display {
+                    Some(d) if id == self.active_pane => d.clone(),
+                    _ => self
+                        .panes
+                        .get(&id)
+                        .map_or_else(String::new, |p| p.title.clone()),
+                },
                 active: id == self.active_pane,
             })
             .collect();
@@ -1313,6 +1398,78 @@ impl App {
         if let Some(pane) = self.panes.get(&self.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
         }
+    }
+
+    /// Toggle the local line editor for the active pane (Alt+E). Returns false
+    /// when a modal overlay (settings / host picker) is open so the key falls
+    /// through to its handler.
+    fn toggle_editing(&mut self) -> bool {
+        if self.settings.open || self.host_picker.open {
+            return false;
+        }
+        if self.editing.is_some() {
+            self.editing = None;
+        } else {
+            self.start_editing();
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+        true
+    }
+
+    fn start_editing(&mut self) {
+        // The shell's readline may already hold a partial line the user typed
+        // before toggling. Kill it (Ctrl+U) so the local buffer is the sole
+        // source of truth on Enter; Ctrl+U is a no-op on an empty line.
+        if !self.current_line().trim().is_empty() {
+            self.write_pty(b"\x15");
+        }
+        self.scroll_offset = 0;
+        self.editing = Some(EditingState::new());
+    }
+
+    /// Handle a key while the line editor is active. Returns true when the key
+    /// was consumed by the editor (never forwarded to the shell).
+    fn handle_editing_key(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+        match code {
+            KeyCode::Enter => {
+                let state = self
+                    .editing
+                    .take()
+                    .expect("caller guards editing.is_some()");
+                let line = state.line();
+                // Wrap in bracketed paste so readline inserts the buffer
+                // literally (tabs stay tabs, no completion / history
+                // expansion). Falls back to raw bytes when the shell never
+                // enabled it. Empty buffer submits a bare newline.
+                let bracketed = self
+                    .active_pane()
+                    .is_some_and(|p| p.parser.bracketed_paste());
+                let mut data = Vec::new();
+                if bracketed {
+                    data.extend_from_slice(b"\x1b[200~");
+                }
+                data.extend_from_slice(line.as_bytes());
+                data.extend_from_slice(if bracketed { b"\x1b[201~\r\n" } else { b"\r\n" });
+                self.write_pty(&data);
+            }
+            KeyCode::Escape => self.editing = None,
+            KeyCode::Backspace => self.editing.as_mut().unwrap().backspace(),
+            KeyCode::Delete => self.editing.as_mut().unwrap().delete(),
+            KeyCode::ArrowLeft => self.editing.as_mut().unwrap().left(),
+            KeyCode::ArrowRight => self.editing.as_mut().unwrap().right(),
+            KeyCode::Home => self.editing.as_mut().unwrap().home(),
+            KeyCode::End => self.editing.as_mut().unwrap().end(),
+            KeyCode::Tab => self.editing.as_mut().unwrap().insert('\t'),
+            // Let Alt+E fall through so the same key exits edit mode.
+            KeyCode::KeyE if alt && !ctrl => return false,
+            // Swallow other ctrl/alt chords; plain keys fall through to the
+            // text-input path which inserts them into the buffer.
+            _ if ctrl || alt => return true,
+            _ => return false,
+        }
+        true
     }
 
     /// Text of the line the cursor sits on, up to the cursor column.
@@ -1658,6 +1815,7 @@ impl App {
         // Click focuses the clicked pane so selection renders/copies against its screen.
         if pane_id != self.active_pane {
             self.active_pane = pane_id;
+            self.editing = None;
             self.scroll_offset = 0;
         }
         if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
@@ -1951,6 +2109,23 @@ impl ApplicationHandler for App {
                 // Tab management shortcuts
                 match &event.physical_key {
                     PhysicalKey::Code(code) => {
+                        // Local line editor: while active, editing keys are
+                        // intercepted here and printable text is absorbed in
+                        // the text-input path below — nothing reaches the pty.
+                        if self.editing.is_some() && self.handle_editing_key(*code, ctrl, alt) {
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                            return;
+                        }
+                        // Alt+E toggles the line editor. Alt is a prefix winit
+                        // reports with every Escape-prefixed chord, so this is
+                        // handled before the printable path and never reaches
+                        // the shell (M-e is unbound in readline).
+                        if alt && !ctrl && !shift && *code == KeyCode::KeyE && self.toggle_editing()
+                        {
+                            return;
+                        }
                         if ctrl && shift && !alt && *code == KeyCode::KeyP {
                             self.toggle_settings();
                             return;
@@ -2253,8 +2428,17 @@ impl ApplicationHandler for App {
                 // Handle printable text (IME text input)
                 if let Some(text) = &event.text {
                     if !text.is_empty() && !ctrl && !alt {
-                        self.clear_selection();
-                        self.write_pty(text.as_bytes());
+                        if let Some(state) = self.editing.as_mut() {
+                            for c in text.chars() {
+                                state.insert(c);
+                            }
+                            if let Some(window) = &self.window {
+                                window.request_redraw();
+                            }
+                        } else {
+                            self.clear_selection();
+                            self.write_pty(text.as_bytes());
+                        }
                     }
                 }
 
@@ -2321,6 +2505,7 @@ impl ApplicationHandler for App {
                     if let Some(id) = hovered {
                         if id != self.active_pane {
                             self.active_pane = id;
+                            self.editing = None;
                             self.scroll_offset = 0;
                             if let Some(window) = &self.window {
                                 window.request_redraw();
@@ -2364,6 +2549,7 @@ impl ApplicationHandler for App {
                     if let Some(pane_id) = self.tab_at_point(x, y) {
                         if pane_id != self.active_pane {
                             self.active_pane = pane_id;
+                            self.editing = None;
                             self.scroll_offset = 0;
                         }
                         self.end_selection();
@@ -2449,6 +2635,7 @@ impl ApplicationHandler for App {
                 if let Some(id) = self.pane_at_point(x, y) {
                     if id != self.active_pane {
                         self.active_pane = id;
+                        self.editing = None;
                         self.scroll_offset = 0;
                     }
                 }
@@ -2558,6 +2745,37 @@ mod tests {
         assert_eq!(word_left(&line, 12), 8);
         assert_eq!(word_right(&line, 2, 20), 6);
         assert_eq!(word_right(&line, 8, 20), 12);
+    }
+
+    #[test]
+    fn editing_state_ops() {
+        let mut e = EditingState::new();
+        assert_eq!(e.line(), "");
+        assert_eq!(e.display(), "[edit] ▌");
+        for c in "hello".chars() {
+            e.insert(c);
+        }
+        assert_eq!(e.line(), "hello");
+        e.backspace();
+        assert_eq!(e.line(), "hell");
+        e.insert('o');
+        e.left();
+        e.left();
+        e.insert('_');
+        assert_eq!(e.line(), "hel_lo");
+        e.home();
+        e.delete();
+        assert_eq!(e.line(), "el_lo");
+        e.end();
+        e.insert('!');
+        assert_eq!(e.line(), "el_lo!");
+        e.right(); // cursor already at end: clamp
+        assert_eq!(e.line(), "el_lo!");
+        e.backspace();
+        assert_eq!(e.line(), "el_lo");
+        // display places the block cursor at the edit position
+        e.home();
+        assert_eq!(e.display(), "[edit] ▌el_lo");
     }
 
     #[test]
