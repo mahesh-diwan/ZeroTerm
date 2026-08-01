@@ -229,7 +229,7 @@ pub struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            program: if cfg!(windows) { "cmd.exe" } else { "zsh" }.to_string(),
+            program: if cfg!(windows) { "cmd.exe" } else { "bash" }.to_string(),
             args: if cfg!(windows) {
                 vec![]
             } else {

@@ -9,7 +9,7 @@ use arboard::Clipboard;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
@@ -22,7 +22,7 @@ use zeroterm_core::screen::{CommandBlock, Size as PtySize};
 use zeroterm_core::Parser;
 use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
-use zeroterm_render::{Renderer, Selection, TabInfo};
+use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
 use zeroterm_sync::daemon::SyncDaemon;
 
 use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
@@ -89,6 +89,33 @@ struct PaneState {
     pty_tx: Sender<PtyCommand>,
     title: String,
     pane_cmd: String,
+    pty_dead: bool,
+}
+impl PaneState {
+    /// Drain available pty output into the parser. Returns true if any bytes
+    /// were parsed. Marks the pane dead once the pty channel disconnects so a
+    /// dead pane is never drained twice (this is what stops the exit notice
+    /// from being re-appended to the buffer on every subsequent drain call).
+    fn drain(&mut self) -> bool {
+        if self.pty_dead {
+            return false;
+        }
+        let mut got = false;
+        loop {
+            match self.pty_rx.try_recv() {
+                Ok(data) => {
+                    self.parser.parse(&data);
+                    got = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.pty_dead = true;
+                    break;
+                }
+            }
+        }
+        got
+    }
 }
 
 fn spawn_pty_process(
@@ -96,6 +123,7 @@ fn spawn_pty_process(
     shell_args: &[String],
     cols: usize,
     rows: usize,
+    wake: EventLoopProxy<()>,
 ) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
     let shell_refs: Vec<&str> = shell_args.iter().map(|s| s.as_str()).collect();
     let mut backend = PortablePtyBackend::new()?;
@@ -128,6 +156,7 @@ fn spawn_pty_process(
                     if output_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
+                    let _ = wake.send_event(());
                 }
                 Err(_) => break,
             }
@@ -145,6 +174,7 @@ fn spawn_ssh_process(
     key_path: Option<&Path>,
     cols: usize,
     rows: usize,
+    wake: EventLoopProxy<()>,
 ) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
     let host = host.to_string();
     let user = user.to_string();
@@ -158,11 +188,13 @@ fn spawn_ssh_process(
         let mut ssh = zeroterm_ssh::client::SshSession::new();
         if let Err(e) = ssh.connect(&host, port, &user, password.as_deref(), key_path.as_deref()) {
             let _ = output_tx.send(format!("\r\n\x1b[31mSSH: {}\x1b[0m\r\n", e).into_bytes());
+            let _ = wake.send_event(());
             return;
         }
         if let Err(e) = ssh.resize(cols as u32, rows as u32) {
             let _ =
                 output_tx.send(format!("\r\n\x1b[31mSSH resize: {}\x1b[0m\r\n", e).into_bytes());
+            let _ = wake.send_event(());
         }
 
         let mut buf = [0u8; 65536];
@@ -189,6 +221,7 @@ fn spawn_ssh_process(
                     if output_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
+                    let _ = wake.send_event(());
                 }
                 Err(_) => break,
             }
@@ -265,8 +298,8 @@ impl HostPicker {
             .min(cols.saturating_sub(2))
             .max(2);
         let height = lines.len().min(rows).max(2);
-        let top = (rows - height) / 2;
-        let left = (cols - width) / 2;
+        let top = (rows.saturating_sub(height)) / 2;
+        let left = (cols.saturating_sub(width)) / 2;
         (top, left, height, width)
     }
 
@@ -371,6 +404,7 @@ struct App {
     sync_active: bool,
     last_sync_clear: std::time::Instant,
     last_anim_frame: std::time::Instant,
+    event_proxy: Option<EventLoopProxy<()>>,
 }
 
 #[allow(dead_code)]
@@ -409,11 +443,20 @@ impl App {
             sync_active: false,
             last_sync_clear: std::time::Instant::now(),
             last_anim_frame: std::time::Instant::now(),
+            event_proxy: None,
         }
     }
 
     fn active_pane(&self) -> Option<&PaneState> {
         self.panes.get(&self.active_pane)
+    }
+
+    /// Clone of the event-loop proxy for a PTY reader thread. Registered in
+    /// main() before run_app, so always present once init() spawns PTYs.
+    fn wake_proxy(&self) -> EventLoopProxy<()> {
+        self.event_proxy
+            .clone()
+            .expect("event_proxy registered in main() before run_app")
     }
 
     fn active_pane_mut(&mut self) -> Option<&mut PaneState> {
@@ -461,17 +504,21 @@ impl App {
         self.font_path = config.font.path.clone();
 
         let size = window.inner_size();
-        let cell_w = font_size * 0.6;
-        let cell_h = font_size * config.font.line_height;
-        let cols = (size.width as f32 / cell_w) as usize;
-        let rows = (size.height as f32 / cell_h) as usize;
+        // Size parsers from the renderer's *measured* glyph metrics. The old
+        // font_size*0.6 heuristic (8.4px for a 14px font) under-sized the cell,
+        // giving the parser more cols than the renderer's cell buffer holds
+        // (e.g. 119 vs 112 at 1000px) -> update_cell_data wrote past the buffer.
+        let cell = renderer.cell_size();
+        let cols = (size.width as f32 / cell[0]) as usize;
+        let rows = (size.height as f32 / cell[1]) as usize;
 
         let shell = config.shell.program.clone();
         let shell_args = config.shell.args.clone();
         self.shell = shell.clone();
         self.shell_args = shell_args.clone();
 
-        let (pty_rx, pty_tx) = spawn_pty_process(&shell, &shell_args, cols, rows)?;
+        let (pty_rx, pty_tx) =
+            spawn_pty_process(&shell, &shell_args, cols, rows, self.wake_proxy())?;
         let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
 
         let parser = Parser::new(cols, rows);
@@ -484,6 +531,7 @@ impl App {
                 pty_tx,
                 title: "ZeroTerm v0.2.0".into(),
                 pane_cmd: shell.clone(),
+                pty_dead: false,
             },
         );
 
@@ -509,7 +557,7 @@ impl App {
                     } else {
                         record.cmd.clone()
                     };
-                    match spawn_pty_process(&cmd, &[], cols, rows) {
+                    match spawn_pty_process(&cmd, &[], cols, rows, self.wake_proxy()) {
                         Ok((pty_rx, pty_tx)) => {
                             let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
                             let id = self.next_pane_id;
@@ -522,6 +570,7 @@ impl App {
                                     pty_tx,
                                     title: record.title.clone(),
                                     pane_cmd: cmd,
+                                    pty_dead: false,
                                 },
                             );
                             self.tabs.push(Tab::new(id));
@@ -578,6 +627,9 @@ impl App {
         });
 
         info!("ZeroTerm initialized: {}x{} ({})", cols, rows, shell);
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
         Ok(())
     }
 
@@ -594,7 +646,8 @@ impl App {
             let cols = (size.width as f32 / cell_w) as usize;
             let rows = (size.height as f32 / cell_h) as usize;
 
-            let (pty_rx, pty_tx) = spawn_pty_process(&self.shell, &self.shell_args, cols, rows)?;
+            let (pty_rx, pty_tx) =
+                spawn_pty_process(&self.shell, &self.shell_args, cols, rows, self.wake_proxy())?;
             let parser = Parser::new(cols, rows);
             let id = self.next_pane_id;
             self.next_pane_id += 1;
@@ -606,6 +659,7 @@ impl App {
                     pty_tx,
                     title: "ZeroTerm v0.2.0".into(),
                     pane_cmd: self.shell.clone(),
+                    pty_dead: false,
                 },
             );
             self.active_pane = id;
@@ -629,7 +683,8 @@ impl App {
             let cols = (size.width as f32 / cell_w) as usize;
             let rows = (size.height as f32 / cell_h) as usize;
 
-            let (pty_rx, pty_tx) = spawn_pty_process(&self.shell, &self.shell_args, cols, rows)?;
+            let (pty_rx, pty_tx) =
+                spawn_pty_process(&self.shell, &self.shell_args, cols, rows, self.wake_proxy())?;
             let parser = Parser::new(cols, rows);
             let id = self.next_pane_id;
             self.next_pane_id += 1;
@@ -641,6 +696,7 @@ impl App {
                     pty_tx,
                     title: "ZeroTerm v0.2.0".into(),
                     pane_cmd: self.shell.clone(),
+                    pty_dead: false,
                 },
             );
             let parent = self.active_pane;
@@ -841,7 +897,16 @@ impl App {
                 })
                 .map(Path::new);
 
-            let (pty_rx, pty_tx) = spawn_ssh_process(host, port, user, None, key_path, cols, rows)?;
+            let (pty_rx, pty_tx) = spawn_ssh_process(
+                host,
+                port,
+                user,
+                None,
+                key_path,
+                cols,
+                rows,
+                self.wake_proxy(),
+            )?;
             let parser = Parser::new(cols, rows);
             let id = self.next_pane_id;
             self.next_pane_id += 1;
@@ -853,6 +918,7 @@ impl App {
                     pty_tx,
                     title: format!("SSH: {}@{}", user, host),
                     pane_cmd: format!("ssh {}@{}", user, host),
+                    pty_dead: false,
                 },
             );
             self.active_pane = id;
@@ -1005,48 +1071,48 @@ impl App {
         let mut dead_panes = Vec::new();
         let pane_count = self.panes.len();
         for (&id, pane) in &mut self.panes {
-            loop {
-                match pane.pty_rx.try_recv() {
-                    Ok(data) => {
-                        pane.parser.parse(&data);
-                        if let Some(text) = pane.parser.take_clipboard_text() {
-                            if let Some(clipboard) = &mut self.clipboard {
-                                if let Err(e) = clipboard.set_text(text) {
-                                    warn!("clipboard error: {}", e);
-                                }
-                            }
+            if pane.pty_dead {
+                continue;
+            }
+            let got = pane.drain();
+            if got {
+                if let Some(text) = pane.parser.take_clipboard_text() {
+                    if let Some(clipboard) = &mut self.clipboard {
+                        if let Err(e) = clipboard.set_text(text) {
+                            warn!("clipboard error: {}", e);
                         }
-                        if id == active {
-                            let new_title = pane.parser.screen().title().to_string();
-                            if new_title != pane.title {
-                                pane.title = new_title.clone();
-                                title_changed = Some(new_title);
-                            }
-                            if pane.parser.sync_output() {
-                                if !self.sync_active {
-                                    self.sync_active = true;
-                                    self.last_sync_clear = std::time::Instant::now();
-                                }
-                            } else {
-                                self.sync_active = false;
-                            }
-                            got_data = !self.sync_active;
-                        } else {
-                            got_data = true;
-                        }
-                    }
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        if pane_count <= 1 {
-                            pane.parser
-                                .parse(b"\r\n[Process exited] - exit to quit\r\n");
-                        } else {
-                            pane.parser.parse(b"\r\n[Process exited]\r\n");
-                        }
-                        dead_panes.push(id);
-                        break;
                     }
                 }
+                if id == active {
+                    let new_title = pane.parser.screen().title().to_string();
+                    if new_title != pane.title {
+                        pane.title = new_title.clone();
+                        title_changed = Some(new_title);
+                    }
+                    if pane.parser.sync_output() {
+                        if !self.sync_active {
+                            self.sync_active = true;
+                            self.last_sync_clear = std::time::Instant::now();
+                        }
+                    } else {
+                        self.sync_active = false;
+                    }
+                    got_data = !self.sync_active;
+                } else {
+                    got_data = true;
+                }
+            }
+            if pane.pty_dead {
+                dead_panes.push(id);
+                // Append the exit notice exactly once: pty_dead is sticky, so
+                // future drain calls skip this pane entirely. Previously every
+                // drain re-appended the notice, flooding the buffer on each
+                // RedrawRequested / KeyboardInput.
+                pane.parser.parse(if pane_count <= 1 {
+                    b"\r\n[Process exited] - exit to quit\r\n"
+                } else {
+                    b"\r\n[Process exited]\r\n"
+                });
             }
         }
         for id in &dead_panes {
@@ -1315,7 +1381,8 @@ impl App {
                 .panes
                 .get(&id)
                 .map_or_else(String::new, |p| p.title.clone());
-            let span = title.chars().count().saturating_add(2);
+            // Must match draw_tab_bar: truncated title + 2 padding cells.
+            let span = tab_span(&title, 20);
             let start_px = col as f32 * cell_w;
             let end_px = (col + span) as f32 * cell_w;
             if x >= start_px && x < end_px {
@@ -2314,6 +2381,15 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ()) {
+        let _ = (event_loop, event);
+        if self.drain_pty() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -2350,6 +2426,7 @@ fn main() -> Result<()> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new();
+    app.event_proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
 
     Ok(())
@@ -2372,7 +2449,7 @@ fn upgrade() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{word_left, word_right};
+    use super::*;
 
     #[test]
     fn word_bounds() {
@@ -2381,5 +2458,108 @@ mod tests {
         assert_eq!(word_left(&line, 12), 8);
         assert_eq!(word_right(&line, 2, 20), 6);
         assert_eq!(word_right(&line, 8, 20), 12);
+    }
+
+    #[test]
+    fn pane_drain_marks_dead_on_disconnect() {
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        let mut pane = PaneState {
+            parser: Parser::new(10, 5),
+            pty_rx: rx,
+            pty_tx: mpsc::channel().0,
+            title: String::new(),
+            pane_cmd: String::new(),
+            pty_dead: false,
+        };
+        tx.send(b"abc".to_vec()).unwrap();
+        drop(tx);
+        assert!(pane.drain());
+        assert!(pane.pty_dead, "disconnect must mark pane dead");
+        let before = pane.parser.screen().buffer()[0][0].ch;
+        assert!(!pane.drain(), "dead pane must not be drained again");
+        assert_eq!(pane.parser.screen().buffer()[0][0].ch, before);
+    }
+
+    #[test]
+    fn drain_pty_appends_exit_notice_exactly_once() {
+        let mut app = App::new();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        drop(tx); // pty already gone -> Disconnected on first drain
+        app.panes.insert(
+            0,
+            PaneState {
+                parser: Parser::new(10, 5),
+                pty_rx: rx,
+                pty_tx: mpsc::channel().0,
+                title: String::new(),
+                pane_cmd: String::new(),
+                pty_dead: false,
+            },
+        );
+        app.active_pane = 0;
+
+        app.drain_pty();
+        let first: String = app.panes[&0]
+            .parser
+            .screen()
+            .buffer()
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.ch))
+            .collect();
+        let scrollback_before = app.panes[&0].parser.screen().scrollback().len();
+        assert!(
+            first.contains("Process exited"),
+            "first drain should append the exit notice"
+        );
+
+        app.drain_pty();
+        let second: String = app.panes[&0]
+            .parser
+            .screen()
+            .buffer()
+            .iter()
+            .flat_map(|row| row.iter().map(|c| c.ch))
+            .collect();
+        let scrollback_after = app.panes[&0].parser.screen().scrollback().len();
+        assert_eq!(first, second, "visible buffer unchanged by a second drain");
+        assert_eq!(
+            scrollback_before, scrollback_after,
+            "exit notice must be appended exactly once, not on every drain (scrollback must not grow)"
+        );
+    }
+
+    #[test]
+    fn host_picker_overlay_survives_tiny_window() {
+        let mut hp = HostPicker::new();
+        hp.open(vec!["some.host".to_string()]);
+        // rows/cols < 2 would previously underflow (rows - height, cols - width).
+        let (top, left, height, width) = hp.overlay_rect(1, 1);
+        assert_eq!(top, 0);
+        assert_eq!(left, 0);
+        assert!(height >= 2 && width >= 2);
+        // Centering on a normal window keeps the rect inside it.
+        let (top, left, height, width) = hp.overlay_rect(80, 24);
+        assert!(top + height <= 24);
+        assert!(left + width <= 80);
+    }
+
+    #[test]
+    fn init_parser_dims_fit_renderer_capacity() {
+        // DejaVu Sans Mono at 14px measures (9,16) px/cell (measured via swash).
+        // The old init heuristic (font_size*0.6, font_size*1.2) = (8.4,16.8)
+        // produced parser cols larger than the renderer's ceil-based capacity:
+        // at 1000px wide, 119 parser cols vs 112 buffer cols -> GPU buffer
+        // overflow in update_cell_data. Init must size from renderer metrics.
+        let cell_w = 9.0f32;
+        let width = 1000u32;
+        let cols = (width as f32 / cell_w) as usize;
+        let capacity = (width as f32 / cell_w).ceil() as usize;
+        assert!(
+            cols <= capacity,
+            "parser cols {} > capacity {}",
+            cols,
+            capacity
+        );
+        assert_eq!(cols, 111, "floor(1000/9) must be the parser width");
     }
 }

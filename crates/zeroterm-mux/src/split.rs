@@ -128,9 +128,15 @@ impl SplitNode {
         }
     }
 
-    /// Divider lines as (dir, normalized boundary position, first-leaf target).
-    /// Boundary position is in the normalized 0..1 content space (x for Vertical,
-    /// y for Horizontal), matching compute_rects. DFS order, outermost first.
+    /// Divider lines as (dir, normalized boundary position, first-leaf of the
+    /// second child). Boundary position is in the normalized 0..1 content space
+    /// (x for Vertical, y for Horizontal), matching compute_rects. DFS order,
+    /// outermost first.
+    ///
+    /// The target leaf uniquely identifies a divider: each divider separates
+    /// children[0] from children[1..], so its target is children[1]'s first
+    /// leaf, which no other divider in the tree can produce (the second-child
+    /// subtrees of nested splits are disjoint).
     pub fn dividers(&self) -> Vec<(SplitDir, f32, usize)> {
         let mut out = Vec::new();
         self.collect_dividers(0.0, 0.0, 1.0, 1.0, &mut out);
@@ -156,8 +162,11 @@ impl SplitNode {
                 match dir {
                     SplitDir::Vertical => {
                         let first_w = w * ratio;
-                        let target = children[0].leaves()[0];
-                        out.push((SplitDir::Vertical, x + first_w, target));
+                        if let Some(target) =
+                            children.get(1).and_then(|c| c.leaves().first().copied())
+                        {
+                            out.push((SplitDir::Vertical, x + first_w, target));
+                        }
                         let rest_w = if n > 1 {
                             (w - first_w) / (n - 1) as f32
                         } else {
@@ -172,8 +181,11 @@ impl SplitNode {
                     }
                     SplitDir::Horizontal => {
                         let first_h = h * ratio;
-                        let target = children[0].leaves()[0];
-                        out.push((SplitDir::Horizontal, y + first_h, target));
+                        if let Some(target) =
+                            children.get(1).and_then(|c| c.leaves().first().copied())
+                        {
+                            out.push((SplitDir::Horizontal, y + first_h, target));
+                        }
                         let rest_h = if n > 1 {
                             (h - first_h) / (n - 1) as f32
                         } else {
@@ -192,8 +204,9 @@ impl SplitNode {
     }
 
     /// Adjust `ratio` of the split whose divider sits at `boundary` and whose
-    /// first-leaf is `target`. `delta` is the normalized move amount (positive
-    /// grows the first child). Clamps ratio to 0.15..0.85.
+    /// second-child first-leaf is `target` (the target emitted by dividers()).
+    /// `delta` is the normalized move amount (positive grows the first child).
+    /// Clamps ratio to 0.15..0.85.
     pub fn resize_leaf(&mut self, target: usize, boundary: f32, delta: f32) -> bool {
         self.resize_walk(0.0, 0.0, 1.0, 1.0, target, boundary, delta)
     }
@@ -239,7 +252,9 @@ impl SplitNode {
                         y + h * r,
                     ),
                 };
-                if (divider_pos - boundary).abs() < 0.001 && children[0].leaves()[0] == target {
+                if (divider_pos - boundary).abs() < 0.001
+                    && children.get(1).and_then(|c| c.leaves().first().copied()) == Some(target)
+                {
                     *ratio = (*ratio + delta).clamp(0.15, 0.85);
                     return true;
                 }
@@ -410,13 +425,14 @@ mod tests {
     fn resize_leaf_adjusts_matching_divider() {
         let mut root = SplitNode::Leaf(1);
         root.insert_leaf(2, SplitDir::Vertical, 1, 0.5);
-        // Divider for split 1|2 sits at x=0.5, target leaf 1.
-        assert!(root.resize_leaf(1, 0.5, 0.2));
+        // Divider for split 1|2 sits at x=0.5, target leaf 2 (first leaf of the
+        // second child).
+        assert!(root.resize_leaf(2, 0.5, 0.2));
         let rects = root.compute_rects();
         assert!((rects[&1].2 - 0.7).abs() < 1e-6);
         // Wrong boundary or wrong target -> no-op.
-        assert!(!root.resize_leaf(2, 0.5, 0.2));
-        assert!(!root.resize_leaf(1, 0.9, 0.2));
+        assert!(!root.resize_leaf(1, 0.5, 0.2));
+        assert!(!root.resize_leaf(2, 0.9, 0.2));
     }
 
     #[test]
@@ -425,7 +441,7 @@ mod tests {
         root.insert_leaf(2, SplitDir::Vertical, 1, 0.5);
         let divs = root.dividers();
         assert_eq!(divs.len(), 1);
-        assert_eq!(divs[0], (SplitDir::Vertical, 0.5, 1));
+        assert_eq!(divs[0], (SplitDir::Vertical, 0.5, 2));
     }
 
     #[test]
@@ -437,5 +453,171 @@ mod tests {
         assert_eq!(rects[&1], (0.0, 0.0, 0.25, 1.0));
         assert_eq!(rects[&3], (0.25, 0.0, 0.25, 1.0));
         assert_eq!(rects[&2], (0.5, 0.0, 0.5, 1.0));
+    }
+
+    // --- divider target uniqueness / drag resolution ---
+
+    /// main.rs resolves a divider drag with `.find(|(_, _, t)| *t == target)`.
+    /// If two dividers share a target, the outer one always wins and dragging an
+    /// inner divider silently resizes the wrong split.
+    #[test]
+    fn divider_targets_are_unique() {
+        let root = SplitNode::from_ids(&[1, 2, 3, 4]);
+        let mut targets: Vec<usize> = root.dividers().into_iter().map(|(_, _, t)| t).collect();
+        targets.sort_unstable();
+        assert!(
+            targets.windows(2).all(|w| w[0] != w[1]),
+            "divider targets must uniquely identify each divider: {:?}",
+            targets
+        );
+    }
+
+    /// Dragging the left column's inner horizontal divider must resize the left
+    /// column's ratio only — not the outer vertical split.
+    #[test]
+    fn nested_divider_drag_resizes_correct_split() {
+        let mut root = SplitNode::from_ids(&[1, 2, 3, 4]);
+        // Resolve the inner H divider (pane1 | pane2) the way main.rs does.
+        let (dir, boundary) = root
+            .dividers()
+            .into_iter()
+            .find(|(_, _, t)| *t == 2)
+            .map(|(d, b, _)| (d, b))
+            .expect("inner divider must be resolvable by its target");
+        assert_eq!(dir, SplitDir::Horizontal);
+        assert!((boundary - 0.5).abs() < 1e-6);
+        assert!(root.resize_leaf(2, boundary, 0.1));
+        let rects = root.compute_rects();
+        assert!(
+            (rects[&1].3 - 0.6).abs() < 1e-6,
+            "pane1 height must grow to 0.6, got {}",
+            rects[&1].3
+        );
+        assert!(
+            (rects[&2].1 - 0.6).abs() < 1e-6,
+            "pane2 must start at y=0.6, got {}",
+            rects[&2].1
+        );
+        assert!(
+            (rects[&1].2 - 0.5).abs() < 1e-6,
+            "outer vertical split must stay 0.5 wide, got {}",
+            rects[&1].2
+        );
+        assert!(
+            (rects[&3].3 - 0.5).abs() < 1e-6,
+            "right column must be untouched, got {}",
+            rects[&3].3
+        );
+    }
+
+    /// Every divider's boundary must equal the rect start of the pane it points
+    /// at (the first leaf of the second child), tying dividers() to compute_rects.
+    #[test]
+    fn divider_boundaries_align_with_compute_rects() {
+        let root = SplitNode::from_ids(&[1, 2, 3, 4]);
+        let rects = root.compute_rects();
+        for (dir, boundary, target) in root.dividers() {
+            match dir {
+                SplitDir::Vertical => assert!(
+                    (rects[&target].0 - boundary).abs() < 1e-5,
+                    "V divider {} must match pane {} x start {}",
+                    boundary,
+                    target,
+                    rects[&target].0
+                ),
+                SplitDir::Horizontal => assert!(
+                    (rects[&target].1 - boundary).abs() < 1e-5,
+                    "H divider {} must match pane {} y start {}",
+                    boundary,
+                    target,
+                    rects[&target].1
+                ),
+            }
+        }
+    }
+
+    // --- removal consistency ---
+
+    #[test]
+    fn remove_leaf_various_orders_keep_tree_consistent() {
+        let orders: [&[usize]; 4] = [&[2, 3], &[3, 2], &[2, 4], &[4, 2]];
+        for order in orders {
+            let mut root = SplitNode::from_ids(&[1, 2, 3, 4]);
+            for &id in order {
+                root.remove_leaf(id);
+                let mut leaves = root.leaves();
+                leaves.sort_unstable();
+                let mut keys: Vec<usize> = root.compute_rects().keys().copied().collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys, leaves,
+                    "rects keys must match leaves after removing {}",
+                    id
+                );
+                let rects = root.compute_rects();
+                let sum_area: f32 = rects.values().map(|r| r.2 * r.3).sum();
+                assert!(
+                    (sum_area - 1.0).abs() < 1e-4,
+                    "leaf rects must tile the unit square after removing {}, got area {}",
+                    id,
+                    sum_area
+                );
+                for (pid, &(x, y, w, h)) in &rects {
+                    assert!(
+                        x >= -1e-5 && y >= -1e-5 && x + w <= 1.0 + 1e-5 && y + h <= 1.0 + 1e-5,
+                        "pane {} rect {:?} must stay inside the unit square",
+                        pid,
+                        (x, y, w, h)
+                    );
+                    assert!(
+                        w > 0.0 && h > 0.0,
+                        "pane {} must keep a positive rect, got {}x{}",
+                        pid,
+                        w,
+                        h
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remove_leaf_last_pane_is_noop() {
+        let mut root = SplitNode::Leaf(5);
+        root.remove_leaf(5);
+        assert_eq!(root.leaves(), vec![5]);
+        root.remove_leaf(7);
+        assert_eq!(root.leaves(), vec![5]);
+    }
+
+    // --- resize clamping ---
+
+    #[test]
+    fn resize_ratio_clamps_without_accumulating() {
+        let mut root = SplitNode::from_ids(&[1, 2]);
+        assert!(root.resize_leaf(2, 0.5, -0.9));
+        let rects = root.compute_rects();
+        assert!((rects[&1].2 - 0.15).abs() < 1e-6);
+        assert!((rects[&2].2 - 0.85).abs() < 1e-6);
+        // Further drags past the clamp must not shrink below the bound.
+        assert!(root.resize_leaf(2, 0.15, -0.5));
+        let rects = root.compute_rects();
+        assert!((rects[&1].2 - 0.15).abs() < 1e-6);
+    }
+
+    // --- insert semantics ---
+
+    #[test]
+    fn insert_into_unknown_parent_is_noop() {
+        let mut root = SplitNode::from_ids(&[1, 2]);
+        root.insert_leaf(9, SplitDir::Vertical, 999, 0.5);
+        assert_eq!(root.leaves(), vec![1, 2]);
+    }
+
+    #[test]
+    fn inserted_pane_becomes_last_child_of_parent() {
+        let mut root = SplitNode::from_ids(&[1, 2, 3]);
+        root.insert_leaf(4, SplitDir::Vertical, 2, 0.5);
+        assert_eq!(root.leaves(), vec![1, 2, 4, 3]);
     }
 }

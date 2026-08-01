@@ -101,6 +101,7 @@ pub struct Parser {
     csi: CsiParams,
     osc_buffer: Vec<u8>,
     dcs_buffer: Vec<u8>,
+    escape_intermediates: Vec<char>,
     screen: crate::screen::Screen,
     after_newline: bool,
     command_buf: String,
@@ -122,6 +123,7 @@ impl Parser {
             csi: CsiParams::new(),
             osc_buffer: Vec::new(),
             dcs_buffer: Vec::new(),
+            escape_intermediates: Vec::new(),
             screen: crate::screen::Screen::new(cols, rows),
             after_newline: false,
             command_buf: String::new(),
@@ -237,6 +239,13 @@ impl Parser {
 
     fn handle_escape(&mut self, byte: u8) {
         match byte {
+            0x20..=0x2F => {
+                // Intermediate bytes (e.g. ESC ( B, ESC # 8): collect, stay in
+                // Escape until the final byte 0x30..=0x7E arrives.
+                if self.escape_intermediates.len() < MAX_CSI_INTERMEDIATES {
+                    self.escape_intermediates.push(byte as char);
+                }
+            }
             0x5B => {
                 // '['
                 self.state = ParserState::CsiEntry;
@@ -258,16 +267,21 @@ impl Parser {
                 self.state = ParserState::SosPmApcString;
             }
             0x30..=0x4F => {
-                // Single-char escape sequences
-                self.handle_escape_sequence(byte as char);
+                // Final byte of an escape sequence (single-char or after intermediates)
+                let intermediates = std::mem::take(&mut self.escape_intermediates);
+                self.handle_escape_sequence(byte as char, &intermediates);
                 self.state = ParserState::Ground;
             }
             0x60..=0x7E => {
-                // Single-char escape sequences
-                self.handle_escape_sequence(byte as char);
+                // Final byte of an escape sequence (single-char or after intermediates)
+                let intermediates = std::mem::take(&mut self.escape_intermediates);
+                self.handle_escape_sequence(byte as char, &intermediates);
                 self.state = ParserState::Ground;
             }
-            _ => self.state = ParserState::Ground,
+            _ => {
+                self.escape_intermediates.clear();
+                self.state = ParserState::Ground;
+            }
         }
     }
 
@@ -339,11 +353,19 @@ impl Parser {
 
     fn handle_osc_string(&mut self, byte: u8) {
         match byte {
-            0x07 | 0x1B => {
+            0x07 => {
                 let buffer = std::mem::take(&mut self.osc_buffer);
                 let osc = String::from_utf8_lossy(&buffer);
                 self.handle_osc(&osc);
                 self.state = ParserState::Ground;
+            }
+            0x1B => {
+                // ST terminator (ESC \): consume the OSC, then stay in Escape so
+                // the trailing '\' is swallowed instead of printed as text.
+                let buffer = std::mem::take(&mut self.osc_buffer);
+                let osc = String::from_utf8_lossy(&buffer);
+                self.handle_osc(&osc);
+                self.state = ParserState::Escape;
             }
             0x20..=0xFF if self.osc_buffer.len() < MAX_OSC_BUFFER => {
                 self.osc_buffer.push(byte);
@@ -412,10 +434,12 @@ impl Parser {
     fn handle_dcs_passthrough(&mut self, byte: u8) {
         match byte {
             0x1B => {
+                // ST terminator (ESC \): finish the DCS, stay in Escape so the
+                // trailing '\' is swallowed.
                 let buffer = std::mem::take(&mut self.dcs_buffer);
                 let dcs = String::from_utf8_lossy(&buffer);
                 self.handle_dcs_string(&dcs);
-                self.state = ParserState::Ground;
+                self.state = ParserState::Escape;
             }
             _ => {
                 if self.dcs_buffer.len() < MAX_DCS_BUFFER {
@@ -434,9 +458,11 @@ impl Parser {
     fn handle_sos_pm_apc(&mut self, byte: u8) {
         match byte {
             0x1B => {
+                // ST terminator (ESC \): finish the string, stay in Escape so the
+                // trailing '\' is swallowed.
                 let buffer = std::mem::take(&mut self.apc_buffer);
                 self.handle_apc(&buffer);
-                self.state = ParserState::Ground;
+                self.state = ParserState::Escape;
             }
             0x20..=0x7E if self.apc_buffer.len() < MAX_APC_BUFFER => {
                 self.apc_buffer.push(byte as char);
@@ -470,20 +496,22 @@ impl Parser {
         }
     }
 
-    fn handle_escape_sequence(&mut self, ch: char) {
-        match ch {
-            '7' => self.screen.save_cursor(),    // DECSC
-            '8' => self.screen.restore_cursor(), // DECRC
-            'D' => self.screen.linefeed(),       // IND
-            'E' => {
+    fn handle_escape_sequence(&mut self, ch: char, intermediates: &[char]) {
+        match (ch, intermediates) {
+            ('7', []) => self.screen.save_cursor(),    // DECSC
+            ('8', []) => self.screen.restore_cursor(), // DECRC
+            ('8', ['#']) => self.screen.decaln(),      // DECALN
+            ('D', []) => self.screen.linefeed(),       // IND
+            ('E', []) => {
                 self.screen.carriage_return();
                 self.screen.linefeed();
             } // NEL
-            'H' => self.screen.tab_set(),        // HTS
-            'M' => self.screen.reverse_linefeed(), // RI
-            'Z' => self.screen.identify(),       // DECID
-            'c' => self.screen.reset(),          // RIS
-            '(' | ')' | '*' | '+' => {}          // Designate charset - ignored
+            ('H', []) => self.screen.tab_set(),        // HTS
+            ('M', []) => self.screen.reverse_linefeed(), // RI
+            ('Z', []) => self.screen.identify(),       // DECID
+            ('c', []) => self.screen.reset(),          // RIS
+            // '(' ')' '*' '+' '$' '%' '#' prefixes select charsets / UTF-8 /
+            // line attributes — consumed and ignored (cells are Unicode-native).
             _ => {}
         }
     }

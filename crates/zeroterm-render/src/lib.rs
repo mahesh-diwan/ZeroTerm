@@ -2,7 +2,7 @@
 
 pub mod renderer;
 
-pub use renderer::{Renderer, Selection, TabInfo};
+pub use renderer::{tab_span, Renderer, Selection, TabInfo};
 
 pub struct RenderConfig {
     pub font_size: f32,

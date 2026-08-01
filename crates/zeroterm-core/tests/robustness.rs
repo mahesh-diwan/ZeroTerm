@@ -465,6 +465,138 @@ fn dec_2026_sets_sync_flag() {
     assert!(!p.sync_output(), "DECRST 2026 disables");
 }
 
+// --------------------- escape sequence correctness ---------------------
+
+#[test]
+fn esc_intermediate_bytes_are_consumed_not_printed() {
+    // ESC ( 0 = designate DEC special graphics; the '0' final byte must NOT print.
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b(0X");
+    assert_eq!(
+        p.screen().cell(0, 0).unwrap().ch,
+        'X',
+        "charset final byte after ESC ( must be consumed"
+    );
+    assert_eq!(p.screen().cursor().col, 1);
+
+    // ESC # 8 = DECALN; the '8' must not print.
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b#8Y");
+    assert_eq!(
+        p.screen().cell(0, 0).unwrap().ch,
+        'Y',
+        "ESC # 8 final byte must be consumed"
+    );
+
+    // ESC ) 0, ESC * 0, ESC + 0 charset designations
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b)0Z");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'Z');
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b*0W");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'W');
+
+    // ESC $ B and ESC % G charset designations
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b$BV");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'V');
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b%GU");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'U');
+
+    // Multiple intermediates then final (ESC ( B)
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b(BT");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'T');
+}
+
+#[test]
+fn st_terminator_does_not_print_backslash() {
+    // OSC 0;title terminated by ST (ESC \) — no stray backslash may print.
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b]0;t\x1b\\hi");
+    assert_eq!(p.screen().title(), "t");
+    assert_eq!(
+        p.screen().cell(0, 0).unwrap().ch,
+        'h',
+        "no stray backslash after OSC ST"
+    );
+    assert_eq!(p.screen().cell(0, 1).unwrap().ch, 'i');
+
+    // DCS terminated by ST
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1bPq\x1b\\hi");
+    assert_eq!(
+        p.screen().cell(0, 0).unwrap().ch,
+        'h',
+        "no stray backslash after DCS ST"
+    );
+
+    // APC / PM / SOS terminated by ST
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b_G\x1b\\hi");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'h');
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b^pm\x1b\\hi");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'h');
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1bXsos\x1b\\hi");
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'h');
+}
+
+#[test]
+fn scroll_region_scroll_keeps_scrollback_empty() {
+    // DECSTBM 2;4 then scroll inside the region: scrollback must stay empty
+    // (only full-screen scrolls write to scrollback).
+    let mut p = Parser::new(10, 6);
+    p.parse(b"abcdefghij");
+    p.parse(b"\x1b[2;4r"); // region rows 1..=3 (0-indexed)
+    p.parse(b"\x1b[4;1H"); // cursor to region bottom
+    p.parse(b"\x1bD"); // IND -> scrolls the region
+    assert_eq!(
+        p.screen().scrollback().len(),
+        0,
+        "partial-region scroll must not write scrollback"
+    );
+    // Cursor stays at region bottom.
+    assert_eq!(p.screen().cursor().row, 3);
+
+    // Same for scroll_up/down escape sequences (SU/SD).
+    let mut p = Parser::new(10, 6);
+    p.parse(b"\x1b[2;4r\x1b[4;1H\x1b[5S"); // SU 5 inside region
+    assert_eq!(
+        p.screen().scrollback().len(),
+        0,
+        "SU in region must not write scrollback"
+    );
+
+    // Reverse scroll at region top must not pull lines back out of scrollback.
+    let mut p = Parser::new(10, 4);
+    p.parse(b"line0\r\nline1\r\nline2\r\nline3"); // 4 rows, then LF pushes to scrollback
+    p.parse(b"\r\n"); // row 3 -> scroll, scrollback=1
+    p.parse(b"\x1b[2;3r"); // region rows 1..=2
+    p.parse(b"\x1b[2;1H"); // cursor to region top
+    p.parse(b"\x1bM"); // RI at region top -> scroll_down region
+    assert_eq!(
+        p.screen().scrollback().len(),
+        1,
+        "RI in region must not consume scrollback"
+    );
+}
+
+#[test]
+fn huge_insert_delete_counts_are_bounded() {
+    let mut p = Parser::new(80, 24);
+    p.parse(b"\x1b[999999999999L"); // IL huge
+    assert_screen_ok(&p);
+    p.parse(b"\x1b[999999999999M"); // DL huge
+    assert_screen_ok(&p);
+    p.parse(b"\x1b[999999999999@"); // ICH huge
+    assert_screen_ok(&p);
+    p.parse(b"\x1b[999999999999P"); // DCH huge
+    assert_screen_ok(&p);
+}
+
 // --------------------- Animated image support (Phase 3.3) ---------------------
 
 fn make_gif_2frame() -> Vec<u8> {

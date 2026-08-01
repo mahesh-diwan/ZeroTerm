@@ -363,6 +363,9 @@ impl Screen {
         let top = self.scroll_top();
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
+        // Scrollback is only touched when the WHOLE screen scrolls; a DECSTBM
+        // region scroll discards the line instead (real terminal behavior).
+        let full_screen = top == 0 && bottom == self.size.rows.saturating_sub(1);
 
         // ponytail: scrollback is capped, so more iterations than the cap are wasted
         let n = n.min(self.scrollback_limit);
@@ -370,9 +373,11 @@ impl Screen {
         for _ in 0..n {
             if top < bottom {
                 let line = self.current_buffer_mut().remove(top);
-                self.scrollback.push_front(line);
-                if self.scrollback.len() > self.scrollback_limit {
-                    self.scrollback.pop_back();
+                if full_screen {
+                    self.scrollback.push_front(line);
+                    if self.scrollback.len() > self.scrollback_limit {
+                        self.scrollback.pop_back();
+                    }
                 }
                 self.current_buffer_mut()
                     .insert(bottom, vec![Cell::default(); cols]);
@@ -384,19 +389,25 @@ impl Screen {
         let top = self.scroll_top();
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
+        // Mirror of scroll_up: partial-region reverse scroll never pulls lines
+        // back out of scrollback.
+        let full_screen = top == 0 && bottom == self.size.rows.saturating_sub(1);
 
         // ponytail: scrollback is capped, so more iterations than the cap are wasted
         let n = n.min(self.scrollback_limit);
 
         for _ in 0..n {
             if top < bottom {
-                if let Some(line) = self.scrollback.pop_front() {
-                    self.current_buffer_mut().remove(bottom);
-                    self.current_buffer_mut().insert(top, line);
+                let line = if full_screen {
+                    self.scrollback.pop_front()
                 } else {
-                    self.current_buffer_mut().remove(bottom);
-                    self.current_buffer_mut()
-                        .insert(top, vec![Cell::default(); cols]);
+                    None
+                };
+                self.current_buffer_mut().remove(bottom);
+                let blank = vec![Cell::default(); cols];
+                match line {
+                    Some(line) => self.current_buffer_mut().insert(top, line),
+                    None => self.current_buffer_mut().insert(top, blank),
                 }
             }
         }
@@ -475,6 +486,9 @@ impl Screen {
         let top = self.scroll_top();
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
+        // More iterations than the region holds are no-ops; clamp so a hostile
+        // "ESC [ 999999999999 L" cannot spin forever.
+        let n = n.min(bottom - top + 1);
         for _ in 0..n {
             if top < bottom {
                 self.current_buffer_mut().remove(bottom);
@@ -488,6 +502,7 @@ impl Screen {
         let top = self.scroll_top();
         let bottom = self.scroll_bottom();
         let cols = self.size.cols;
+        let n = n.min(bottom - top + 1);
         for _ in 0..n {
             if top < bottom {
                 self.current_buffer_mut().remove(top);
@@ -500,6 +515,8 @@ impl Screen {
     pub fn insert_chars(&mut self, n: usize) {
         let row = self.cursor.row;
         let col = self.cursor.col;
+        let cols = self.size.cols;
+        let n = n.min(cols.saturating_sub(col));
         let buffer = self.current_buffer_mut();
         if let Some(row_buf) = buffer.get_mut(row) {
             for _ in 0..n {
@@ -512,6 +529,8 @@ impl Screen {
     pub fn delete_chars(&mut self, n: usize) {
         let row = self.cursor.row;
         let col = self.cursor.col;
+        let cols = self.size.cols;
+        let n = n.min(cols.saturating_sub(col));
         let buffer = self.current_buffer_mut();
         if let Some(row_buf) = buffer.get_mut(row) {
             for _ in 0..n {
@@ -556,6 +575,17 @@ impl Screen {
 
     pub fn reset(&mut self) {
         *self = Self::new(self.size.cols, self.size.rows);
+    }
+
+    /// DECALN — screen alignment test: fill the display with 'E' and home the cursor.
+    pub fn decaln(&mut self) {
+        for row in self.current_buffer_mut() {
+            for cell in row.iter_mut() {
+                *cell = Cell::new('E');
+            }
+        }
+        self.cursor.row = 0;
+        self.cursor.col = 0;
     }
 
     pub fn reset_attributes(&mut self) {

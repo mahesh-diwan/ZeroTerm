@@ -226,9 +226,7 @@ fn non_ascii_osc_title() {
 #[test]
 fn non_ascii_dcs_passthrough() {
     // UTF-8 bytes ride through DCS passthrough untouched; state must recover.
-    // Note: DCS passthrough terminates on ESC alone, so the ST backslash of
-    // `\x1b\\` leaks into the screen as a literal '\\' — pinned as current
-    // behavior.
+    // ST (ESC \) is fully consumed — the '\' does not leak to the screen.
     let mut p = Parser::new(80, 24);
     p.parse("before".as_bytes());
     p.parse(b"\x1bP0;1;q\xc3\xa9\xe4\xb8\xad");
@@ -239,10 +237,9 @@ fn non_ascii_dcs_passthrough() {
     );
     p.parse(b"\x1b\\after");
     let buf = p.screen().buffer();
-    assert_eq!(buf[0][6].ch, '\\', "ST backslash leaks as one char");
-    assert_eq!(buf[0][7].ch, 'a');
-    assert_eq!(buf[0][11].ch, 'r');
-    assert_eq!(p.screen().cursor().col, 12);
+    assert_eq!(buf[0][6].ch, 'a');
+    assert_eq!(buf[0][10].ch, 'r');
+    assert_eq!(p.screen().cursor().col, 11);
     assert_screen_ok(&p);
 }
 

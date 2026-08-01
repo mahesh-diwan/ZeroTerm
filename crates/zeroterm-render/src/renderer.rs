@@ -469,7 +469,7 @@ pub struct Renderer {
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     image_texture: Option<wgpu::Texture>,
     image_view: Option<wgpu::TextureView>,
-    has_image: bool,
+    uploaded_image_id: Option<u32>,
     image_frames: Vec<(Vec<u8>, u32, u32, u64)>,
     anim_frame_index: usize,
     anim_last_swap: std::time::Instant,
@@ -840,7 +840,7 @@ impl Renderer {
             opacity,
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
-            has_image: false,
+            uploaded_image_id: None,
             image_frames: Vec::new(),
             anim_frame_index: 0,
             anim_last_swap: std::time::Instant::now(),
@@ -864,7 +864,6 @@ impl Renderer {
         self.size = PhysicalSize::new(width, height);
         self.config.width = width;
         self.config.height = height;
-        self.config.alpha_mode = wgpu::CompositeAlphaMode::PostMultiplied;
         self.surface.configure(&self.device, &self.config);
 
         if needs_resize {
@@ -1100,7 +1099,7 @@ impl Renderer {
                 break;
             }
             let title = truncate_title(&tab.title, 20);
-            let span = title.chars().count().saturating_add(2);
+            let span = tab_span(&tab.title, 20);
             let is_active = i == active;
             let bg = if is_active { ACTIVE_BG } else { INACTIVE_BG };
             let fg = if is_active { FG } else { FG_DIM };
@@ -1336,11 +1335,7 @@ impl Renderer {
     }
 
     fn update_image_from_screen(&mut self, screen: &CoreScreen) {
-        let reg = screen.image_registry();
-        if reg.is_empty() || self.has_image {
-            return;
-        }
-        let img = match reg.values().max_by_key(|img| img.id) {
+        let img = match latest_new_image(screen.image_registry(), self.uploaded_image_id) {
             Some(img) => img,
             None => return,
         };
@@ -1359,7 +1354,7 @@ impl Renderer {
         self.is_animated = self.image_frames.len() > 1;
         self.anim_frame_index = 0;
         self.anim_last_swap = std::time::Instant::now();
-        self.has_image = true;
+        self.uploaded_image_id = Some(img.id);
     }
 
     /// Upload RGBA bytes into the image texture (recreating it when the size
@@ -1480,5 +1475,81 @@ fn truncate_title(title: &str, max: usize) -> String {
         let mut s: String = title.chars().take(max).collect();
         s.push('\u{2026}');
         s
+    }
+}
+
+/// Width of a tab in cells: truncated title + one cell of padding each side.
+/// Must be identical wherever a tab's hit region is computed (draw_tab_bar and
+/// the app's tab_at_point), otherwise clicks land on the wrong tab.
+pub fn tab_span(title: &str, max_title: usize) -> usize {
+    truncate_title(title, max_title)
+        .chars()
+        .count()
+        .saturating_add(2)
+}
+
+/// The newest image in the registry that has not been uploaded yet, or `None`
+/// when the registry is empty or the newest id is already uploaded. The old
+/// code gated on a sticky `has_image` flag, so once any image was shown every
+/// later image rendered as the first one (and `clear` never reset it).
+fn latest_new_image(
+    reg: &HashMap<u32, zeroterm_core::screen::ImageData>,
+    uploaded: Option<u32>,
+) -> Option<&zeroterm_core::screen::ImageData> {
+    let img = reg.values().max_by_key(|img| img.id)?;
+    if uploaded == Some(img.id) {
+        None
+    } else {
+        Some(img)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroterm_core::screen::ImageData;
+
+    fn image(id: u32) -> ImageData {
+        ImageData {
+            id,
+            width: 8,
+            height: 8,
+            rgba_data: vec![0u8; 8 * 8 * 4],
+            frames: vec![],
+        }
+    }
+
+    #[test]
+    fn image_update_tracks_newest_id_not_sticky_flag() {
+        let mut reg = HashMap::new();
+        reg.insert(0, image(0));
+        // Nothing uploaded yet -> picks the newest image.
+        assert_eq!(latest_new_image(&reg, None).unwrap().id, 0);
+        // Same registry, id 0 already uploaded -> no re-upload.
+        assert!(latest_new_image(&reg, Some(0)).is_none());
+        // A later image must be picked even though one was already shown.
+        // (Old code gated on a sticky has_image flag and kept rendering image 0.)
+        reg.insert(1, image(1));
+        assert_eq!(latest_new_image(&reg, Some(0)).unwrap().id, 1);
+        // Eviction only removes the oldest; newest stays stable.
+        reg.remove(&0);
+        assert!(latest_new_image(&reg, Some(1)).is_none());
+    }
+
+    #[test]
+    fn image_update_ignores_empty_registry() {
+        let reg = HashMap::new();
+        assert!(latest_new_image(&reg, None).is_none());
+        assert!(latest_new_image(&reg, Some(0)).is_none());
+    }
+
+    #[test]
+    fn tab_span_matches_drawn_width() {
+        // Short title: len + 2 padding cells.
+        assert_eq!(tab_span("short", 20), 7);
+        // Long title: truncated to 20 chars + ellipsis (1) + 2 padding.
+        assert_eq!(tab_span(&"x".repeat(30), 20), 23);
+        // Empty title: 2 padding cells only.
+        assert_eq!(tab_span("", 20), 2);
     }
 }
