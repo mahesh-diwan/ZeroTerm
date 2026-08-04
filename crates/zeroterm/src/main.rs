@@ -36,8 +36,8 @@ use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
 use crate::app::{
-    block_output_text, word_left, word_right, EditingState, HostPicker, PaneState, PtyCommand,
-    SessionManager,
+    block_output_text, word_left, word_right, EditingState, HostPicker, PaneState, PromptHistory,
+    PtyCommand, SessionManager,
 };
 use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
@@ -109,6 +109,9 @@ struct App {
     // editing keys are intercepted (not forwarded to the shell) and accumulated
     // into the buffer until Enter submits the line or Esc discards it.
     editing: Option<EditingState>,
+    // Per-session command history for the line editor (Up/Down recall). Pushed
+    // on Enter-submit; navigation state resets when editing starts.
+    history: PromptHistory,
     // Pending AI line completion for the active editor (Tab). None when AI is
     // disabled or no request is in flight / staged.
     ai_completion: Option<AiCompletion>,
@@ -124,6 +127,18 @@ fn split_scroll_fraction(fraction: f32) -> (usize, usize, f32) {
         (-whole).max(0) as usize,
         fraction - whole as f32,
     )
+}
+
+/// Pure focus-follow decision: switch focus on hover only when the feature is
+/// enabled, no drag-select is in progress, and the cursor actually moved into
+/// a different pane (skips 1px jitter within the same pane).
+fn should_focus_follow(
+    follows: bool,
+    selecting: bool,
+    active: usize,
+    hovered: Option<usize>,
+) -> bool {
+    follows && !selecting && hovered.is_some_and(|id| id != active)
 }
 
 #[allow(dead_code)]
@@ -168,6 +183,7 @@ impl App {
             #[cfg(feature = "plugins")]
             plugins: HashMap::new(),
             editing: None,
+            history: PromptHistory::new(),
             ai_completion: None,
         }
     }
@@ -1208,6 +1224,8 @@ impl App {
         if !state.is_empty() {
             self.write_pty(b"\x15");
         }
+        // Fresh editing session: Up starts at the most recent history entry.
+        self.history.reset();
         self.session.scroll_offset = 0;
         self.editing = Some(state);
     }
@@ -1222,6 +1240,7 @@ impl App {
                     .take()
                     .expect("caller guards editing.is_some()");
                 let line = state.line();
+                self.history.push(&line);
                 // Wrap in bracketed paste so readline inserts the buffer
                 // literally (tabs stay tabs, no completion / history
                 // expansion). Falls back to raw bytes when the shell never
@@ -1268,6 +1287,13 @@ impl App {
             KeyCode::ArrowRight => self.editing.as_mut().unwrap().right(),
             KeyCode::Home => self.editing.as_mut().unwrap().home(),
             KeyCode::End => self.editing.as_mut().unwrap().end(),
+            // History navigation (readline Up/Down, C-p / C-n). Recalled lines
+            // replace the buffer; the in-progress line is stashed on the first
+            // Up so Down can return to it.
+            KeyCode::ArrowUp => self.history_prev(),
+            KeyCode::KeyP if ctrl && !alt => self.history_prev(),
+            KeyCode::ArrowDown => self.history_next(),
+            KeyCode::KeyN if ctrl && !alt => self.history_next(),
             KeyCode::Tab => self.editor_tab(),
             // Let Alt+E fall through so the same key exits edit mode.
             KeyCode::KeyE if alt && !ctrl => return false,
@@ -1277,6 +1303,25 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Recall the previous history entry into the editor buffer. A stale AI
+    /// ghost is dropped since the buffer changed.
+    fn history_prev(&mut self) {
+        let current = self.editing.as_ref().unwrap().buffer_text();
+        if let Some(line) = self.history.prev(&current) {
+            self.editing.as_mut().unwrap().set_line(&line);
+            self.ai_completion = None;
+        }
+    }
+
+    /// Recall the next (more recent) history entry, or restore the stashed
+    /// in-progress line at the top.
+    fn history_next(&mut self) {
+        if let Some(line) = self.history.next() {
+            self.editing.as_mut().unwrap().set_line(&line);
+            self.ai_completion = None;
+        }
     }
 
     /// Tab in the line editor. Accepts a staged AI completion when one is
@@ -1530,6 +1575,8 @@ impl App {
     }
 
     /// Map a window pixel point to the pane under it (normalized rects × window size).
+    /// Single-pane shortcut keeps the historical "any pixel -> the one pane"
+    /// answer (even over the bars) so cursor/mouse-tracking stays unchanged.
     fn pane_at_point(&self, x: f32, y: f32) -> Option<usize> {
         let rects = self.session.split_root.compute_rects();
         if rects.len() <= 1 {
@@ -1540,18 +1587,31 @@ impl App {
         let tab_h = self.tab_bar_height();
         let content_h =
             (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        for (&id, &(nx, ny, nw, nh)) in &rects {
-            let (px, py, pw, ph) = (
-                nx * win_w,
-                ny * content_h + tab_h,
-                nw * win_w,
-                nh * content_h,
-            );
-            if x >= px && y >= py && x < px + pw && y < py + ph {
-                return Some(id);
-            }
+        self.session
+            .split_root
+            .pane_at(x / win_w, (y - tab_h) / content_h)
+    }
+
+    /// Focus-follow-on-hover: if enabled and the pointer has drifted into a
+    /// different pane (not during drag-select), make that pane active. Early
+    /// returns: disabled, drag-selecting, hover over the tab/status bars
+    /// (hit-test is None), hover == active pane. Hit-testing goes through
+    /// pane_at_point so focus-follow matches click-to-focus.
+    fn maybe_focus_follow(&mut self, hovered: Option<usize>) {
+        let follows = self
+            .config
+            .as_ref()
+            .map_or(false, |c| c.mouse.focus_follows_mouse);
+        if !should_focus_follow(follows, self.selecting, self.session.active_pane, hovered) {
+            return;
         }
-        None
+        let id = hovered.unwrap();
+        self.session.active_pane = id;
+        self.editing = None;
+        self.session.scroll_offset = 0;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     /// Pane id of the tab under a window-space x,y (must match draw_tab_bar's
@@ -2588,21 +2648,8 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
-                // ponytail: focus-follows-mouse hardcoded ON; gate on config.mouse.focus_follows
-                // when the config gains a mouse section. Skipped during drag-select.
                 let hovered = self.pane_at_point(x, y);
-                if !self.selecting {
-                    if let Some(id) = hovered {
-                        if id != self.session.active_pane {
-                            self.session.active_pane = id;
-                            self.editing = None;
-                            self.session.scroll_offset = 0;
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        }
-                    }
-                }
+                self.maybe_focus_follow(hovered);
                 let pane_id = hovered.unwrap_or(self.session.active_pane);
                 let mouse_tracking = self
                     .session
@@ -2888,6 +2935,71 @@ mod tests {
         assert!(app.editing.is_some());
         assert!(app.handle_editing_key(KeyCode::KeyC, true, false));
         assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn focus_follow_requires_enabled_not_selecting_and_new_pane() {
+        // Disabled -> never switch.
+        assert!(!should_focus_follow(false, false, 1, Some(2)));
+        // Enabled but drag-selecting -> hold focus on the starting pane.
+        assert!(!should_focus_follow(true, true, 1, Some(2)));
+        // Hover outside any pane (tab/status bar) -> no switch.
+        assert!(!should_focus_follow(true, false, 1, None));
+        // Same pane (1px jitter) -> no switch.
+        assert!(!should_focus_follow(true, false, 1, Some(1)));
+        // Enabled, idle, different pane -> switch.
+        assert!(should_focus_follow(true, false, 1, Some(2)));
+    }
+
+    #[test]
+    fn editing_history_up_down_recalls_lines() {
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line(""));
+        app.history.push("echo one");
+        app.history.push("echo two");
+        // Up recalls the most recent entry; the in-progress line is stashed.
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
+        // Down walks forward again.
+        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
+        // Ctrl+P / Ctrl+N are the readline chords for Up / Down.
+        assert!(app.handle_editing_key(KeyCode::KeyP, true, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
+        assert!(app.handle_editing_key(KeyCode::KeyN, true, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
+        // Up then Enter submits the recalled line into history.
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert!(app.handle_editing_key(KeyCode::Enter, false, false));
+        assert!(app.editing.is_none());
+        assert_eq!(app.history.len(), 3);
+        assert_eq!(
+            app.history.prev(""),
+            Some("echo one".to_string()),
+            "recalled submission must be the newest entry"
+        );
+    }
+
+    #[test]
+    fn editing_history_enter_dedupes_last_entry() {
+        let mut app = App::new();
+        app.history.push("ls");
+        app.history.push("cd /tmp");
+        app.editing = Some(EditingState::from_line("cd /tmp"));
+        assert!(app.handle_editing_key(KeyCode::Enter, false, false));
+        assert_eq!(app.history.len(), 2, "repeat of last entry must be a no-op");
+    }
+
+    #[test]
+    fn editing_history_empty_noop() {
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line("ls"));
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
+        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
     }
 
     #[test]

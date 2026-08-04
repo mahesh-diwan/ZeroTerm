@@ -34,6 +34,8 @@ pub struct Config {
     pub window: WindowConfig,
     #[serde(default)]
     pub cursor: CursorConfig,
+    #[serde(default)]
+    pub mouse: MouseConfig,
     pub ai: AiConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
@@ -153,6 +155,9 @@ impl Config {
                 "click_to_position" | "keybindings.click_to_position" => {
                     self.keybindings.click_to_position = value.parse().unwrap_or(true);
                 }
+                "focus_follows_mouse" | "mouse.focus_follows_mouse" => {
+                    self.mouse.focus_follows_mouse = value.parse().unwrap_or(false);
+                }
                 _ => {}
             }
         }
@@ -189,6 +194,7 @@ impl Config {
         self.shell = new_config.shell;
         self.window = new_config.window;
         self.cursor = new_config.cursor;
+        self.mouse = new_config.mouse;
         self.ai = new_config.ai;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
@@ -290,6 +296,30 @@ mod tests {
         let parsed: Config = table.try_into().unwrap();
         assert!(parsed.cursor.blink);
         assert_eq!(parsed.cursor.blink_interval_ms, 530);
+    }
+
+    #[test]
+    fn mouse_config_defaults_focus_follows_on() {
+        assert!(Config::default().mouse.focus_follows_mouse);
+        assert!(MouseConfig::default().focus_follows_mouse);
+    }
+
+    #[test]
+    fn mouse_config_deserializes_focus_follows() {
+        let mut config = Config::default();
+        config.mouse.focus_follows_mouse = true;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.mouse.focus_follows_mouse);
+    }
+
+    #[test]
+    fn mouse_config_without_keys_uses_defaults() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("mouse");
+        let parsed: Config = table.try_into().unwrap();
+        assert!(parsed.mouse.focus_follows_mouse);
     }
 }
 
@@ -402,4 +432,23 @@ impl Default for CursorConfig {
             blink_interval_ms: 530,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MouseConfig {
+    /// Hover over a pane in a split makes it the active pane. On by default.
+    #[serde(default = "default_focus_follows_mouse")]
+    pub focus_follows_mouse: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            focus_follows_mouse: default_focus_follows_mouse(),
+        }
+    }
+}
+
+fn default_focus_follows_mouse() -> bool {
+    true
 }

@@ -1,6 +1,106 @@
+use std::collections::VecDeque;
+
 /// Readline word characters: alphanumerics and the underscore.
 fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// ponytail: fixed ring cap; persistence and dedup-fuzz deferred.
+const HISTORY_CAP: usize = 500;
+
+/// Readline-style command history for the local line editor: a fixed ring of
+/// submitted lines (oldest evicted past the cap). prev() walks back from the
+/// most-recent entry, stashing the in-progress line on the first call so
+/// next() can restore it. No persistence.
+pub struct PromptHistory {
+    entries: VecDeque<String>,
+    /// Steps walked back from the most-recent entry (0 = live position).
+    pos: usize,
+    /// The in-progress line captured on the first prev(), returned by next()
+    /// when navigation reaches the top of the ring.
+    stashed: Option<String>,
+}
+
+impl PromptHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            pos: 0,
+            stashed: None,
+        }
+    }
+
+    /// Test/observability accessors; navigation uses `prev`/`next`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Append a submitted line; ignores empty lines and repeats of the most
+    /// recent entry. Resets in-progress navigation.
+    pub fn push(&mut self, line: &str) {
+        if line.is_empty() || self.entries.back().is_some_and(|last| last == line) {
+            return;
+        }
+        self.entries.push_back(line.to_string());
+        while self.entries.len() > HISTORY_CAP {
+            self.entries.pop_front();
+        }
+        self.pos = 0;
+        self.stashed = None;
+    }
+
+    /// Walk one step toward the oldest entry. The first call stashes
+    /// `current_line` (the in-progress buffer) so Down can return to it.
+    /// Repeated calls clamp at the oldest entry.
+    pub fn prev(&mut self, current_line: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        if self.pos == 0 {
+            self.stashed = Some(current_line.to_string());
+            self.pos = 1;
+        } else {
+            self.pos = (self.pos + 1).min(self.entries.len());
+        }
+        self.entries.get(self.entries.len() - self.pos).cloned()
+    }
+
+    /// Walk one step toward the most-recent entry. At the top, returns the
+    /// stashed in-progress line once; further calls return None.
+    pub fn next(&mut self) -> Option<String> {
+        if self.pos == 0 {
+            return None;
+        }
+        self.pos -= 1;
+        if self.pos == 0 {
+            self.stashed.take()
+        } else {
+            self.entries.get(self.entries.len() - self.pos).cloned()
+        }
+    }
+
+    /// The entry navigation currently points at, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn peek(&self) -> Option<String> {
+        if self.pos == 0 {
+            None
+        } else {
+            self.entries.get(self.entries.len() - self.pos).cloned()
+        }
+    }
+
+    /// Forget in-progress navigation; the next prev() starts at the most
+    /// recent entry again.
+    pub fn reset(&mut self) {
+        self.pos = 0;
+        self.stashed = None;
+    }
 }
 
 /// Local single-line editor state (not readline): a char buffer plus a cursor,
@@ -120,9 +220,14 @@ impl EditingState {
     }
 
     /// Buffer content only (the partial command line, no prompt prefix).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     pub fn buffer_text(&self) -> String {
         self.buffer.iter().collect()
+    }
+
+    /// Replace the whole buffer with `line`, cursor at end (history recall).
+    pub fn set_line(&mut self, line: &str) {
+        self.buffer = line.chars().collect();
+        self.cursor = self.buffer.len();
     }
 
     /// Insert `suffix` at the cursor and advance past it (accept a completion).
@@ -182,7 +287,7 @@ pub fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{word_left, word_right, EditingState};
+    use super::{word_left, word_right, EditingState, PromptHistory, HISTORY_CAP};
 
     #[test]
     fn word_movement_bounds() {
@@ -227,5 +332,78 @@ mod tests {
         let e = EditingState::from_line("hel");
         assert!(e.display_with_suffix("lo").contains("hel▌lo"));
         assert!(e.display().contains("hel▌"));
+    }
+
+    #[test]
+    fn set_line_replaces_buffer_and_cursor() {
+        let mut e = EditingState::from_line("old line");
+        e.home();
+        e.set_line("new");
+        assert_eq!(e.line(), "new");
+        // Cursor at end: typing appends, backspace eats the last char.
+        e.insert('!');
+        assert_eq!(e.line(), "new!");
+        e.backspace();
+        assert_eq!(e.line(), "new");
+    }
+
+    #[test]
+    fn history_push_ignores_empty_and_duplicate() {
+        let mut h = PromptHistory::new();
+        h.push("ls");
+        h.push("");
+        h.push("ls");
+        assert_eq!(h.len(), 1);
+        assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn history_prev_next_walks_and_stashes() {
+        let mut h = PromptHistory::new();
+        h.push("a");
+        h.push("b");
+        h.push("c");
+        // prev walks back from most-recent, stashing the in-progress line.
+        assert_eq!(h.prev("typed"), Some("c".to_string()));
+        assert_eq!(h.prev("typed"), Some("b".to_string()));
+        assert_eq!(h.prev("typed"), Some("a".to_string()));
+        // Clamps at the oldest entry.
+        assert_eq!(h.prev("typed"), Some("a".to_string()));
+        // next walks forward, returning the stash at the top.
+        assert_eq!(h.next(), Some("b".to_string()));
+        assert_eq!(h.next(), Some("c".to_string()));
+        assert_eq!(h.next(), Some("typed".to_string()));
+        assert_eq!(h.next(), None);
+    }
+
+    #[test]
+    fn history_prev_next_empty_returns_none() {
+        let mut h = PromptHistory::new();
+        assert_eq!(h.prev("typed"), None);
+        assert_eq!(h.next(), None);
+    }
+
+    #[test]
+    fn history_evicts_oldest_at_cap() {
+        let mut h = PromptHistory::new();
+        for i in 0..HISTORY_CAP + 10 {
+            h.push(&format!("cmd{}", i));
+        }
+        assert_eq!(h.len(), HISTORY_CAP);
+        assert_eq!(h.peek(), None);
+        assert_eq!(h.prev(""), Some("cmd509".to_string()));
+        assert_eq!(h.next(), Some("".to_string()));
+        assert_eq!(h.peek(), None);
+    }
+
+    #[test]
+    fn history_reset_forgets_navigation() {
+        let mut h = PromptHistory::new();
+        h.push("ls");
+        h.prev("typed");
+        h.reset();
+        assert_eq!(h.peek(), None);
+        assert_eq!(h.prev("again"), Some("ls".to_string()));
+        assert_eq!(h.next(), Some("again".to_string()));
     }
 }

@@ -76,6 +76,18 @@ impl SplitNode {
         rects
     }
 
+    /// Pane id whose normalized rect contains the content-space point (x, y),
+    /// both in 0..=1 (the same space compute_rects emits). Rects tile the unit
+    /// square without overlap, so a point inside the content area hits exactly
+    /// one pane; None outside every rect. Used for mouse hit-testing.
+    pub fn pane_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.compute_rects()
+            .into_iter()
+            .find_map(|(id, (px, py, pw, ph))| {
+                (x >= px && y >= py && x < px + pw && y < py + ph).then_some(id)
+            })
+    }
+
     fn assign_rects(
         &self,
         x: f32,
@@ -453,6 +465,22 @@ mod tests {
         assert_eq!(rects[&1], (0.0, 0.0, 0.25, 1.0));
         assert_eq!(rects[&3], (0.25, 0.0, 0.25, 1.0));
         assert_eq!(rects[&2], (0.5, 0.0, 0.5, 1.0));
+    }
+
+    #[test]
+    fn pane_at_hits_all_quadrants_of_2x2() {
+        // from_ids([1,2,3,4]): left column [1,2] split H, right column [3,4].
+        let root = SplitNode::from_ids(&[1, 2, 3, 4]);
+        assert_eq!(root.pane_at(0.25, 0.25), Some(1));
+        assert_eq!(root.pane_at(0.25, 0.75), Some(2));
+        assert_eq!(root.pane_at(0.75, 0.25), Some(3));
+        assert_eq!(root.pane_at(0.75, 0.75), Some(4));
+        // Divider boundaries belong to the second child (left/half-open rects).
+        assert_eq!(root.pane_at(0.5, 0.25), Some(3));
+        assert_eq!(root.pane_at(0.25, 0.5), Some(2));
+        // Outside the unit square -> None.
+        assert_eq!(root.pane_at(1.5, 0.5), None);
+        assert_eq!(root.pane_at(-0.1, 0.5), None);
     }
 
     // --- divider target uniqueness / drag resolution ---
