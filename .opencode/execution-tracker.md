@@ -86,7 +86,7 @@ Target: `crates/zeroterm/src/app/{mod,session,chrome,input,extensions}.rs` (note
 - [x] status bar (bottom row, viewport_origin=[0,win_h-cell_h]) — pane title left, [N%] scroll right; content_h shrunk by status bar height in ALL layout sites
 - [x] scrollbar overlay (right 2 cols of active pane, thumb=theme.accent, only when max_scroll>0)
 - [x] rounded selection corners — REJECTED (zero precedent in any terminal; conflicts with instanced-quad model + half-px seam fix)
-- [~] window transparency + blur — PARTIAL: opacity already existed (config.window.opacity, cycle_opacity); blur/blur_radius config fields added (defaults off) but renderer has NO blur pass yet
+- [x] window transparency + blur — opacity (config.window.opacity, cycle_opacity) + blur/blur_radius config fields + GPU blur pass (shader.wgsl fs_blur single-pass outer-product Gaussian, gated on blur && opacity<1.0, offscreen texture → composite). Also fixed pre-existing race: async config consumed before GPU init → re-applied in check_renderer_ready()
 
 ## v1.0 perf gates (bench-v10.sh, release/fat-LTO)
 

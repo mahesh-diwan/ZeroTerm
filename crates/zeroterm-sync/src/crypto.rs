@@ -1,6 +1,7 @@
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
+#[derive(Clone, Copy)]
 pub struct CryptoKey(pub [u8; 32]);
 
 impl CryptoKey {

@@ -103,13 +103,46 @@ impl PromptHistory {
     }
 }
 
-/// Local single-line editor state (not readline): a char buffer plus a cursor,
-/// shown in the active pane's tab title while active. Enter submits
-/// `prompt + buffer` to the shell; Esc discards.
+/// Editing keybinding mode. Emacs is the default; Vi runs a minimal normal /
+/// insert split (see `vi_normal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditMode {
+    Emacs,
+    Vi,
+}
+
+/// Shell-token kind for prompt highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum HighlightKind {
+    Plain,
+    Command,
+    Flag,
+    Quoted,
+}
+
+/// A highlighted span of the editing buffer. Indices are char offsets into
+/// the buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct HighlightSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: HighlightKind,
+}
+
+/// Local line editor state (not readline): a char buffer plus a cursor,
+/// shown in the active pane's tab title while active. The buffer is
+/// multiline — `'\n'` is an ordinary buffer char — so cursoring and kills
+/// treat line boundaries explicitly. Enter submits `prompt + buffer` to the
+/// shell; Esc discards.
 pub struct EditingState {
     buffer: Vec<char>,
     cursor: usize,
     prompt: String,
+    mode: EditMode,
+    vi_normal: bool,
+    vi_d_pending: bool,
 }
 
 impl EditingState {
@@ -121,6 +154,9 @@ impl EditingState {
             buffer,
             cursor,
             prompt: String::new(),
+            mode: EditMode::Emacs,
+            vi_normal: false,
+            vi_d_pending: false,
         }
     }
 
@@ -128,9 +164,20 @@ impl EditingState {
         self.buffer.is_empty()
     }
 
-    /// Truncate the buffer to the cursor (readline C-k "kill to end").
+    /// Kill text after the cursor on the current line (readline C-k). When
+    /// the cursor already sits at the end of the line, kill the rest of the
+    /// buffer instead (zsh-style fallback).
     pub fn truncate_to_cursor(&mut self) {
-        self.buffer.truncate(self.cursor);
+        let i = self.cursor.min(self.buffer.len());
+        let end = self.line_end(i);
+        if end > i {
+            // Text after the cursor on this line: drop it, keep the trailing
+            // newline and any following lines.
+            self.buffer.drain(i..end);
+        } else {
+            // Cursor at the line end: kill everything after it.
+            self.buffer.truncate(i);
+        }
     }
 
     pub fn insert(&mut self, c: char) {
@@ -160,11 +207,34 @@ impl EditingState {
     }
 
     pub fn home(&mut self) {
-        self.cursor = 0;
+        self.cursor = self.line_start(self.cursor);
     }
 
     pub fn end(&mut self) {
-        self.cursor = self.buffer.len();
+        self.cursor = self.line_end(self.cursor);
+    }
+
+    /// Char offset of the start of the line containing `col`.
+    fn line_start(&self, col: usize) -> usize {
+        let i = col.min(self.buffer.len());
+        self.buffer[..i]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |p| p + 1)
+    }
+
+    /// Char offset of the end of the line containing `col` (before the next
+    /// newline, or the buffer end). When `col` points at a newline, the line
+    /// ends there.
+    fn line_end(&self, col: usize) -> usize {
+        let i = col.min(self.buffer.len());
+        if self.buffer.get(i) == Some(&'\n') {
+            return i;
+        }
+        self.buffer[i..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(self.buffer.len(), |off| i + off)
     }
 
     /// Start of the current or previous word (readline M-b).
@@ -241,12 +311,28 @@ impl EditingState {
 
     /// Tab-title rendering: prompt + buffer with a block cursor at the edit
     /// position, optionally followed by a ghost suffix (pending completion).
+    /// Embedded newlines render as the visible escape `\n` (one line fits the
+    /// tab title). Vi-normal mode tags the title `[vi]`.
     pub fn display_with_suffix(&self, suffix: &str) -> String {
-        let mut s = String::from("[edit] ");
+        let mut s = if self.mode == EditMode::Vi && self.vi_normal {
+            String::from("[vi] ")
+        } else {
+            String::from("[edit] ")
+        };
         s.push_str(&self.prompt);
-        s.extend(self.buffer[..self.cursor].iter());
-        s.push('▌');
-        s.extend(self.buffer[self.cursor..].iter());
+        for (i, c) in self.buffer.iter().enumerate() {
+            if i == self.cursor {
+                s.push('▌');
+            }
+            if *c == '\n' {
+                s.push_str("\\n");
+            } else {
+                s.push(*c);
+            }
+        }
+        if self.cursor == self.buffer.len() {
+            s.push('▌');
+        }
         s.push_str(suffix);
         s
     }
@@ -255,6 +341,115 @@ impl EditingState {
     /// position.
     pub fn display(&self) -> String {
         self.display_with_suffix("")
+    }
+
+    /// Current editing mode.
+    pub fn mode(&self) -> EditMode {
+        self.mode
+    }
+
+    /// Flip Emacs <-> Vi. Entering Vi starts in normal mode; leaving it resets
+    /// any pending vi command prefix.
+    pub fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            EditMode::Emacs => EditMode::Vi,
+            EditMode::Vi => EditMode::Emacs,
+        };
+        self.vi_normal = self.mode == EditMode::Vi;
+        self.vi_d_pending = false;
+    }
+
+    /// Whether Vi-normal mode is active (motions instead of text input).
+    pub fn vi_normal(&self) -> bool {
+        self.vi_normal
+    }
+
+    pub fn set_vi_normal(&mut self, normal: bool) {
+        self.vi_normal = normal;
+        if !normal {
+            self.vi_d_pending = false;
+        }
+    }
+
+    /// Whether a `d` in Vi-normal mode is waiting for a second `d`.
+    pub fn vi_d_pending(&self) -> bool {
+        self.vi_d_pending
+    }
+
+    pub fn set_vi_d_pending(&mut self, pending: bool) {
+        self.vi_d_pending = pending;
+    }
+
+    /// Cheap shell-token spans for the current buffer: the first word is the
+    /// command, `-`/`--`-prefixed tokens are flags, and single/double-quoted
+    /// strings (closed or not) are quoted; Plain spans cover the gaps so the
+    /// whole buffer is covered.
+    /// ponytail: pure fn, not yet consumed — the tab-title renderer draws
+    /// plain text only. Wire it in when titles gain markup.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn highlight(&self) -> Vec<HighlightSpan> {
+        let mut spans = Vec::new();
+        let mut i = 0;
+        while i < self.buffer.len() {
+            let c = self.buffer[i];
+            if c.is_whitespace() {
+                let start = i;
+                while i < self.buffer.len() && self.buffer[i].is_whitespace() {
+                    i += 1;
+                }
+                spans.push(HighlightSpan {
+                    start,
+                    end: i,
+                    kind: HighlightKind::Plain,
+                });
+            } else if c == '-' {
+                let start = i;
+                i += 1;
+                if i < self.buffer.len() && self.buffer[i] == '-' {
+                    i += 1;
+                }
+                while i < self.buffer.len() && !self.buffer[i].is_whitespace() {
+                    i += 1;
+                }
+                spans.push(HighlightSpan {
+                    start,
+                    end: i,
+                    kind: HighlightKind::Flag,
+                });
+            } else if c == '\'' || c == '"' {
+                let start = i;
+                let quote = c;
+                i += 1;
+                while i < self.buffer.len() && self.buffer[i] != quote {
+                    i += 1;
+                }
+                if i < self.buffer.len() {
+                    i += 1; // closing quote
+                }
+                spans.push(HighlightSpan {
+                    start,
+                    end: i,
+                    kind: HighlightKind::Quoted,
+                });
+            } else {
+                let start = i;
+                while i < self.buffer.len() && !self.buffer[i].is_whitespace() {
+                    i += 1;
+                }
+                // The very first word is the command; later words are Plain.
+                let kind = if spans.iter().any(|s| s.kind != HighlightKind::Plain) {
+                    HighlightKind::Plain
+                } else {
+                    HighlightKind::Command
+                };
+                spans.push(HighlightSpan {
+                    start,
+                    end: i,
+                    kind,
+                });
+            }
+        }
+        spans
     }
 }
 
@@ -287,7 +482,10 @@ pub fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{word_left, word_right, EditingState, PromptHistory, HISTORY_CAP};
+    use super::{
+        word_left, word_right, EditMode, EditingState, HighlightKind, HighlightSpan, PromptHistory,
+        HISTORY_CAP,
+    };
 
     #[test]
     fn word_movement_bounds() {
@@ -405,5 +603,186 @@ mod tests {
         assert_eq!(h.peek(), None);
         assert_eq!(h.prev("again"), Some("ls".to_string()));
         assert_eq!(h.next(), Some("again".to_string()));
+    }
+
+    #[test]
+    fn multiline_insert_and_cursor_cross_newline() {
+        let mut e = EditingState::from_line("ab");
+        e.insert('\n');
+        e.insert('c');
+        assert_eq!(e.buffer_text(), "ab\nc");
+        assert_eq!(e.line(), "ab\nc");
+        // Cursor at the end (4); walk left across the newline.
+        e.left();
+        e.left();
+        e.left();
+        assert_eq!(e.line(), "ab\nc");
+        // A backspace right after the newline joins the lines.
+        e.right();
+        e.right();
+        e.backspace();
+        assert_eq!(e.line(), "abc");
+    }
+
+    #[test]
+    fn multiline_home_end_stay_on_current_line() {
+        let mut e = EditingState::from_line("ab\ncd\nef");
+        e.end(); // cursor at buffer end (line "ef")
+        e.left();
+        assert_eq!(e.line(), "ab\ncd\nef");
+        e.home();
+        assert_eq!(e.line(), "ab\ncd\nef");
+        e.insert('X');
+        assert_eq!(e.line(), "ab\ncd\nXef");
+        e.right();
+        e.right();
+        e.end();
+        e.insert('Y');
+        assert_eq!(e.line(), "ab\ncd\nXefY");
+        // Home from the middle of a line goes to that line's start.
+        e.set_line("one\ntwo");
+        e.end();
+        e.left();
+        e.left();
+        e.home();
+        e.insert('!');
+        assert_eq!(e.line(), "one\n!two");
+    }
+
+    #[test]
+    fn multiline_home_end_boundary_at_newline() {
+        let mut e = EditingState::from_line("ab\ncd");
+        // Cursor right before the '\n' (end of line "ab").
+        e.home();
+        e.left();
+        e.end();
+        assert_eq!(e.line(), "ab\ncd");
+        e.insert('Z');
+        assert_eq!(e.line(), "abZ\ncd");
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_line_end_then_rest_of_buffer() {
+        let mut e = EditingState::from_line("ab\ncd\nef");
+        // Cursor onto 'd' (middle line); C-k kills that line's tail only.
+        e.end();
+        e.left();
+        e.left();
+        e.left();
+        e.left();
+        e.truncate_to_cursor();
+        assert_eq!(e.line(), "ab\nc\nef");
+        // Cursor is now at the end of line "c"; C-k kills the buffer tail.
+        e.truncate_to_cursor();
+        assert_eq!(e.line(), "ab\nc");
+    }
+
+    #[test]
+    fn ctrl_k_single_line_matches_old_behavior() {
+        let mut e = EditingState::from_line("hello world");
+        e.home();
+        e.word_right();
+        e.truncate_to_cursor();
+        assert_eq!(e.line(), "hello");
+    }
+
+    #[test]
+    fn display_escapes_newlines_and_tags_vi_mode() {
+        let mut e = EditingState::from_line("a\nb");
+        assert!(e.display().contains("a\\nb"));
+        e.toggle_mode();
+        assert!(e.display().contains("[vi] "));
+        assert!(!e.display().contains("[edit] "));
+        e.toggle_mode();
+        assert!(e.display().contains("[edit] "));
+    }
+
+    #[test]
+    fn highlight_first_word_command_flags_and_quotes() {
+        let e = EditingState::from_line("ls -la 'foo bar'");
+        let spans = e.highlight();
+        assert_eq!(
+            spans,
+            vec![
+                HighlightSpan {
+                    start: 0,
+                    end: 2,
+                    kind: HighlightKind::Command
+                },
+                HighlightSpan {
+                    start: 2,
+                    end: 3,
+                    kind: HighlightKind::Plain
+                },
+                HighlightSpan {
+                    start: 3,
+                    end: 6,
+                    kind: HighlightKind::Flag
+                },
+                HighlightSpan {
+                    start: 6,
+                    end: 7,
+                    kind: HighlightKind::Plain
+                },
+                HighlightSpan {
+                    start: 7,
+                    end: 16,
+                    kind: HighlightKind::Quoted
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn highlight_empty_and_double_quoted_and_unclosed() {
+        let e = EditingState::from_line("");
+        assert!(e.highlight().is_empty());
+        let e = EditingState::from_line("git --stat");
+        assert_eq!(e.highlight()[2].kind, HighlightKind::Flag);
+        assert_eq!(e.highlight()[2].end, e.line().len());
+        // An unterminated quote spans to the end of the buffer.
+        let e = EditingState::from_line("echo \"abc");
+        let spans = e.highlight();
+        assert_eq!(spans[0].kind, HighlightKind::Command);
+        assert_eq!(spans.last().unwrap().kind, HighlightKind::Quoted);
+        assert_eq!(spans.last().unwrap().end, 9);
+    }
+
+    #[test]
+    fn toggle_mode_flips_and_vi_starts_normal() {
+        let mut e = EditingState::from_line("x");
+        assert_eq!(e.mode(), EditMode::Emacs);
+        assert!(!e.vi_normal());
+        e.toggle_mode();
+        assert_eq!(e.mode(), EditMode::Vi);
+        assert!(e.vi_normal());
+        e.set_vi_normal(false);
+        assert!(!e.vi_normal());
+        e.toggle_mode();
+        assert_eq!(e.mode(), EditMode::Emacs);
+        assert!(!e.vi_normal());
+    }
+
+    #[test]
+    fn vi_primitives_move_and_edit() {
+        let mut e = EditingState::from_line("ab\ncd");
+        assert!(!e.vi_normal());
+        e.set_vi_normal(true);
+        assert!(e.vi_normal());
+        // h / l walk the cursor across embedded newlines.
+        e.end();
+        e.left();
+        e.left();
+        e.left();
+        e.home();
+        e.insert('!');
+        assert_eq!(e.line(), "!ab\ncd");
+        // x deletes the char at the cursor (now one past the inserted '!').
+        e.set_vi_normal(false);
+        e.delete();
+        assert_eq!(e.line(), "!b\ncd");
+        // dd clears the line (set_line to empty).
+        e.set_line("");
+        assert!(e.is_empty());
     }
 }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::client::{SyncClient, SyncError};
 use crate::crypto::CryptoKey;
+use crate::store::DocStore;
 
 pub struct SyncDaemon {
     pub server_url: String,
@@ -23,6 +25,13 @@ impl SyncDaemon {
             client: reqwest::Client::new(),
             dirty: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Replace the auto-generated key with a persisted user key so ciphertext
+    /// stays decryptable across restarts.
+    pub fn with_key(mut self, key: CryptoKey) -> Self {
+        self.key = key;
+        self
     }
 
     pub fn mark_dirty(&self) {
@@ -63,6 +72,23 @@ impl SyncDaemon {
 
         info!("Sync: pushed settings");
         Ok(())
+    }
+
+    /// Sync every named document, one `SyncClient::sync` per name.
+    pub async fn sync_all(
+        &self,
+        store: &mut DocStore,
+        names: &[&str],
+    ) -> Vec<Result<(), SyncError>> {
+        if self.server_url.is_empty() {
+            return names.iter().map(|_| Ok(())).collect();
+        }
+        let client = SyncClient::new(self.server_url.clone(), self.key);
+        let mut results = Vec::with_capacity(names.len());
+        for name in names {
+            results.push(client.sync(store, name).await.map(|_| ()));
+        }
+        results
     }
 
     async fn collect_settings(&self) -> Result<Vec<u8>, anyhow::Error> {

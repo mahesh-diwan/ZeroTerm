@@ -36,8 +36,8 @@ use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
 use crate::app::{
-    block_output_text, word_left, word_right, EditingState, HostPicker, PaneState, PromptHistory,
-    PtyCommand, SessionManager,
+    block_output_text, word_left, word_right, EditMode, EditingState, HostPicker, PaneState,
+    PromptHistory, PtyCommand, SessionManager,
 };
 use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
@@ -1232,32 +1232,31 @@ impl App {
 
     /// Handle a key while the line editor is active. Returns true when the key
     /// was consumed by the editor (never forwarded to the shell).
-    fn handle_editing_key(&mut self, code: KeyCode, ctrl: bool, alt: bool) -> bool {
+    fn handle_editing_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
+        // Ctrl+Shift+M toggles the editing mode (Emacs <-> Vi). Free in the
+        // global key dispatch, so it is safe to claim while editing.
+        if ctrl && shift && !alt && code == KeyCode::KeyM {
+            self.editing.as_mut().unwrap().toggle_mode();
+            return true;
+        }
+        // Vi-normal mode interprets its own key subset; Vi-insert and Emacs
+        // behave alike below.
+        if self.editing.as_ref().unwrap().mode() == EditMode::Vi
+            && self.editing.as_ref().unwrap().vi_normal()
+        {
+            return self.handle_editing_key_vi(code, ctrl, alt, shift);
+        }
         match code {
-            KeyCode::Enter => {
-                let state = self
-                    .editing
-                    .take()
-                    .expect("caller guards editing.is_some()");
-                let line = state.line();
-                self.history.push(&line);
-                // Wrap in bracketed paste so readline inserts the buffer
-                // literally (tabs stay tabs, no completion / history
-                // expansion). Falls back to raw bytes when the shell never
-                // enabled it. Empty buffer submits a bare newline.
-                let bracketed = self
-                    .session
-                    .active_pane()
-                    .is_some_and(|p| p.parser.bracketed_paste());
-                let mut data = Vec::new();
-                if bracketed {
-                    data.extend_from_slice(b"\x1b[200~");
+            KeyCode::Enter => self.submit_editor(),
+            KeyCode::Escape => {
+                // In Vi-insert mode Esc returns to normal instead of canceling.
+                let is_vi = self.editing.as_ref().unwrap().mode() == EditMode::Vi;
+                if is_vi {
+                    self.editing.as_mut().unwrap().set_vi_normal(true);
+                } else {
+                    self.editing = None;
                 }
-                data.extend_from_slice(line.as_bytes());
-                data.extend_from_slice(if bracketed { b"\x1b[201~\r\n" } else { b"\r\n" });
-                self.write_pty(&data);
             }
-            KeyCode::Escape => self.editing = None,
             // Word moves and deletes (readline M-b / M-f / M-d / M-backspace).
             KeyCode::KeyB if alt && !ctrl => self.editing.as_mut().unwrap().word_left(),
             KeyCode::KeyF if alt && !ctrl => self.editing.as_mut().unwrap().word_right(),
@@ -1301,6 +1300,90 @@ impl App {
             // text-input path which inserts them into the buffer.
             _ if ctrl || alt => return true,
             _ => return false,
+        }
+        true
+    }
+
+    /// Submit the editor buffer to the shell and push it to history. Wraps
+    /// the line in bracketed paste so readline inserts it literally; falls
+    /// back to raw bytes when the shell never enabled it. An empty buffer
+    /// submits a bare newline. Shared by Emacs-Enter and Vi-Enter.
+    fn submit_editor(&mut self) {
+        let state = self
+            .editing
+            .take()
+            .expect("caller guards editing.is_some()");
+        let line = state.line();
+        self.history.push(&line);
+        let bracketed = self
+            .session
+            .active_pane()
+            .is_some_and(|p| p.parser.bracketed_paste());
+        let mut data = Vec::new();
+        if bracketed {
+            data.extend_from_slice(b"\x1b[200~");
+        }
+        data.extend_from_slice(line.as_bytes());
+        data.extend_from_slice(if bracketed { b"\x1b[201~\r\n" } else { b"\r\n" });
+        self.write_pty(&data);
+    }
+
+    /// Handle a key while Vi-normal mode is active (mode()==Vi &&
+    /// vi_normal()): a minimal motion/delete subset — `i`/`a` enter insert,
+    /// `h`/`l`/arrows move, `0`/`$` move to line start/end, `x` deletes the
+    /// char at the cursor, `d d` clears the line. Everything is consumed so
+    /// plain keys never leak into the buffer; Enter still submits and Ctrl+C
+    /// still cancels.
+    fn handle_editing_key_vi(&mut self, code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> bool {
+        if code == KeyCode::KeyC && ctrl && !alt {
+            self.editing = None;
+            return true;
+        }
+        if ctrl || alt {
+            return true;
+        }
+        // `d` is a two-key prefix: `d d` clears the line.
+        if self.editing.as_ref().unwrap().vi_d_pending() {
+            self.editing.as_mut().unwrap().set_vi_d_pending(false);
+            if code == KeyCode::KeyD {
+                self.editing.as_mut().unwrap().set_line("");
+                return true;
+            }
+        }
+        // Self-borrowing actions first (history / submit) so no editor borrow
+        // is held across them.
+        match code {
+            KeyCode::Enter => {
+                self.submit_editor();
+                return true;
+            }
+            KeyCode::ArrowUp => {
+                self.history_prev();
+                return true;
+            }
+            KeyCode::ArrowDown => {
+                self.history_next();
+                return true;
+            }
+            _ => {}
+        }
+        let state = self.editing.as_mut().unwrap();
+        match code {
+            KeyCode::Escape => {} // already in normal mode
+            KeyCode::KeyI => state.set_vi_normal(false),
+            KeyCode::KeyA => {
+                state.right();
+                state.set_vi_normal(false);
+            }
+            KeyCode::KeyH | KeyCode::ArrowLeft => state.left(),
+            KeyCode::KeyL | KeyCode::ArrowRight => state.right(),
+            KeyCode::Digit0 => state.home(),
+            // `$` is Shift+4 on the US physical layout (no KeyCode::Dollar).
+            KeyCode::Digit4 if shift => state.end(),
+            KeyCode::KeyX => state.delete(),
+            KeyCode::KeyD => state.set_vi_d_pending(true),
+            KeyCode::Backspace => state.backspace(),
+            _ => {}
         }
         true
     }
@@ -2219,7 +2302,9 @@ impl ApplicationHandler for App {
                         // Local line editor: while active, editing keys are
                         // intercepted here and printable text is absorbed in
                         // the text-input path below — nothing reaches the pty.
-                        if self.editing.is_some() && self.handle_editing_key(*code, ctrl, alt) {
+                        if self.editing.is_some()
+                            && self.handle_editing_key(*code, ctrl, shift, alt)
+                        {
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -2930,10 +3015,10 @@ mod tests {
         app.editing = Some(EditingState::from_line("hello world"));
         app.editing.as_mut().unwrap().home();
         app.editing.as_mut().unwrap().word_right();
-        assert!(app.handle_editing_key(KeyCode::KeyK, true, false));
+        assert!(app.handle_editing_key(KeyCode::KeyK, true, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "hello");
         assert!(app.editing.is_some());
-        assert!(app.handle_editing_key(KeyCode::KeyC, true, false));
+        assert!(app.handle_editing_key(KeyCode::KeyC, true, false, false));
         assert!(app.editing.is_none());
     }
 
@@ -2958,21 +3043,21 @@ mod tests {
         app.history.push("echo one");
         app.history.push("echo two");
         // Up recalls the most recent entry; the in-progress line is stashed.
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
         // Down walks forward again.
-        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
         // Ctrl+P / Ctrl+N are the readline chords for Up / Down.
-        assert!(app.handle_editing_key(KeyCode::KeyP, true, false));
+        assert!(app.handle_editing_key(KeyCode::KeyP, true, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
-        assert!(app.handle_editing_key(KeyCode::KeyN, true, false));
+        assert!(app.handle_editing_key(KeyCode::KeyN, true, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
         // Up then Enter submits the recalled line into history.
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
-        assert!(app.handle_editing_key(KeyCode::Enter, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
+        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
         assert!(app.editing.is_none());
         assert_eq!(app.history.len(), 3);
         assert_eq!(
@@ -2988,7 +3073,7 @@ mod tests {
         app.history.push("ls");
         app.history.push("cd /tmp");
         app.editing = Some(EditingState::from_line("cd /tmp"));
-        assert!(app.handle_editing_key(KeyCode::Enter, false, false));
+        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
         assert_eq!(app.history.len(), 2, "repeat of last entry must be a no-op");
     }
 
@@ -2996,9 +3081,9 @@ mod tests {
     fn editing_history_empty_noop() {
         let mut app = App::new();
         app.editing = Some(EditingState::from_line("ls"));
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
-        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false));
+        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
     }
 
@@ -3009,9 +3094,104 @@ mod tests {
         let mut app = App::new();
         app.editing = Some(EditingState::from_line("ab"));
         app.editing.as_mut().unwrap().home();
-        assert!(app.handle_editing_key(KeyCode::Tab, false, false));
+        assert!(app.handle_editing_key(KeyCode::Tab, false, false, false));
         assert_eq!(app.editing.as_ref().unwrap().line(), "\tab");
         assert!(app.ai_completion.is_none());
+    }
+
+    #[test]
+    fn vi_toggle_mode_and_normal_subset() {
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line(""));
+        // Ctrl+Shift+M toggles Emacs -> Vi (normal mode) -> Emacs.
+        assert!(app.handle_editing_key(KeyCode::KeyM, true, true, false));
+        assert_eq!(app.editing.as_ref().unwrap().mode(), EditMode::Vi);
+        assert!(app.editing.as_ref().unwrap().vi_normal());
+        assert!(app.handle_editing_key(KeyCode::KeyM, true, true, false));
+        assert_eq!(app.editing.as_ref().unwrap().mode(), EditMode::Emacs);
+        assert!(!app.editing.as_ref().unwrap().vi_normal());
+    }
+
+    #[test]
+    fn vi_normal_motions_and_insert() {
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line("ab\ncd"));
+        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
+                                                     // `h` / `l` move the cursor; letters in normal mode are swallowed.
+        assert!(app.handle_editing_key(KeyCode::KeyH, false, false, false));
+        assert!(app.handle_editing_key(KeyCode::KeyQ, false, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\ncd");
+        // `0` -> start of the current line (revealed by inserting in insert mode).
+        assert!(app.handle_editing_key(KeyCode::Digit0, false, false, false));
+        app.editing.as_mut().unwrap().set_vi_normal(false);
+        app.editing.as_mut().unwrap().insert('X');
+        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\nXcd");
+        // `$` (Shift+4) -> end of the current line.
+        app.editing.as_mut().unwrap().set_vi_normal(true);
+        app.editing.as_mut().unwrap().set_line("xy\nzw");
+        app.editing.as_mut().unwrap().home();
+        assert!(app.handle_editing_key(KeyCode::Digit4, false, true, false));
+        app.editing.as_mut().unwrap().set_vi_normal(false);
+        app.editing.as_mut().unwrap().insert('Y');
+        assert_eq!(app.editing.as_ref().unwrap().line(), "xy\nzwY");
+        // `x` deletes the char at the cursor.
+        app.editing.as_mut().unwrap().set_vi_normal(true);
+        app.editing.as_mut().unwrap().set_line("ab\ncd");
+        assert!(app.handle_editing_key(KeyCode::KeyH, false, false, false));
+        assert!(app.handle_editing_key(KeyCode::KeyX, false, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\nc");
+        // `dd` clears the line.
+        assert!(app.handle_editing_key(KeyCode::KeyD, false, false, false));
+        assert!(app.handle_editing_key(KeyCode::KeyD, false, false, false));
+        assert!(app.editing.as_ref().unwrap().is_empty());
+        // `i` enters insert mode; a plain key now lands in the buffer.
+        assert!(app.handle_editing_key(KeyCode::KeyI, false, false, false));
+        assert!(!app.editing.as_ref().unwrap().vi_normal());
+        app.editing.as_mut().unwrap().insert('H');
+        assert_eq!(app.editing.as_ref().unwrap().line(), "H");
+        // Esc returns to normal mode; the editor stays open.
+        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
+        assert!(app.editing.as_ref().unwrap().vi_normal());
+        // `a` appends after the cursor: home, then a, then type.
+        app.editing.as_mut().unwrap().set_vi_normal(true);
+        app.editing.as_mut().unwrap().set_line("ab");
+        app.editing.as_mut().unwrap().home();
+        assert!(app.handle_editing_key(KeyCode::KeyA, false, false, false));
+        app.editing.as_mut().unwrap().insert('Z');
+        assert_eq!(app.editing.as_ref().unwrap().line(), "aZb");
+    }
+
+    #[test]
+    fn vi_normal_enter_submits_and_ctrl_c_cancels() {
+        let mut app = App::new();
+        app.history.push("cmd");
+        app.editing = Some(EditingState::from_line("run"));
+        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
+        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
+        assert!(app.editing.is_none(), "Enter submits in Vi-normal too");
+        assert_eq!(app.history.len(), 2);
+
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line("run"));
+        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
+        assert!(app.handle_editing_key(KeyCode::KeyC, true, false, false));
+        assert!(app.editing.is_none(), "Ctrl+C cancels in Vi-normal");
+    }
+
+    #[test]
+    fn vi_escape_returns_to_normal_not_cancel() {
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line("ab"));
+        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
+                                                     // Into insert, then Esc back to normal; editor stays open.
+        assert!(app.handle_editing_key(KeyCode::KeyI, false, false, false));
+        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
+        assert!(app.editing.is_some());
+        assert!(app.editing.as_ref().unwrap().vi_normal());
+        // Emacs mode still cancels on Esc.
+        app.editing.as_mut().unwrap().toggle_mode(); // back to Emacs
+        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
+        assert!(app.editing.is_none());
     }
 
     #[test]
