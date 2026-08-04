@@ -184,28 +184,9 @@ impl GlyphAtlas {
             ..Default::default()
         });
 
-        // Clear atlas to transparent
-        let clear = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &clear,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(ATLAS_SIZE * 4),
-                rows_per_image: Some(ATLAS_SIZE),
-            },
-            wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
-
+        // ponytail: no full-atlas clear. Uninitialized texels are only sampled
+        // at 0.5-texel Linear bleed into *written* glyph neighbors, never far
+        // from a glyph, so skipping the 4MB write_texture saves ~30ms of boot.
         let mut atlas = Self {
             texture,
             view,
@@ -520,7 +501,9 @@ impl Renderer {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            // Native backend only: enumerating every backend (GL/D3D/Metal)
+            // on startup costs ~170ms of adapter probing.
+            backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
 
@@ -548,7 +531,6 @@ impl Renderer {
             found
         }
         .ok_or(RendererError::NoAdapter)?;
-
         let supports_pipeline_cache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
 
         let (device, queue) = adapter

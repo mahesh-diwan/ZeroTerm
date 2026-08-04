@@ -12,3 +12,6 @@ pub use screen::Screen;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unicode;

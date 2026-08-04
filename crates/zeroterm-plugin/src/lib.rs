@@ -11,6 +11,10 @@
 //! [`PluginConfig::max_memory`] (via a `ResourceLimiter`), and every call runs
 //! under a fixed fuel budget, so infinite loops are trapped by the engine.
 
+mod manager;
+
+pub use manager::{github_latest_release, PluginManager, PluginMeta};
+
 use std::path::{Path, PathBuf};
 
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};

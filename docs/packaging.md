@@ -4,11 +4,11 @@ ZeroTerm builds as a single binary: `cargo build --release -p zeroterm`.
 
 ## Artifacts per platform
 
-| Platform | Artifact                                                                                     | Producer                                                                                                    |
-| -------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| Linux    | `zeroterm-<ver>-linux-<arch>.tar.gz`, `ZeroTerm-<arch>.AppImage`, `.deb`, `.rpm`, `.flatpak` | `build-release.sh`, `scripts/make_appimage.sh`, `scripts/build-deb.sh`, `scripts/build-rpm.sh`, flatpak job |
-| macOS    | `ZeroTerm.app` zipped as `zeroterm-<ver>-macos-<arch>.zip`                                   | `scripts/make_macos_app.sh`                                                                                 |
-| Windows  | `zeroterm-<ver>-windows-x86_64.zip`, optional `.msi`                                         | `scripts/package_windows.bat` + `scripts/windows_installer.wxs`                                             |
+| Platform | Artifact                                                                                     | Producer                                                                                                           |
+| -------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Linux    | `zeroterm-<ver>-linux-<arch>.tar.gz`, `ZeroTerm-<arch>.AppImage`, `.deb`, `.rpm`, `.flatpak` | `scripts/package-zstd.sh`, `scripts/make_appimage.sh`, `scripts/build-deb.sh`, `scripts/build-rpm.sh`, flatpak job |
+| macOS    | `ZeroTerm.app` zipped as `zeroterm-<ver>-macos-<arch>.zip`                                   | `scripts/make_macos_app.sh`                                                                                        |
+| Windows  | `zeroterm-<ver>-windows-x86_64.zip`, optional `.msi`                                         | `scripts/package_windows.bat` + `scripts/windows_installer.wxs`                                                    |
 
 ## Auto-update
 

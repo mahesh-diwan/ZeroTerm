@@ -108,12 +108,12 @@ The gate is enforced in CI (`.github/workflows/release.yml`, hard-fail at ≥50 
 
 Where the size comes from (dominant static deps of `zeroterm` + `zeroterm-render`):
 
-| Contributor                                             | Why it's large                                                                            | Notes                                                                        |
-| ------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| **wgpu**                                                | Full WebGPU implementation (Vulkan/Metal/DX12 backends, wgsl validation, shader compiler) | Largest single dep; `wgpu = "23"`. Bigger with `spirv`/glsl feature baggage. |
-| **winit**                                               | Whole windowing stack (X11, Wayland, Cocoa, Windows) in one binary                        | Platform backends all compiled in by default.                                |
-| **swash**                                               | Font shaping/rasterization, glyph outline data                                            | Needed for the glyph atlas; moderate size.                                   |
-| zeroterm-* crates + tokio/mlua/reqwest (workspace deps) | Parser, SSH, plugin runtime (mlua), sync daemon (tokio + crypto), AI client (reqwest)     | Feature-gated deps pull in significant transitive code.                      |
+| Contributor                                             | Why it's large                                                                                                                           | Notes                                                                        |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **wgpu**                                                | Full WebGPU implementation (Vulkan/Metal/DX12 backends, wgsl validation, shader compiler)                                                | Largest single dep; `wgpu = "23"`. Bigger with `spirv`/glsl feature baggage. |
+| **winit**                                               | Whole windowing stack (X11, Wayland, Cocoa, Windows) in one binary                                                                       | Platform backends all compiled in by default.                                |
+| **swash**                                               | Font shaping/rasterization, glyph outline data                                                                                           | Needed for the glyph atlas; moderate size.                                   |
+| zeroterm-* crates + tokio/mlua/reqwest (workspace deps) | Parser, SSH, WASM plugin runtime (wasmtime, feature-gated), Lua config overlay (mlua), sync daemon (tokio + crypto), AI client (reqwest) | Feature-gated deps pull in significant transitive code.                      |
 
 To stay <50MB as features grow, the levers in order of size-impact:
 

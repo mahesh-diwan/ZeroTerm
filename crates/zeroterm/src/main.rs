@@ -14,11 +14,12 @@ use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
 #[cfg(feature = "ai")]
-use zeroterm_ai::client::AiClient;
+use zeroterm_ai::client::{AiClient, AiError};
 use zeroterm_config::{Config, KeybindingsConfig};
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
+use zeroterm_mux::session::{PaneSpec, Session, SessionLayout};
 use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
 #[cfg(feature = "plugins")]
@@ -27,6 +28,9 @@ use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
+use crate::ai_overlay::AiOverlay;
+#[cfg(feature = "ai")]
+use crate::ai_overlay::{explain_prompt, suggest_context, AiKind, AiState};
 #[cfg(feature = "plugins")]
 use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
@@ -39,12 +43,24 @@ use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
 use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
 
+mod ai_overlay;
 mod app;
 mod search;
+// Retained for the legacy session.json format + its tests; session layout
+// persistence now lives in zeroterm-mux (SessionLayout) via save_session_layout().
+#[allow(dead_code)]
 mod session;
 mod settings;
 
 const COPY_MARKER: &str = "[copy]";
+
+fn zt(mark: &str) {
+    if std::env::var("ZTIME").is_ok() {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = *START.get_or_init(std::time::Instant::now);
+        eprintln!("ZTIME {}: {:?}", mark, start.elapsed());
+    }
+}
 
 #[allow(dead_code)]
 struct App {
@@ -82,6 +98,7 @@ struct App {
     settings: SettingsMenu,
     host_picker: HostPicker,
     search: SearchState,
+    ai: AiOverlay,
     sync_active: bool,
     last_sync_clear: std::time::Instant,
     last_anim_frame: std::time::Instant,
@@ -140,6 +157,7 @@ impl App {
             settings: SettingsMenu::new(&SettingsContext::default()),
             host_picker: HostPicker::new(),
             search: SearchState::default(),
+            ai: AiOverlay::default(),
             sync_active: false,
             last_sync_clear: std::time::Instant::now(),
             last_anim_frame: std::time::Instant::now(),
@@ -179,9 +197,11 @@ impl App {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        zt("init start");
         info!("Initializing ZeroTerm");
 
         let (config, config_rx) = Config::load_async(None);
+        zt("config load_async returned");
         info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
         let window_attrs = WindowAttributes::default()
@@ -193,6 +213,7 @@ impl App {
             .with_resizable(true);
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
+        zt("window created");
 
         let font_size = config.font.size;
         self.font_size = font_size;
@@ -208,12 +229,14 @@ impl App {
         let opacity = self.opacity;
         let font_path = config.font.path.clone();
         std::thread::spawn(move || {
+            zt("renderer thread start");
             match pollster::block_on(Renderer::new(window_clone, font_size, opacity, font_path)) {
                 Ok(renderer) => {
                     let _ = render_tx.send(renderer);
                 }
                 Err(e) => error!("Renderer init failed: {}", e),
             }
+            zt("renderer thread done");
         });
         self.renderer_rx = Some(render_rx);
 
@@ -230,6 +253,7 @@ impl App {
 
         let (pty_rx, pty_tx) = {
             let (shell, shell_args, starship_env) = starship_setup(&self.shell, &self.shell_args);
+            zt("starship_setup done");
             let env_refs: Vec<(&str, &str)> =
                 starship_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
             spawn_pty_process(
@@ -241,6 +265,7 @@ impl App {
                 self.wake_proxy(),
             )?
         };
+        zt("pty spawned");
         // Bash's readline advertises `\x1b[?2004h` (bracketed paste) itself; writing it here
         // lands in the pty line discipline pre-readline and leaks as literal `2004h` text.
         // So we do NOT send it — the parser handles the shell's own advertisement.
@@ -271,42 +296,51 @@ impl App {
         self.session.active_pane = 0;
         self.session.next_pane_id = 1;
 
-        let session_path = session::session_file_path();
-        if let Some((records, layout)) = session::load_session(&session_path) {
-            let mut restored_ids = Vec::new();
-            if records.len() > 1 {
-                for record in records.iter().skip(1) {
-                    let cmd = if record.cmd.is_empty() {
-                        shell.clone()
-                    } else {
-                        record.cmd.clone()
-                    };
-                    match spawn_pty_process(&cmd, &[], &[], cols, rows, self.wake_proxy()) {
-                        Ok((pty_rx, pty_tx)) => {
-                            // FIXME(test): startup bracketed-paste probe removed for leak test.
-                            // let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
-                            let id = self.session.next_pane_id;
-                            self.session.next_pane_id += 1;
-                            self.session.panes.insert(
-                                id,
-                                PaneState {
-                                    parser: Parser::new(cols, rows),
-                                    pty_rx,
-                                    pty_tx,
-                                    title: record.title.clone(),
-                                    pane_cmd: cmd,
-                                    pty_dead: false,
-                                },
-                            );
-                            self.session.tabs.push(Tab::new(id));
-                            restored_ids.push(id);
-                        }
-                        Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
+        let layout_path = Config::default_config_path().with_file_name("layout.json");
+        zt("session load start");
+        // Session restore (roadmap 2.1): layout.json from the last clean quit
+        // rebuilds tabs/splits. Pane 0 is the shell spawned above; each further
+        // PaneSpec spawns through the pty layer (never bypassed). A missing or
+        // corrupt file falls back to the single default tab already set up.
+        if let Some(saved) = SessionLayout::restore(&layout_path) {
+            let mut restored_ids = vec![0usize];
+            for spec in saved.panes.iter().skip(1) {
+                let cmd = if spec.cmd.is_empty() {
+                    shell.clone()
+                } else {
+                    spec.cmd.clone()
+                };
+                match spawn_pty_process(&cmd, &[], &[], cols, rows, self.wake_proxy()) {
+                    Ok((pty_rx, pty_tx)) => {
+                        // FIXME(test): startup bracketed-paste probe removed for leak test.
+                        // let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
+                        let id = self.session.next_pane_id;
+                        self.session.next_pane_id += 1;
+                        self.session.panes.insert(
+                            id,
+                            PaneState {
+                                parser: Parser::new(cols, rows),
+                                pty_rx,
+                                pty_tx,
+                                title: spec.title.clone(),
+                                pane_cmd: cmd,
+                                pty_dead: false,
+                            },
+                        );
+                        self.session.tabs.push(Tab::new(id));
+                        restored_ids.push(id);
                     }
+                    Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
                 }
             }
-            if layout.is_some() {
-                self.session.split_root = SplitNode::from_ids(&restored_ids);
+            if let Some(split) = saved.split {
+                // Saved leaf ids are positions into `saved.panes`; remap them
+                // onto the freshly assigned ids so the tree survives the id reset.
+                self.session.split_root = SessionLayout::remap_split(&split, &restored_ids);
+                if saved.active_pane < restored_ids.len() {
+                    self.session.active_pane = restored_ids[saved.active_pane];
+                    self.session.scroll_offset = 0;
+                }
             }
         }
 
@@ -362,11 +396,45 @@ impl App {
             }
         });
 
+        zt("init done (pre-redraw)");
         info!("ZeroTerm initialized: {}x{} ({})", cols, rows, shell);
         if let Some(window) = &self.window {
             window.request_redraw();
         }
         Ok(())
+    }
+
+    /// Serialize the current tabs/splits to layout.json (roadmap 2.1) so the
+    /// next launch can restore them. Pane order is sorted-by-id, so leaf ids in
+    /// the split tree double as positions into the saved pane list.
+    fn save_session_layout(&self) {
+        let path = Config::default_config_path().with_file_name("layout.json");
+        let ids = self.session.pane_ids();
+        let cwd = std::env::current_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let panes: Vec<PaneSpec> = ids
+            .iter()
+            .map(|&id| {
+                let pane = &self.session.panes[&id];
+                PaneSpec {
+                    title: pane.title.clone(),
+                    cmd: pane.pane_cmd.clone(),
+                    cwd: cwd.clone(),
+                }
+            })
+            .collect();
+        let layout = SessionLayout {
+            active_pane: ids
+                .iter()
+                .position(|&i| i == self.session.active_pane)
+                .unwrap_or(0),
+            panes,
+            split: Some(self.session.split_root.clone()),
+        };
+        if let Err(e) = Session::new(0, layout).save(&path) {
+            error!("Failed to save session layout: {}", e);
+        }
     }
 
     fn create_new_tab(&mut self) -> Result<()> {
@@ -702,86 +770,74 @@ impl App {
     }
 
     #[cfg(feature = "ai")]
-    fn ai_explain(&self) {
-        if let Some(ai_client) = &self.ai_client {
-            if let Some(pane) = self.session.panes.get(&self.session.active_pane) {
-                let screen = pane.parser.screen();
-                let mut text = String::new();
-                for row in screen.buffer() {
-                    for cell in row {
-                        text.push(cell.ch);
-                    }
-                    text.push('\n');
-                }
-                let client = ai_client.clone();
-                let tx = pane.pty_tx.clone();
-                std::thread::spawn(move || {
-                    let rt = match tokio::runtime::Runtime::new() {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            let _ = tx.send(PtyCommand::Write(
-                                format!("\r\n\u{1b}[31mRuntime error: {}\u{1b}[0m\r\n", e)
-                                    .into_bytes(),
-                            ));
-                            return;
-                        }
-                    };
-                    match rt.block_on(client.explain(&text)) {
-                        Ok(response) => {
-                            let _ = tx.send(PtyCommand::Write(response.into_bytes()));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(PtyCommand::Write(
-                                format!("\r\n\u{1b}[31mAI error: {}\u{1b}[0m\r\n", e).into_bytes(),
-                            ));
-                        }
-                    }
-                });
-            }
+    fn open_ai(&mut self, kind: AiKind) {
+        let Some(ai_client) = self.ai_client.clone() else {
+            self.ai.open(kind);
+            self.ai.state = AiState::Error(
+                "AI not configured (set ai.endpoint in config, e.g. http://localhost:11434)"
+                    .to_string(),
+            );
+            self.redraw();
+            return;
+        };
+        let Some(prompt) = self.ai_prompt(kind) else {
+            self.ai.open(kind);
+            self.ai.state = AiState::Error("no command context in the current pane".to_string());
+            self.redraw();
+            return;
+        };
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
+            self.ai.save_screen(pane.parser.screen());
         }
+        self.ai.open(kind);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        self.ai.pending = Some(rx);
+        // Fire-and-poll: the request runs on a fresh runtime in a background
+        // thread; the result lands on the channel and is picked up by
+        // AiOverlay::poll from the render loop. Never blocks the window.
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Runtime::new() {
+                Ok(rt) => match kind {
+                    AiKind::Explain => rt.block_on(ai_client.explain(&prompt)),
+                    AiKind::Suggest => rt.block_on(ai_client.suggest(&prompt)),
+                },
+                Err(e) => Err(AiError::RequestFailed(e.to_string())),
+            };
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+        self.redraw();
     }
 
     #[cfg(feature = "ai")]
-    fn ai_suggest(&self) {
-        let Some(ai_client) = &self.ai_client else {
-            warn!("ai_suggest: no AI client configured");
-            return;
-        };
-        let Some(pane) = self.session.panes.get(&self.session.active_pane) else {
-            return;
-        };
-        let blocks = pane.parser.screen().blocks();
-        if blocks.is_empty() {
-            warn!("ai_suggest: no command history");
+    fn ai_prompt(&self, kind: AiKind) -> Option<String> {
+        let screen = self.session.active_pane()?.parser.screen();
+        match kind {
+            AiKind::Explain => explain_prompt(screen),
+            AiKind::Suggest => suggest_context(screen),
+        }
+    }
+
+    fn close_ai(&mut self) {
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
+            self.ai.restore_screen(pane.parser.screen_mut());
+        }
+        self.ai.close();
+        self.redraw();
+    }
+
+    fn draw_ai_overlay(&mut self) {
+        if !self.ai.open {
             return;
         }
-        let history: Vec<&str> = blocks
-            .iter()
-            .rev()
-            .take(10)
-            .map(|b| b.command.as_str())
-            .filter(|c| !c.is_empty())
-            .collect();
-        let history = history.into_iter().rev().collect::<Vec<_>>().join("\n");
-        let client = ai_client.clone();
-        let tx = pane.pty_tx.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!("ai_suggest: runtime error: {}", e);
-                    return;
-                }
-            };
-            match rt.block_on(client.suggest(&history)) {
-                Ok(suggestion) => {
-                    let _ = tx.send(PtyCommand::Write(suggestion.into_bytes()));
-                }
-                Err(e) => {
-                    warn!("ai_suggest: {}", e);
-                }
-            }
-        });
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
+            return;
+        };
+        let (cols, rows) = {
+            let s = pane.parser.screen();
+            (s.size().cols, s.size().rows)
+        };
+        let bytes = self.ai.overlay_bytes(cols, rows);
+        pane.parser.parse(&bytes);
     }
 
     fn drain_pty(&mut self) -> bool {
@@ -895,6 +951,7 @@ impl App {
             let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
         }
         self.renderer = Some(renderer);
+        zt("renderer received on main");
         info!("GPU renderer ready: {}x{}", cols, rows);
     }
 
@@ -916,6 +973,12 @@ impl App {
         }
         if self.settings.open {
             self.draw_settings_overlay();
+        }
+        if self.ai.open {
+            // Fire-and-poll: collect the finished AI result, then redraw the
+            // panel with the response (or error) in this frame.
+            self.ai.poll();
+            self.draw_ai_overlay();
         }
         let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
             return Ok(());
@@ -1895,6 +1958,27 @@ impl App {
                     config.reload(None).ok();
                 }
             }
+            // Concurrent-WIP glue: the settings menu gained Export/Import items
+            // (new notice field) before main.rs was wired. Minimal handlers so
+            // the match stays exhaustive; owner of that feature can refine.
+            SettingsAction::ExportConfig => {
+                let export = Config::default_config_path().with_file_name("zeroterm-export.toml");
+                let ok = self
+                    .config
+                    .as_ref()
+                    .is_some_and(|c| c.save(Some(&export)).is_ok());
+                self.settings.notice = Some(if ok {
+                    format!("Exported to {}", export.display())
+                } else {
+                    "Export failed".to_string()
+                });
+            }
+            SettingsAction::ImportConfig => {
+                if let Some(config) = &mut self.config {
+                    config.reload(None).ok();
+                }
+                self.settings.notice = Some("Config reloaded".to_string());
+            }
         }
         self.apply_config_to_renderer();
         self.draw_settings_overlay();
@@ -1920,13 +2004,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested");
-                if let Err(e) = session::save_session(
-                    &session::session_file_path(),
-                    &self.session.panes,
-                    Some(&self.session.split_root),
-                ) {
-                    error!("Failed to save session: {}", e);
-                }
+                self.save_session_layout();
                 for (_, pane) in &self.session.panes {
                     let _ = pane.pty_tx.send(PtyCommand::Kill);
                 }
@@ -1986,6 +2064,20 @@ impl ApplicationHandler for App {
                             }
                             self.search_apply();
                         }
+                    }
+                    return;
+                }
+
+                // AI overlay: while open, Escape or the toggle keys close it.
+                if self.ai.open {
+                    match &event.physical_key {
+                        PhysicalKey::Code(code) => match code {
+                            KeyCode::Escape => self.close_ai(),
+                            KeyCode::KeyI if ctrl && shift => self.close_ai(),
+                            KeyCode::KeyA if ctrl && shift => self.close_ai(),
+                            _ => {}
+                        },
+                        _ => {}
                     }
                     return;
                 }
@@ -2072,12 +2164,12 @@ impl ApplicationHandler for App {
                         }
                         #[cfg(feature = "ai")]
                         if ctrl && shift && !alt && *code == KeyCode::KeyI {
-                            self.ai_explain();
+                            self.open_ai(AiKind::Explain);
                             return;
                         }
                         #[cfg(feature = "ai")]
                         if ctrl && shift && !alt && *code == KeyCode::KeyA {
-                            self.ai_suggest();
+                            self.open_ai(AiKind::Suggest);
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyO {
@@ -2656,11 +2748,14 @@ fn main() -> Result<()> {
     }
 
     info!("Starting ZeroTerm v{}", env!("CARGO_PKG_VERSION"));
+    zt("main start");
 
     let event_loop = EventLoop::new()?;
+    zt("event loop created");
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new();
+    zt("app created");
     app.event_proxy = Some(event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
 

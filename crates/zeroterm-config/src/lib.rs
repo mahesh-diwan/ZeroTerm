@@ -5,6 +5,7 @@ pub mod gui;
 pub mod lua;
 
 pub use config::{Config, KeybindingsConfig};
+pub use gui::{SettingEntry, SettingsState};
 
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,6 @@
 # ZeroTerm Architecture
 
-GPU-accelerated terminal emulator in Rust. Workspace of 8 crates under
+GPU-accelerated terminal emulator in Rust. Workspace of 9 crates under
 `crates/`, a single binary in `crates/zeroterm`.
 
 ## Crate Layout
@@ -14,6 +14,7 @@ crates/
 ├── zeroterm-ai        — Ollama/LM Studio client (explain)
 ├── zeroterm-sync      — E2E encrypted settings sync daemon
 ├── zeroterm-ssh       — native SSH client (libssh2)
+├── zeroterm-plugin    — wasmtime/WASI sandboxed plugin runtime (stdio ABI)
 └── zeroterm           — main binary: event loop, PTY threads, wiring
 ```
 
@@ -83,6 +84,28 @@ then applies attribute effects:
 Glyphs are packed into a 1024² atlas on demand (`swash` rasterizer); ASCII is
 pre-packed at init. Cell metrics come from font ascent/descent/leading.
 
+## Rendering Pipeline
+
+`zeroterm-render` draws the frame as a sequence of passes, each ending in a
+`end_frame` submit/present. The GUI thread calls these in order every redraw:
+
+```
+draw_background(color)   — clear the whole surface to the background color
+render_screen(screen, …) — the instanced cell grid (the pass above)
+draw_tab_bar(tabs)       — tab strip with active/hover states + close buttons
+draw_status_bar(left, right) — bottom status line
+draw_scrollbar(screen, …) — overlay scrollbar thumb/track
+end_frame()              — submit the pass command buffers and present
+```
+
+Every pass is a separate wgpu render pass with its own shader bindings, so the
+bar passes (tab/status/scrollbar) reuse the same glyph pipeline with their own
+vertex data. Each pass sets a per-pass `viewport_origin` uniform (`[f32; 2]`,
+`renderer.rs`); for the grid pass it is the scrolled window's origin in cell
+space plus padding, letting `render_screen` draw only the visible window of the
+scrollback. `render_screen` is the only pass that reads `Screen` state; the UI
+bar passes take plain slices (`&[TabInfo]`, `&str`).
+
 ## Block Tracking
 
 The parser recognizes command boundaries: when a line starts with a prompt
@@ -147,3 +170,11 @@ non-fatal (warn and continue).
 - **zeroterm-ssh** — libssh2 (`ssh2`) session; password, key-file, or agent
   auth; execs `$SHELL` on a channel and bridges reads/writes/resizes to the same
   `PtyCommand` protocol as local PTYs.
+- **zeroterm-plugin** — wasmtime + WASI (`wasm32-wasip1`) command modules. A
+  plugin imports `wasi_snapshot_preview1`, exports `_start`, reads input from
+  WASI stdin, writes its result to WASI stdout — no linear-memory pointer ABI.
+  `PluginHost` owns the shared engine; each `.wasm` loads once and runs in a
+  fresh `Store` per call (stateless). Bounds: `max_memory` (16 MiB), fixed fuel
+  budget per call (infinite loops trap), optional read-only `wasi_dir` preopen,
+  `max_output` (1 MiB) stdout cap. Loaded plugins run via `Ctrl+Shift+B`.
+  See [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md).

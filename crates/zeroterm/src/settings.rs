@@ -40,6 +40,8 @@ pub enum SettingsAction {
     ToggleTheme,
     CycleTheme,
     ReloadConfig,
+    ExportConfig,
+    ImportConfig,
     Close,
 }
 
@@ -62,6 +64,8 @@ pub struct SettingsMenu {
     pub open: bool,
     pub items: Vec<SettingsItem>,
     pub cursor: usize,
+    /// One-shot status line shown at the bottom (e.g. export/import result).
+    pub notice: Option<String>,
     saved_cells: Option<Vec<Vec<Cell>>>,
     saved_top: Option<usize>,
     saved_cursor: Option<Cursor>,
@@ -107,6 +111,16 @@ impl SettingsMenu {
                 action: SettingsAction::ReloadConfig,
             },
             SettingsItem {
+                label: "Export Config".into(),
+                value: String::new(),
+                action: SettingsAction::ExportConfig,
+            },
+            SettingsItem {
+                label: "Import Config".into(),
+                value: String::new(),
+                action: SettingsAction::ImportConfig,
+            },
+            SettingsItem {
                 label: "Close".into(),
                 value: String::new(),
                 action: SettingsAction::Close,
@@ -121,6 +135,7 @@ impl SettingsMenu {
         self.open = !self.open;
         if self.open {
             self.cursor = 0;
+            self.notice = None;
         }
     }
 
@@ -166,7 +181,7 @@ impl SettingsMenu {
     }
 
     fn panel_lines(&self) -> Vec<String> {
-        let mut lines = Vec::with_capacity(self.items.len() + 2);
+        let mut lines = Vec::with_capacity(self.items.len() + 3);
         lines.push(" ZeroTerm Settings ".to_string());
         for (i, item) in self.items.iter().enumerate() {
             let marker = if i == self.cursor { '>' } else { ' ' };
@@ -176,6 +191,9 @@ impl SettingsMenu {
                 format!("  {}", item.value)
             };
             lines.push(format!(" {} {}{}", marker, item.label, value));
+        }
+        if let Some(notice) = &self.notice {
+            lines.push(format!(" {}", notice));
         }
         lines.push(" arrows: navigate  enter: activate  esc: close ".to_string());
         lines

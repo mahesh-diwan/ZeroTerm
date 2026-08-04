@@ -88,6 +88,10 @@ Target: `crates/zeroterm/src/app/{mod,session,chrome,input,extensions}.rs` (note
 - [x] rounded selection corners — REJECTED (zero precedent in any terminal; conflicts with instanced-quad model + half-px seam fix)
 - [~] window transparency + blur — PARTIAL: opacity already existed (config.window.opacity, cycle_opacity); blur/blur_radius config fields added (defaults off) but renderer has NO blur pass yet
 
+## v1.0 perf gates (bench-v10.sh, release/fat-LTO)
+
+- [~] Cold <200ms / warm <50ms / RSS <50MB — MEASURED FAIL, HONESTLY DOCUMENTED. Release bench: cold 217-327ms (run-to-run jitter), warm 218ms, RSS 63.7MB. Root cause (ZTIME profile): 100% of cold-start is Renderer::new = request_adapter (107-182ms Vulkan init) + request_device + first shader/pipeline compile + glyph atlas — a hard GPU/driver floor. 50MB RSS = wgpu/Vulkan baseline; 50ms warm = unattainable with GPU re-init. Two honest wins applied: `wgpu::Backends::PRIMARY` (enumerating all backends cost ~170ms probe; now 107ms) and removed the full 4MB atlas clear from GlyphAtlas::new (29.8→0.9ms). DECIDED NOT to add pre-parse/deferred-init complexity for demo numbers. All temp ZTIME instrumentation stripped; tree green (240 tests/clippy/fmt). Revisit only if a real user reports slow startup.
+
 ## Execution order chosen
 
 1. Track D1 themes — DONE

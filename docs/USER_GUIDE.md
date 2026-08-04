@@ -37,17 +37,23 @@ directory. See the config reference.
 ## Features
 
 - **GPU rendering** — wgpu instanced quads, dynamic glyph atlas, true font metrics
-- **Tabs & splits** — tiling pane tree per session, keyboard-driven navigation
+- **Tabs & splits** — tiling pane tree per session, keyboard-driven navigation,
+  drag-resizable dividers, floating overlay pane
 - **Block output tracking** — every prompt line starts a block; dividers show exit
   code and wall-clock duration, with one-click block copy
-- **Scrollback** — 10,000-line buffer, Shift+PageUp/Home navigation
-- **Clipboard** — OSC 52 read/write, native copy/paste, selection copy
+- **Scrollback** — 10,000-line buffer; Shift+PageUp/Home navigation with smooth
+  velocity-based scrolling
+- **Search overlay** — `Ctrl+Shift+F`, in-terminal regex search across the screen
+- **Clipboard** — OSC 52 read/write, native copy/paste, copy-on-select
+- **URL detection** — URLs are highlighted inline; hover/copy affordances
 - **Local AI** — `Ctrl+Shift+I` asks an Ollama/LM Studio endpoint to explain the
   current screen
 - **SSH sessions** — native SSH client, one key to connect to a configured host
 - **Settings sync** — E2E encrypted (ChaCha20-Poly1305) push/pull of config
+- **Plugins** — sandboxed WASM/WASI command plugins (see [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md))
 - **Session restore** — tabs/panes are re-spawned on next launch
 - **Transparency** — cycle window opacity, persisted per config
+- **Quake mode** — `F12` toggles a full-width drop-down window over your desktop
 
 ## Keyboard Shortcuts
 
@@ -60,17 +66,25 @@ directory. See the config reference.
 | `Alt+1` … `Alt+9`   | Switch to tab 1-9              |
 | `Ctrl+Shift+E`      | Split pane vertically          |
 | `Ctrl+Shift+D`      | Split pane horizontally        |
+| `Ctrl+Shift+G`      | Float active pane (overlay)    |
 | `Alt+Arrow`         | Focus adjacent pane            |
+| `Ctrl+Shift+F`      | Toggle search overlay          |
+| `Esc`               | Close search overlay           |
 | `Ctrl+Shift+I`      | Ask local AI to explain screen |
 | `Ctrl+Shift+O`      | Cycle window opacity           |
 | `Ctrl+Shift+S`      | Connect SSH (config.ssh.host)  |
 | `Ctrl+Shift+C`      | Copy selection                 |
 | `Ctrl+Shift+V`      | Paste (honors bracketed paste) |
+| `F12`               | Toggle quake mode              |
 | `Ctrl+A` … `Ctrl+Z` | Send control char to shell     |
 | `Ctrl+Space`        | Send NUL (0x00)                |
 | `Shift+PageUp/Down` | Scroll back/forward 20 lines   |
 | `Shift+Home`        | Jump to oldest scrollback      |
 | `Shift+End`         | Jump to latest output          |
+
+> **Scroll gotcha:** a _plain_ `PageUp`/`PageDown`/`Home`/`End` is forwarded to
+> the shell as an escape sequence (for `less`, `vim`, etc.). Only the `Shift`
+> variants scroll the ZeroTerm scrollback.
 
 > `Ctrl+Shift+Z` (fullscreen) and zoom are listed in README but not yet bound.
 > Move-tab bindings are also pending.
@@ -90,6 +104,47 @@ $ ·────────────── [copy]exit:0 · 3421ms
 - **Metadata** — exit code and duration of the block above, right-aligned.
 - **Copy block** — click the `[copy]` marker at the far right of a divider to
   copy that block's command + output to the clipboard.
+- **Jump between blocks** — `Ctrl+Shift+J` / `Ctrl+Shift+K` move to the next /
+  previous block boundary.
+
+## Search Overlay
+
+`Ctrl+Shift+F` opens an in-terminal search box. Type a query; matches are
+highlighted across the screen and scrollback, and the view jumps to the first
+hit. `Enter` steps forward, `Shift+Enter` backward, `Esc` (or `Ctrl+Shift+F`
+again) closes and returns to the shell.
+
+## Selection & Copy
+
+- **Copy-on-select** — dragging to select text copies it to the clipboard on
+  mouse release. `Ctrl+Shift+C` re-copies the current selection.
+- **Selection extend** — hold `Shift` while pressing arrow keys to extend the
+  selection.
+- Selection is disabled while the foreground app has mouse tracking (e.g.
+  `vim`/`htop`); it copies whatever was selected beforehand.
+
+## URLs
+
+URLs (`http(s)://`, `ftp://`, `www.`) in terminal output are detected and
+highlighted inline as you type, across both the visible screen and scrollback.
+Highlighting only — there is no click-to-open yet; copy the URL with selection
+and paste it into your browser.
+
+## Tabs & Splits
+
+- **Modern tab bar** — a GPU-rendered tab strip above the grid. Hovering a tab
+  reveals a close (`×`) button; click it to close, click the tab body to switch.
+- **Split panes** — `Ctrl+Shift+E` (vertical) and `Ctrl+Shift+D` (horizontal)
+  split the active pane. Drag any divider to resize the adjacent panes.
+- **Floating pane** — `Ctrl+Shift+G` pops the active pane out of the tree as a
+  fullscreen overlay; pressing it again docks it back. One pane floats at a
+  time.
+
+## Quake Mode
+
+`F12` toggles quake mode: the window snaps to a full-width, drop-down bar
+anchored to the top of the screen, overlay-style. Press `F12` again to restore
+the normal windowed position.
 
 ## FAQ
 
