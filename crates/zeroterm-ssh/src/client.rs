@@ -217,6 +217,14 @@ impl SshSession {
         drop(self.session.take());
         Ok(())
     }
+
+    /// Bound the blocking read/write calls so an idle SSH channel returns
+    /// WouldBlock/TimedOut instead of hanging the caller forever.
+    pub fn set_timeout(&mut self, timeout_ms: u32) {
+        if let Some(ref session) = self.session {
+            session.set_timeout(timeout_ms);
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -251,4 +259,6 @@ impl SshSession {
     pub fn disconnect(&mut self) -> Result<()> {
         Ok(())
     }
+
+    pub fn set_timeout(&mut self, _timeout_ms: u32) {}
 }

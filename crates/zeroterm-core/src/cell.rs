@@ -11,6 +11,9 @@ pub struct Color {
 }
 
 impl Color {
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b }
+    }
     pub const DEFAULT_FG: Color = Color {
         r: 0xe0,
         g: 0xe0,

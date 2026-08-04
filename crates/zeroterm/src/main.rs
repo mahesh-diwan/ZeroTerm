@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,443 +13,80 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
+#[cfg(feature = "ai")]
 use zeroterm_ai::client::AiClient;
 use zeroterm_config::{Config, KeybindingsConfig};
-use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::parser::MouseTrackingMode;
-use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
-use zeroterm_core::screen::{CommandBlock, Size as PtySize};
+use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
 use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
-use zeroterm_plugin::{Plugin, PluginConfig, PluginHost};
+#[cfg(feature = "plugins")]
+use zeroterm_plugin::Plugin;
 use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
+#[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
+#[cfg(feature = "plugins")]
+use crate::app::load_plugins;
+#[cfg(all(unix, feature = "ssh"))]
+use crate::app::spawn_ssh_process;
+use crate::app::{
+    block_output_text, word_left, word_right, EditingState, HostPicker, PaneState, PtyCommand,
+    SessionManager,
+};
+use crate::app::{spawn_pty_process, starship_setup};
+use crate::search::SearchState;
 use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
 
+mod app;
+mod search;
 mod session;
 mod settings;
 
 const COPY_MARKER: &str = "[copy]";
 
-fn block_output_text(screen: &zeroterm_core::screen::Screen, block: &CommandBlock) -> String {
-    let buffer = screen.buffer();
-    let last = buffer.len().saturating_sub(1);
-    let end = block
-        .end_line
-        .map_or(last, |e| e.saturating_sub(1))
-        .min(last);
-    let start = block.start_line.min(end);
-    let mut text = String::new();
-    for row in start..=end {
-        if let Some(line) = buffer.get(row) {
-            for cell in line {
-                text.push(cell.ch);
-            }
-        }
-        text.push('\n');
-    }
-    text.trim_end().to_string()
-}
-
-fn word_left(chars: &[char], col: usize) -> usize {
-    let mut i = col.saturating_sub(1);
-    while i > 0 && chars.get(i).is_some_and(|c| c.is_whitespace()) {
-        i -= 1;
-    }
-    while i > 0 && chars.get(i - 1).is_some_and(|c| !c.is_whitespace()) {
-        i -= 1;
-    }
-    i
-}
-
-fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
-    let mut i = col;
-    while i < chars.len() && chars[i].is_whitespace() {
-        i += 1;
-    }
-    if i >= chars.len() {
-        return col;
-    }
-    while i < chars.len() && !chars[i].is_whitespace() {
-        i += 1;
-    }
-    (i - 1).min(cols.saturating_sub(1))
-}
-
-/// Readline word characters: alphanumerics and the underscore.
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Load every `*.wasm` file from `plugins_dir` into a sandboxed [`Plugin`],
-/// keyed by file stem. Load failures are logged, never fatal.
-fn load_plugins(plugins_dir: &Path) -> HashMap<String, Plugin> {
-    let mut plugins = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
-        return plugins;
-    };
-    let host = match PluginHost::new() {
-        Ok(host) => host,
-        Err(e) => {
-            warn!("Plugin host init failed: {}", e);
-            return plugins;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
-            continue;
-        };
-        let config = PluginConfig {
-            name: name.clone(),
-            ..PluginConfig::default()
-        };
-        match host.load(&path, config) {
-            Ok(plugin) => {
-                info!("Loaded plugin `{}`", name);
-                plugins.insert(name, plugin);
-            }
-            Err(e) => error!("Failed to load plugin `{}`: {}", name, e),
-        }
-    }
-    plugins
-}
-
-enum PtyCommand {
-    Write(Vec<u8>),
-    Resize(PtySize),
-    Kill,
-}
-
-struct PaneState {
-    parser: Parser,
-    pty_rx: Receiver<Vec<u8>>,
-    pty_tx: Sender<PtyCommand>,
-    title: String,
-    pane_cmd: String,
-    pty_dead: bool,
-}
-impl PaneState {
-    /// Drain available pty output into the parser. Returns true if any bytes
-    /// were parsed. Marks the pane dead once the pty channel disconnects so a
-    /// dead pane is never drained twice (this is what stops the exit notice
-    /// from being re-appended to the buffer on every subsequent drain call).
-    fn drain(&mut self) -> bool {
-        if self.pty_dead {
-            return false;
-        }
-        let mut got = false;
-        loop {
-            match self.pty_rx.try_recv() {
-                Ok(data) => {
-                    self.parser.parse(&data);
-                    got = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.pty_dead = true;
-                    break;
-                }
-            }
-        }
-        got
-    }
-}
-
-fn spawn_pty_process(
-    shell: &str,
-    shell_args: &[String],
-    cols: usize,
-    rows: usize,
-    wake: EventLoopProxy<()>,
-) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
-    let shell_refs: Vec<&str> = shell_args.iter().map(|s| s.as_str()).collect();
-    let mut backend = PortablePtyBackend::new()?;
-    let mut process = backend.spawn(shell, &shell_refs, None)?;
-    process.resize(PtySize { cols, rows })?;
-
-    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
-    let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
-
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 65536];
-        loop {
-            while let Ok(cmd) = input_rx.try_recv() {
-                match cmd {
-                    PtyCommand::Write(data) => {
-                        let _ = process.write(&data);
-                    }
-                    PtyCommand::Resize(size) => {
-                        let _ = process.resize(size);
-                    }
-                    PtyCommand::Kill => {
-                        let _ = process.kill();
-                        return;
-                    }
-                }
-            }
-            match process.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if output_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                    let _ = wake.send_event(());
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    Ok((pty_rx, pty_tx))
-}
-
-#[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-fn spawn_ssh_process(
-    host: &str,
-    port: u16,
-    user: &str,
-    password: Option<&str>,
-    key_path: Option<&Path>,
-    cols: usize,
-    rows: usize,
-    wake: EventLoopProxy<()>,
-) -> Result<(Receiver<Vec<u8>>, Sender<PtyCommand>)> {
-    let host = host.to_string();
-    let user = user.to_string();
-    let password = password.map(|s| s.to_string());
-    let key_path = key_path.map(|p| p.to_path_buf());
-
-    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
-    let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
-
-    std::thread::spawn(move || {
-        let mut ssh = zeroterm_ssh::client::SshSession::new();
-        if let Err(e) = ssh.connect(&host, port, &user, password.as_deref(), key_path.as_deref()) {
-            let _ = output_tx.send(format!("\r\n\x1b[31mSSH: {}\x1b[0m\r\n", e).into_bytes());
-            let _ = wake.send_event(());
-            return;
-        }
-        if let Err(e) = ssh.resize(cols as u32, rows as u32) {
-            let _ =
-                output_tx.send(format!("\r\n\x1b[31mSSH resize: {}\x1b[0m\r\n", e).into_bytes());
-            let _ = wake.send_event(());
-        }
-
-        let mut buf = [0u8; 65536];
-        loop {
-            while let Ok(cmd) = input_rx.try_recv() {
-                match cmd {
-                    PtyCommand::Write(data) => {
-                        if ssh.write(&data).is_err() {
-                            return;
-                        }
-                    }
-                    PtyCommand::Resize(size) => {
-                        let _ = ssh.resize(size.cols as u32, size.rows as u32);
-                    }
-                    PtyCommand::Kill => {
-                        let _ = ssh.disconnect();
-                        return;
-                    }
-                }
-            }
-            match ssh.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if output_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                    let _ = wake.send_event(());
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = ssh.disconnect();
-    });
-
-    Ok((pty_rx, pty_tx))
-}
-
-/// SSH host picker overlay, drawn into the active pane like the settings menu.
-/// Destructive to covered cells, so the region is snapshotted on open and
-/// restored on close (same pattern as settings.rs).
-struct HostPicker {
-    open: bool,
-    aliases: Vec<String>,
-    cursor: usize,
-    saved_cells: Option<Vec<Vec<Cell>>>,
-    saved_top: Option<usize>,
-    saved_cursor: Option<Cursor>,
-}
-
-impl HostPicker {
-    fn new() -> Self {
-        Self {
-            open: false,
-            aliases: Vec::new(),
-            cursor: 0,
-            saved_cells: None,
-            saved_top: None,
-            saved_cursor: None,
-        }
-    }
-
-    fn open(&mut self, aliases: Vec<String>) {
-        self.aliases = aliases;
-        self.cursor = 0;
-        self.open = true;
-    }
-
-    fn next(&mut self) {
-        if !self.aliases.is_empty() {
-            self.cursor = (self.cursor + 1) % self.aliases.len();
-        }
-    }
-
-    fn prev(&mut self) {
-        if !self.aliases.is_empty() {
-            self.cursor = (self.cursor + self.aliases.len() - 1) % self.aliases.len();
-        }
-    }
-
-    fn selected(&self) -> Option<String> {
-        self.aliases.get(self.cursor).cloned()
-    }
-
-    fn panel_lines(&self) -> Vec<String> {
-        let mut lines = vec![" SSH Hosts ".to_string()];
-        for (i, alias) in self.aliases.iter().enumerate() {
-            let marker = if i == self.cursor { '>' } else { ' ' };
-            lines.push(format!(" {} {}", marker, alias));
-        }
-        lines.push(" arrows: navigate  enter: connect  esc: cancel ".to_string());
-        lines
-    }
-
-    fn overlay_rect(&self, cols: usize, rows: usize) -> (usize, usize, usize, usize) {
-        let lines = self.panel_lines();
-        let width = lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(10)
-            .min(cols.saturating_sub(2))
-            .max(2);
-        let height = lines.len().min(rows).max(2);
-        let top = (rows.saturating_sub(height)) / 2;
-        let left = (cols.saturating_sub(width)) / 2;
-        (top, left, height, width)
-    }
-
-    fn overlay_bytes(&self, cols: usize, rows: usize) -> Vec<u8> {
-        let lines = self.panel_lines();
-        let (top, left, height, width) = self.overlay_rect(cols, rows);
-        let panel_bg = (40, 44, 52);
-        let panel_fg = (197, 200, 198);
-        let sel_bg = (61, 89, 171);
-        let sel_fg = (255, 255, 255);
-
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\x1b[?25l");
-        for (i, line) in lines.iter().take(height).enumerate() {
-            let (bg, fg) = if i >= 1 && i - 1 == self.cursor {
-                (sel_bg, sel_fg)
-            } else {
-                (panel_bg, panel_fg)
-            };
-            let text: String = line.chars().take(width).collect();
-            let pad = width.saturating_sub(text.chars().count());
-            out.extend_from_slice(format!("\x1b[{};{}H", top + i + 1, left + 1).as_bytes());
-            out.extend_from_slice(
-                format!(
-                    "\x1b[48;2;{};{};{}m\x1b[38;2;{};{};{}m",
-                    bg.0, bg.1, bg.2, fg.0, fg.1, fg.2
-                )
-                .as_bytes(),
-            );
-            out.extend_from_slice(text.as_bytes());
-            for _ in 0..pad {
-                out.push(b' ');
-            }
-            out.extend_from_slice(b"\x1b[0m");
-        }
-        out
-    }
-
-    fn save_screen(&mut self, screen: &zeroterm_core::screen::Screen) {
-        let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
-        let buf = screen.buffer();
-        self.saved_cells = Some(
-            (0..height)
-                .map(|i| buf.get(top + i).cloned().unwrap_or_default())
-                .collect(),
-        );
-        self.saved_top = Some(top);
-        self.saved_cursor = Some(screen.cursor());
-    }
-
-    fn restore_screen(&mut self, screen: &mut zeroterm_core::screen::Screen) {
-        if let (Some(cells), Some(top), Some(cursor)) =
-            (&self.saved_cells, self.saved_top, &self.saved_cursor)
-        {
-            for (i, row_cells) in cells.iter().enumerate() {
-                screen.set_cells(top + i, row_cells);
-            }
-            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
-            screen.set_cursor_visible(cursor.visible);
-        }
-        self.saved_cells = None;
-        self.saved_top = None;
-        self.saved_cursor = None;
-    }
-}
-
 #[allow(dead_code)]
 struct App {
     window: Option<Arc<Window>>,
+    window_visible: bool,
     renderer: Option<Renderer>,
-    panes: HashMap<usize, PaneState>,
-    active_pane: usize,
-    next_pane_id: usize,
-    tabs: Vec<Tab>,
-    // ponytail: per-pane scroll kept as single field, inactive panes render at offset 0
-    split_root: SplitNode,
-    // ponytail: no mouse hit-testing on the overlay rect; keyboard focus only
-    floating: Option<usize>,
-    // Split divider drag: Some(target) = dragging the divider whose first leaf
-    // is `target`; anchor is the last window-space mouse position.
-    dragging_divider: Option<usize>,
-    divider_anchor: (f32, f32),
+    renderer_rx: Option<Receiver<Renderer>>,
+    session: SessionManager,
     modifiers: ModifiersState,
-    scroll_offset: usize,
     font_size: f32,
     selection: Option<Selection>,
     selecting: bool,
     mouse_pos: (f32, f32),
+    // Tab the mouse is over (None when off the tab bar) + whether it sits on
+    // that tab's close button. Drives pill/close-glyph rendering + click hit-test.
+    hovered_tab: Option<usize>,
+    hovered_tab_close: bool,
+    // Sub-line remainder of pixel-wheel deltas (|fraction| < 1); accumulates
+    // across MouseWheel events so trackpad scrolling glides line-by-line.
+    scroll_fraction: f32,
     clipboard: Option<Clipboard>,
     shell: String,
     shell_args: Vec<String>,
+    #[cfg(feature = "ai")]
     ai_client: Option<Arc<AiClient>>,
+    #[cfg(feature = "sync")]
     sync_daemon: Option<SyncDaemon>,
     config_changed: Arc<AtomicBool>,
     config: Option<Config>,
+    config_rx: Option<std::sync::mpsc::Receiver<Config>>,
     opacity: f64,
     sync_tick: u32,
     cursor_visible: bool,
     font_path: Option<String>,
     settings: SettingsMenu,
     host_picker: HostPicker,
+    search: SearchState,
     sync_active: bool,
     last_sync_clear: std::time::Instant,
     last_anim_frame: std::time::Instant,
     event_proxy: Option<EventLoopProxy<()>>,
+    #[cfg(feature = "plugins")]
     plugins: HashMap<String, Plugin>,
     // Local line editor for the active pane. Some while editing: printable +
     // editing keys are intercepted (not forwarded to the shell) and accumulated
@@ -457,120 +94,16 @@ struct App {
     editing: Option<EditingState>,
 }
 
-/// Local single-line editor state (not readline): a char buffer plus a cursor,
-/// shown in the active pane's tab title while active. Enter submits
-/// `prompt + buffer` to the shell; Esc discards.
-struct EditingState {
-    buffer: Vec<char>,
-    cursor: usize,
-    prompt: String,
-}
-
-impl EditingState {
-    fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-            cursor: 0,
-            prompt: String::new(),
-        }
-    }
-
-    fn insert(&mut self, c: char) {
-        self.buffer.insert(self.cursor, c);
-        self.cursor += 1;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.buffer.remove(self.cursor - 1);
-            self.cursor -= 1;
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.buffer.len() {
-            self.buffer.remove(self.cursor);
-        }
-    }
-
-    fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.buffer.len());
-    }
-
-    fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn end(&mut self) {
-        self.cursor = self.buffer.len();
-    }
-
-    /// Start of the current or previous word (readline M-b).
-    fn word_left(&mut self) {
-        self.cursor = self.word_boundary_backward(self.cursor);
-    }
-
-    /// End of the next word (readline M-f).
-    fn word_right(&mut self) {
-        self.cursor = self.word_boundary_forward(self.cursor);
-    }
-
-    /// Delete the word after the cursor (readline M-d).
-    fn delete_word_after(&mut self) {
-        let end = self.word_boundary_forward(self.cursor);
-        self.buffer.drain(self.cursor..end);
-    }
-
-    /// Delete the word before the cursor (readline M-backspace / M-h).
-    fn delete_word_before(&mut self) {
-        let start = self.word_boundary_backward(self.cursor);
-        self.buffer.drain(start..self.cursor);
-        self.cursor = start;
-    }
-
-    fn word_boundary_backward(&self, col: usize) -> usize {
-        let mut i = col.min(self.buffer.len());
-        while i > 0 && !is_word_char(self.buffer[i - 1]) {
-            i -= 1;
-        }
-        while i > 0 && is_word_char(self.buffer[i - 1]) {
-            i -= 1;
-        }
-        i
-    }
-
-    fn word_boundary_forward(&self, col: usize) -> usize {
-        let mut i = col.min(self.buffer.len());
-        while i < self.buffer.len() && !is_word_char(self.buffer[i]) {
-            i += 1;
-        }
-        while i < self.buffer.len() && is_word_char(self.buffer[i]) {
-            i += 1;
-        }
-        i
-    }
-
-    /// Full line (prompt + buffer), what Enter submits to the shell.
-    fn line(&self) -> String {
-        let mut s = self.prompt.clone();
-        s.extend(self.buffer.iter());
-        s
-    }
-
-    /// Tab-title rendering: prompt + buffer with a block cursor at the edit
-    /// position.
-    fn display(&self) -> String {
-        let mut s = String::from("[edit] ");
-        s.push_str(&self.prompt);
-        s.extend(self.buffer[..self.cursor].iter());
-        s.push('▌');
-        s.extend(self.buffer[self.cursor..].iter());
-        s
-    }
+// Split an accumulated pixel-wheel scroll into whole lines to apply (up/down)
+// plus the sub-line remainder (same sign as the input, |rem| < 1) to carry
+// over to the next wheel event. Renderer only supports integer scroll offsets.
+fn split_scroll_fraction(fraction: f32) -> (usize, usize, f32) {
+    let whole = fraction.trunc() as i32;
+    (
+        whole.max(0) as usize,
+        (-whole).max(0) as usize,
+        fraction - whole as f32,
+    )
 }
 
 #[allow(dead_code)]
@@ -578,45 +111,43 @@ impl App {
     fn new() -> Self {
         Self {
             window: None,
+            window_visible: true,
             renderer: None,
-            panes: HashMap::new(),
-            active_pane: 0,
-            next_pane_id: 1,
-            tabs: Vec::new(),
-            split_root: SplitNode::Leaf(0),
-            floating: None,
-            dragging_divider: None,
-            divider_anchor: (0.0, 0.0),
+            renderer_rx: None,
+            session: SessionManager::new(),
             modifiers: ModifiersState::empty(),
-            scroll_offset: 0,
             font_size: 14.0,
             selection: None,
             selecting: false,
             mouse_pos: (0.0, 0.0),
+            hovered_tab: None,
+            hovered_tab_close: false,
+            scroll_fraction: 0.0,
             clipboard: Clipboard::new().ok(),
             shell: String::new(),
             shell_args: vec![],
+            #[cfg(feature = "ai")]
             ai_client: None,
+            #[cfg(feature = "sync")]
             sync_daemon: None,
             config_changed: Arc::new(AtomicBool::new(false)),
             config: None,
+            config_rx: None,
             opacity: 1.0,
             sync_tick: 0,
             cursor_visible: true,
             font_path: None,
             settings: SettingsMenu::new(&SettingsContext::default()),
             host_picker: HostPicker::new(),
+            search: SearchState::default(),
             sync_active: false,
             last_sync_clear: std::time::Instant::now(),
             last_anim_frame: std::time::Instant::now(),
             event_proxy: None,
+            #[cfg(feature = "plugins")]
             plugins: HashMap::new(),
             editing: None,
         }
-    }
-
-    fn active_pane(&self) -> Option<&PaneState> {
-        self.panes.get(&self.active_pane)
     }
 
     /// Clone of the event-loop proxy for a PTY reader thread. Registered in
@@ -627,12 +158,15 @@ impl App {
             .expect("event_proxy registered in main() before run_app")
     }
 
-    fn active_pane_mut(&mut self) -> Option<&mut PaneState> {
-        self.panes.get_mut(&self.active_pane)
+    /// Request a redraw of the window, if one exists.
+    fn redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     fn update_window_title(&self) {
-        if let Some(pane) = self.active_pane() {
+        if let Some(pane) = self.session.active_pane() {
             let title = pane.parser.screen().title();
             if let Some(window) = &self.window {
                 if title.is_empty() {
@@ -647,7 +181,7 @@ impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         info!("Initializing ZeroTerm");
 
-        let config = Config::load(None).unwrap_or_default();
+        let (config, config_rx) = Config::load_async(None);
         info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
         let window_attrs = WindowAttributes::default()
@@ -663,31 +197,53 @@ impl App {
         let font_size = config.font.size;
         self.font_size = font_size;
         self.opacity = config.window.opacity;
-        let renderer = pollster::block_on(Renderer::new(
-            window.clone(),
-            font_size,
-            self.opacity,
-            config.font.path.clone(),
-        ))?;
         self.font_path = config.font.path.clone();
 
+        // Deferred GPU init (boot speed): renderer builds on a background
+        // thread so the window + PTY appear immediately. check_renderer_ready()
+        // polls render_rx and, once the renderer arrives, resizes panes to the
+        // real measured glyph metrics.
+        let (render_tx, render_rx) = mpsc::channel();
+        let window_clone = window.clone();
+        let opacity = self.opacity;
+        let font_path = config.font.path.clone();
+        std::thread::spawn(move || {
+            match pollster::block_on(Renderer::new(window_clone, font_size, opacity, font_path)) {
+                Ok(renderer) => {
+                    let _ = render_tx.send(renderer);
+                }
+                Err(e) => error!("Renderer init failed: {}", e),
+            }
+        });
+        self.renderer_rx = Some(render_rx);
+
         let size = window.inner_size();
-        // Size parsers from the renderer's *measured* glyph metrics. The old
-        // font_size*0.6 heuristic (8.4px for a 14px font) under-sized the cell,
-        // giving the parser more cols than the renderer's cell buffer holds
-        // (e.g. 119 vs 112 at 1000px) -> update_cell_data wrote past the buffer.
-        let cell = renderer.cell_size();
-        let cols = (size.width as f32 / cell[0]) as usize;
-        let rows = (size.height as f32 / cell[1]) as usize;
+        // Estimate cells until the renderer is ready; check_renderer_ready()
+        // resizes the parser + PTY to the measured glyph metrics.
+        let cols = (((size.width as f32) / 8.4).max(20.0)) as usize;
+        let rows = (((size.height as f32) / 15.0).max(10.0)) as usize;
 
         let shell = config.shell.program.clone();
         let shell_args = config.shell.args.clone();
         self.shell = shell.clone();
         self.shell_args = shell_args.clone();
 
-        let (pty_rx, pty_tx) =
-            spawn_pty_process(&shell, &shell_args, cols, rows, self.wake_proxy())?;
-        let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
+        let (pty_rx, pty_tx) = {
+            let (shell, shell_args, starship_env) = starship_setup(&self.shell, &self.shell_args);
+            let env_refs: Vec<(&str, &str)> =
+                starship_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            spawn_pty_process(
+                &shell,
+                &shell_args,
+                &env_refs,
+                cols,
+                rows,
+                self.wake_proxy(),
+            )?
+        };
+        // Bash's readline advertises `\x1b[?2004h` (bracketed paste) itself; writing it here
+        // lands in the pty line discipline pre-readline and leaks as literal `2004h` text.
+        // So we do NOT send it — the parser handles the shell's own advertisement.
 
         let parser = Parser::new(cols, rows);
         let mut panes = HashMap::new();
@@ -703,6 +259,7 @@ impl App {
             },
         );
 
+        #[cfg(feature = "ai")]
         let ai_client = if config.ai.endpoint.is_empty() {
             None
         } else {
@@ -710,10 +267,9 @@ impl App {
         };
 
         self.window = Some(window);
-        self.renderer = Some(renderer);
-        self.panes = panes;
-        self.active_pane = 0;
-        self.next_pane_id = 1;
+        self.session.panes = panes;
+        self.session.active_pane = 0;
+        self.session.next_pane_id = 1;
 
         let session_path = session::session_file_path();
         if let Some((records, layout)) = session::load_session(&session_path) {
@@ -725,12 +281,13 @@ impl App {
                     } else {
                         record.cmd.clone()
                     };
-                    match spawn_pty_process(&cmd, &[], cols, rows, self.wake_proxy()) {
+                    match spawn_pty_process(&cmd, &[], &[], cols, rows, self.wake_proxy()) {
                         Ok((pty_rx, pty_tx)) => {
-                            let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
-                            let id = self.next_pane_id;
-                            self.next_pane_id += 1;
-                            self.panes.insert(
+                            // FIXME(test): startup bracketed-paste probe removed for leak test.
+                            // let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
+                            let id = self.session.next_pane_id;
+                            self.session.next_pane_id += 1;
+                            self.session.panes.insert(
                                 id,
                                 PaneState {
                                     parser: Parser::new(cols, rows),
@@ -741,7 +298,7 @@ impl App {
                                     pty_dead: false,
                                 },
                             );
-                            self.tabs.push(Tab::new(id));
+                            self.session.tabs.push(Tab::new(id));
                             restored_ids.push(id);
                         }
                         Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
@@ -749,18 +306,25 @@ impl App {
                 }
             }
             if layout.is_some() {
-                self.split_root = SplitNode::from_ids(&restored_ids);
+                self.session.split_root = SplitNode::from_ids(&restored_ids);
             }
         }
 
-        self.ai_client = ai_client;
-        self.sync_daemon = if config.sync.server_url.is_empty() {
-            None
-        } else {
-            Some(SyncDaemon::new(config.sync.server_url.clone()))
-        };
+        #[cfg(feature = "ai")]
+        {
+            self.ai_client = ai_client;
+        }
+        #[cfg(feature = "sync")]
+        {
+            self.sync_daemon = if config.sync.server_url.is_empty() {
+                None
+            } else {
+                Some(SyncDaemon::new(config.sync.server_url.clone()))
+            };
+        }
 
         self.config = Some(config);
+        self.config_rx = Some(config_rx);
 
         let ctx = self.settings_ctx();
         self.settings.refresh(&ctx);
@@ -768,7 +332,10 @@ impl App {
         // Start config file watcher
         let config_path = Config::default_config_path();
         let config_dir = config_path.parent().unwrap().to_path_buf();
-        self.plugins = load_plugins(&config_dir.join("plugins"));
+        #[cfg(feature = "plugins")]
+        {
+            self.plugins = load_plugins(&config_dir.join("plugins"));
+        }
         let changed = self.config_changed.clone();
 
         std::thread::spawn(move || {
@@ -815,12 +382,24 @@ impl App {
             let cols = (size.width as f32 / cell_w) as usize;
             let rows = (size.height as f32 / cell_h) as usize;
 
-            let (pty_rx, pty_tx) =
-                spawn_pty_process(&self.shell, &self.shell_args, cols, rows, self.wake_proxy())?;
+            let (pty_rx, pty_tx) = {
+                let (shell, shell_args, starship_env) =
+                    starship_setup(&self.shell, &self.shell_args);
+                let env_refs: Vec<(&str, &str)> =
+                    starship_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                spawn_pty_process(
+                    &shell,
+                    &shell_args,
+                    &env_refs,
+                    cols,
+                    rows,
+                    self.wake_proxy(),
+                )?
+            };
             let parser = Parser::new(cols, rows);
-            let id = self.next_pane_id;
-            self.next_pane_id += 1;
-            self.panes.insert(
+            let id = self.session.next_pane_id;
+            self.session.next_pane_id += 1;
+            self.session.panes.insert(
                 id,
                 PaneState {
                     parser,
@@ -831,15 +410,15 @@ impl App {
                     pty_dead: false,
                 },
             );
-            self.active_pane = id;
-            self.scroll_offset = 0;
-            self.split_root = SplitNode::Leaf(id);
-            self.tabs.push(Tab::new(id));
+            self.session.active_pane = id;
+            self.session.scroll_offset = 0;
+            self.session.split_root = SplitNode::Leaf(id);
+            self.session.tabs.push(Tab::new(id));
         }
         Ok(())
     }
 
-    fn create_split_pane(&mut self, dir: SplitDir) -> Result<()> {
+    fn create_split_pane(&mut self, _dir: SplitDir) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
             let cell_size = self
@@ -852,12 +431,24 @@ impl App {
             let cols = (size.width as f32 / cell_w) as usize;
             let rows = (size.height as f32 / cell_h) as usize;
 
-            let (pty_rx, pty_tx) =
-                spawn_pty_process(&self.shell, &self.shell_args, cols, rows, self.wake_proxy())?;
+            let (pty_rx, pty_tx) = {
+                let (shell, shell_args, starship_env) =
+                    starship_setup(&self.shell, &self.shell_args);
+                let env_refs: Vec<(&str, &str)> =
+                    starship_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                spawn_pty_process(
+                    &shell,
+                    &shell_args,
+                    &env_refs,
+                    cols,
+                    rows,
+                    self.wake_proxy(),
+                )?
+            };
             let parser = Parser::new(cols, rows);
-            let id = self.next_pane_id;
-            self.next_pane_id += 1;
-            self.panes.insert(
+            let id = self.session.next_pane_id;
+            self.session.next_pane_id += 1;
+            self.session.panes.insert(
                 id,
                 PaneState {
                     parser,
@@ -868,29 +459,38 @@ impl App {
                     pty_dead: false,
                 },
             );
-            let parent = self.active_pane;
-            self.split_root.insert_leaf(id, dir, parent, 0.5);
-            self.active_pane = id;
-            self.scroll_offset = 0;
+            self.session.active_pane = id;
+            self.session.scroll_offset = 0;
             self.resize_panes_to_rects();
         }
         Ok(())
     }
 
     fn close_active_tab(&mut self) {
-        if self.panes.len() <= 1 {
+        self.close_tab(self.session.active_pane);
+    }
+
+    fn close_tab(&mut self, id: usize) {
+        if self.session.panes.len() <= 1 {
             return;
         }
-        let closed = self.active_pane;
-        if let Some(pane) = self.panes.remove(&closed) {
+        let was_active = self.session.active_pane == id;
+        if let Some(pane) = self.session.panes.remove(&id) {
             let _ = pane.pty_tx.send(PtyCommand::Kill);
         }
-        self.split_root.remove_leaf(closed);
-        self.tabs.retain(|t| t.id != closed);
-        let first = *self.panes.keys().next().unwrap_or(&0);
-        self.active_pane = first;
-        self.editing = None;
-        self.scroll_offset = 0;
+        self.session.split_root.remove_leaf(id);
+        self.session.tabs.retain(|t| t.id != id);
+        if self.session.floating == Some(id) {
+            self.session.floating = None;
+        }
+        if was_active {
+            let first = *self.session.panes.keys().next().unwrap_or(&0);
+            self.session.active_pane = first;
+            self.editing = None;
+            self.session.scroll_offset = 0;
+        }
+        self.hovered_tab = None;
+        self.hovered_tab_close = false;
         self.resize_panes_to_rects();
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -899,35 +499,37 @@ impl App {
 
     /// Toggle active pane between split-tree and floating overlay (Ctrl+Shift+F).
     fn toggle_floating_pane(&mut self) {
-        let active = self.active_pane;
-        if self.floating == Some(active) {
+        let active = self.session.active_pane;
+        if self.session.floating == Some(active) {
             // Dock: re-insert at first remaining tree leaf.
             // ponytail: original slot lost (insert_leaf only splits a parent) — root-ish
             // placement is the accepted ceiling.
-            self.floating = None;
-            if !self.split_root.leaves().contains(&active) {
-                let parent = *self.split_root.leaves().first().unwrap_or(&active);
-                self.split_root
+            self.session.floating = None;
+            if !self.session.split_root.leaves().contains(&active) {
+                let parent = *self.session.split_root.leaves().first().unwrap_or(&active);
+                self.session
+                    .split_root
                     .insert_leaf(active, SplitDir::Vertical, parent, 0.5);
             }
             self.resize_panes_to_rects();
         } else {
             // Dock whatever was floating (one float at a time), then float active.
-            if let Some(prev) = self.floating.take() {
-                if !self.split_root.leaves().contains(&prev) {
-                    let parent = *self.split_root.leaves().first().unwrap_or(&prev);
-                    self.split_root
+            if let Some(prev) = self.session.floating.take() {
+                if !self.session.split_root.leaves().contains(&prev) {
+                    let parent = *self.session.split_root.leaves().first().unwrap_or(&prev);
+                    self.session
+                        .split_root
                         .insert_leaf(prev, SplitDir::Vertical, parent, 0.5);
                 }
             }
-            if self.split_root.leaves().len() > 1 {
-                self.split_root.remove_leaf(active);
-                self.floating = Some(active);
+            if self.session.split_root.leaves().len() > 1 {
+                self.session.split_root.remove_leaf(active);
+                self.session.floating = Some(active);
                 self.resize_panes_to_rects();
             } else {
                 // ponytail: last visible pane stays in tree AND floats (overlay wins when
                 // drawn twice); zero visible panes not allowed.
-                self.floating = Some(active);
+                self.session.floating = Some(active);
             }
         }
         let Some(renderer) = &self.renderer else {
@@ -938,10 +540,11 @@ impl App {
         };
         if let Some(window) = &self.window {
             // Resize floating pane to overlay dims so cells don't overflow the box.
-            if let Some(id) = self.floating {
-                if let Some(pane) = self.panes.get_mut(&id) {
+            if let Some(id) = self.session.floating {
+                if let Some(pane) = self.session.panes.get_mut(&id) {
                     let tab_h = renderer.cell_size()[1];
-                    let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+                    let status_h = renderer.status_bar_height();
+                    let content_h = (window.inner_size().height as f32 - tab_h - status_h).max(0.0);
                     let cols = renderer.cols_for(window.inner_size().width as f32 * 0.7);
                     let rows = renderer.rows_for(content_h * 0.7);
                     pane.parser.screen_mut().resize(cols, rows);
@@ -953,96 +556,34 @@ impl App {
     }
 
     fn next_tab(&mut self) {
-        let mut keys: Vec<&usize> = self.panes.keys().collect();
-        keys.sort();
-        if keys.len() <= 1 {
-            return;
-        }
-        let pos = keys
-            .iter()
-            .position(|k| **k == self.active_pane)
-            .unwrap_or(0);
-        let next = (pos + 1) % keys.len();
-        self.active_pane = *keys[next];
-        self.scroll_offset = 0;
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.session.next_tab() {
+            self.redraw();
         }
     }
 
     fn previous_tab(&mut self) {
-        let mut keys: Vec<&usize> = self.panes.keys().collect();
-        keys.sort();
-        if keys.len() <= 1 {
-            return;
-        }
-        let pos = keys
-            .iter()
-            .position(|k| **k == self.active_pane)
-            .unwrap_or(0);
-        let prev = if pos == 0 { keys.len() - 1 } else { pos - 1 };
-        self.active_pane = *keys[prev];
-        self.scroll_offset = 0;
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.session.previous_tab() {
+            self.redraw();
         }
     }
 
     fn switch_to_tab(&mut self, idx: usize) {
-        let mut keys: Vec<&usize> = self.panes.keys().collect();
-        keys.sort();
-        if idx < keys.len() {
-            self.active_pane = *keys[idx];
-            self.scroll_offset = 0;
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        if self.session.switch_to_tab(idx) {
+            self.redraw();
         }
     }
 
     fn compute_split_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
-        self.split_root.compute_rects()
+        self.session.compute_split_rects()
     }
 
     fn focus_adjacent_pane(&mut self, dir: KeyCode) {
-        let rects = self.split_root.compute_rects();
-        if rects.len() <= 1 {
-            return;
-        }
-        let cur = self.active_pane;
-        let cur_rect = match rects.get(&cur) {
-            Some(r) => *r,
-            None => return,
-        };
-        let cx = cur_rect.0 + cur_rect.2 / 2.0;
-        let cy = cur_rect.1 + cur_rect.3 / 2.0;
-        let mut best: Option<(usize, f32)> = None;
-        for (&id, &(x, y, w, h)) in &rects {
-            if id == cur {
-                continue;
-            }
-            let px = x + w / 2.0;
-            let py = y + h / 2.0;
-            let dx = px - cx;
-            let dy = py - cy;
-            let (in_dir, dist) = match dir {
-                KeyCode::ArrowLeft if dx < 0.0 => (true, -dx + dy.abs()),
-                KeyCode::ArrowRight if dx > 0.0 => (true, dx + dy.abs()),
-                KeyCode::ArrowUp if dy < 0.0 => (true, -dy + dx.abs()),
-                KeyCode::ArrowDown if dy > 0.0 => (true, dy + dx.abs()),
-                _ => (false, 0.0),
-            };
-            if in_dir && best.map_or(true, |(_, b)| dist < b) {
-                best = Some((id, dist));
-            }
-        }
-        if let Some((id, _)) = best {
-            self.active_pane = id;
-            self.scroll_offset = 0;
+        if self.session.focus_adjacent_pane(dir) {
+            self.redraw();
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "ssh"))]
     fn connect_ssh(&mut self, host: &str, user: &str, port: u16) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
@@ -1079,9 +620,9 @@ impl App {
                 self.wake_proxy(),
             )?;
             let parser = Parser::new(cols, rows);
-            let id = self.next_pane_id;
-            self.next_pane_id += 1;
-            self.panes.insert(
+            let id = self.session.next_pane_id;
+            self.session.next_pane_id += 1;
+            self.session.panes.insert(
                 id,
                 PaneState {
                     parser,
@@ -1092,23 +633,23 @@ impl App {
                     pty_dead: false,
                 },
             );
-            self.active_pane = id;
-            self.scroll_offset = 0;
-            self.split_root = SplitNode::Leaf(id);
-            self.tabs.push(Tab::new(id));
+            self.session.active_pane = id;
+            self.session.scroll_offset = 0;
+            self.session.split_root = SplitNode::Leaf(id);
+            self.session.tabs.push(Tab::new(id));
         }
         Ok(())
     }
 
     fn open_host_picker(&mut self) {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "ssh"))]
         {
             let aliases = zeroterm_ssh::client::ssh_aliases();
             if aliases.is_empty() {
                 return;
             }
             self.host_picker.open(aliases);
-            if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+            if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
                 self.host_picker.save_screen(pane.parser.screen());
             }
             self.draw_host_picker();
@@ -1116,7 +657,7 @@ impl App {
     }
 
     fn draw_host_picker(&mut self) {
-        let Some(pane) = self.panes.get_mut(&self.active_pane) else {
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
             return;
         };
         let (cols, rows) = {
@@ -1131,7 +672,7 @@ impl App {
     }
 
     fn close_host_picker(&mut self) {
-        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
             self.host_picker.restore_screen(pane.parser.screen_mut());
         }
         self.host_picker.open = false;
@@ -1141,7 +682,7 @@ impl App {
     }
 
     fn pick_host(&mut self) {
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "ssh"))]
         {
             let Some(alias) = self.host_picker.selected() else {
                 self.close_host_picker();
@@ -1160,9 +701,10 @@ impl App {
         }
     }
 
+    #[cfg(feature = "ai")]
     fn ai_explain(&self) {
         if let Some(ai_client) = &self.ai_client {
-            if let Some(pane) = self.panes.get(&self.active_pane) {
+            if let Some(pane) = self.session.panes.get(&self.session.active_pane) {
                 let screen = pane.parser.screen();
                 let mut text = String::new();
                 for row in screen.buffer() {
@@ -1199,12 +741,13 @@ impl App {
         }
     }
 
+    #[cfg(feature = "ai")]
     fn ai_suggest(&self) {
         let Some(ai_client) = &self.ai_client else {
             warn!("ai_suggest: no AI client configured");
             return;
         };
-        let Some(pane) = self.panes.get(&self.active_pane) else {
+        let Some(pane) = self.session.panes.get(&self.session.active_pane) else {
             return;
         };
         let blocks = pane.parser.screen().blocks();
@@ -1243,11 +786,11 @@ impl App {
 
     fn drain_pty(&mut self) -> bool {
         let mut got_data = false;
-        let active = self.active_pane;
+        let active = self.session.active_pane;
         let mut title_changed = None;
         let mut dead_panes = Vec::new();
-        let pane_count = self.panes.len();
-        for (&id, pane) in &mut self.panes {
+        let pane_count = self.session.panes.len();
+        for (&id, pane) in &mut self.session.panes {
             if pane.pty_dead {
                 continue;
             }
@@ -1294,11 +837,11 @@ impl App {
         }
         for id in &dead_panes {
             warn!("Pane {} process exited", id);
-            if self.panes.len() > 1 {
-                self.panes.remove(id);
-                self.split_root.remove_leaf(*id);
-                if self.active_pane == *id {
-                    self.active_pane = *self.panes.keys().next().unwrap_or(&0);
+            if self.session.panes.len() > 1 {
+                self.session.panes.remove(id);
+                self.session.split_root.remove_leaf(*id);
+                if self.session.active_pane == *id {
+                    self.session.active_pane = *self.session.panes.keys().next().unwrap_or(&0);
                     self.editing = None;
                 }
             }
@@ -1321,19 +864,55 @@ impl App {
         self.sync_tick += 1;
         if self.sync_tick >= 300 {
             self.sync_tick = 0;
+            #[cfg(feature = "sync")]
             if let Some(sync) = &self.sync_daemon {
                 sync.mark_dirty();
             }
         }
     }
 
+    fn check_renderer_ready(&mut self) {
+        if self.renderer.is_some() {
+            return;
+        }
+        let Some(rx) = &self.renderer_rx else {
+            return;
+        };
+        let Ok(renderer) = rx.try_recv() else {
+            return;
+        };
+        let Some(window) = &self.window else {
+            self.renderer = Some(renderer);
+            return;
+        };
+        let mut renderer = renderer;
+        let size = window.inner_size();
+        let cols = renderer.cols_for(size.width as f32);
+        let rows = renderer.rows_for(size.height as f32);
+        renderer.resize(size.width, size.height);
+        for pane in self.session.panes.values_mut() {
+            pane.parser.screen_mut().resize(cols, rows);
+            let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+        }
+        self.renderer = Some(renderer);
+        info!("GPU renderer ready: {}x{}", cols, rows);
+    }
+
     fn render(&mut self) -> Result<()> {
+        self.check_renderer_ready();
         if self.config_changed.load(Ordering::SeqCst) {
             self.config_changed.store(false, Ordering::SeqCst);
             if let Some(config) = &mut self.config {
                 config.reload(None).ok();
             }
             self.apply_config_to_renderer();
+        }
+        if let Some(rx) = &self.config_rx {
+            if let Ok(hydrated) = rx.try_recv() {
+                self.config_rx = None;
+                self.config = Some(hydrated);
+                self.apply_config_to_renderer();
+            }
         }
         if self.settings.open {
             self.draw_settings_overlay();
@@ -1343,16 +922,14 @@ impl App {
         };
         let win_size = window.inner_size();
         let tab_h = renderer.cell_size()[1];
-        let content_h = (win_size.height as f32 - tab_h).max(0.0);
+        let status_h = renderer.status_bar_height();
+        let content_h = (win_size.height as f32 - tab_h - status_h).max(0.0);
 
         renderer.begin_frame()?;
+        renderer.draw_background(renderer.theme_bg())?;
 
-        let mut tab_ids: Vec<usize> = self.panes.keys().copied().collect();
+        let mut tab_ids: Vec<usize> = self.session.panes.keys().copied().collect();
         tab_ids.sort();
-        let active_idx = tab_ids
-            .iter()
-            .position(|&id| id == self.active_pane)
-            .unwrap_or(0);
         // While editing, the active tab shows the live buffer instead of the
         // shell title. Editing is bound to the active pane and cleared on any
         // pane switch, so this is only ever the pane that owns the editor.
@@ -1361,26 +938,56 @@ impl App {
             .iter()
             .map(|&id| TabInfo {
                 title: match &edit_display {
-                    Some(d) if id == self.active_pane => d.clone(),
+                    Some(d) if id == self.session.active_pane => d.clone(),
                     _ => self
+                        .session
                         .panes
                         .get(&id)
                         .map_or_else(String::new, |p| p.title.clone()),
                 },
-                active: id == self.active_pane,
+                active: id == self.session.active_pane,
+                hovered: self.hovered_tab == Some(id),
+                close_hovered: self.hovered_tab_close,
             })
             .collect();
 
-        let rects = self.split_root.compute_rects();
+        let rects = self.session.split_root.compute_rects();
+        // Active pane's window-space viewport rect (for the scrollbar overlay).
+        // Mirrors the pane-rect transform in render_screen calls below.
+        let (scroll_px, scroll_py, scroll_pw, scroll_ph) =
+            if self.session.floating == Some(self.session.active_pane) {
+                let fw = win_size.width as f32 * 0.7;
+                let fx = (win_size.width as f32 - fw) / 2.0;
+                (fx, tab_h + content_h * 0.15, fw, content_h * 0.7)
+            } else {
+                let (nx, ny, nw, nh) = rects
+                    .get(&self.session.active_pane)
+                    .copied()
+                    .unwrap_or((0.0, 0.0, 1.0, 1.0));
+                (
+                    nx * win_size.width as f32,
+                    ny * content_h + tab_h,
+                    nw * win_size.width as f32,
+                    nh * content_h,
+                )
+            };
         if rects.len() <= 1 {
             // Render the tree leaf, not the floating pane (it renders last as overlay).
-            let tree_id = rects.keys().next().copied().unwrap_or(self.active_pane);
-            if let Some(pane) = self.panes.get(&tree_id) {
-                let is_active = tree_id == self.active_pane;
+            let tree_id = rects
+                .keys()
+                .next()
+                .copied()
+                .unwrap_or(self.session.active_pane);
+            if let Some(pane) = self.session.panes.get(&tree_id) {
+                let is_active = tree_id == self.session.active_pane;
                 renderer.set_viewport(0.0, tab_h);
                 renderer.render_screen(
                     pane.parser.screen(),
-                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active {
+                        self.session.scroll_offset
+                    } else {
+                        0
+                    },
                     if is_active { self.selection } else { None },
                 )?;
             }
@@ -1388,38 +995,68 @@ impl App {
             let mut ordered: Vec<(usize, (f32, f32, f32, f32))> = rects.into_iter().collect();
             ordered.sort_by_key(|(id, _)| *id);
             for (id, (nx, ny, _, _)) in ordered {
-                let Some(pane) = self.panes.get(&id) else {
+                let Some(pane) = self.session.panes.get(&id) else {
                     continue;
                 };
                 let px = nx * win_size.width as f32;
                 let py = ny * content_h + tab_h;
-                let is_active = id == self.active_pane;
+                let is_active = id == self.session.active_pane;
                 renderer.set_viewport(px, py);
                 renderer.render_screen(
                     pane.parser.screen(),
-                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active {
+                        self.session.scroll_offset
+                    } else {
+                        0
+                    },
                     if is_active { self.selection } else { None },
                 )?;
             }
         }
 
         // Floating pane overlay — drawn last, on top of all split leaves.
-        if let Some(id) = self.floating {
-            if let Some(pane) = self.panes.get(&id) {
+        if let Some(id) = self.session.floating {
+            if let Some(pane) = self.session.panes.get(&id) {
                 let fw = win_size.width as f32 * 0.7;
                 let fx = (win_size.width as f32 - fw) / 2.0;
                 let fy = tab_h + content_h * 0.15;
-                let is_active = id == self.active_pane;
+                let is_active = id == self.session.active_pane;
                 renderer.set_viewport(fx, fy);
                 renderer.render_screen(
                     pane.parser.screen(),
-                    if is_active { self.scroll_offset } else { 0 },
+                    if is_active {
+                        self.session.scroll_offset
+                    } else {
+                        0
+                    },
                     if is_active { self.selection } else { None },
                 )?;
             }
         }
 
-        renderer.draw_tab_bar(&tab_infos, active_idx)?;
+        renderer.draw_tab_bar(&tab_infos)?;
+
+        let max_scroll = self.session.max_scroll_offset();
+        let active_title = self
+            .session
+            .active_pane()
+            .map_or_else(String::new, |p| p.title.clone());
+        let right = if max_scroll > 0 {
+            format!(
+                "[{}%]",
+                (100 * self.session.scroll_offset)
+                    .checked_div(max_scroll)
+                    .unwrap_or(0)
+            )
+        } else {
+            String::new()
+        };
+        renderer.draw_status_bar(&active_title, &right)?;
+
+        if max_scroll > 0 {
+            let fraction = self.session.scroll_offset as f32 / max_scroll as f32;
+            renderer.draw_scrollbar(scroll_px, scroll_py, scroll_pw, scroll_ph, fraction)?;
+        }
 
         renderer.end_frame()?;
         Ok(())
@@ -1432,12 +1069,13 @@ impl App {
         };
         let size = window.inner_size();
         let tab_h = renderer.cell_size()[1];
-        let content_h = (size.height as f32 - tab_h).max(0.0);
-        let rects = self.split_root.compute_rects();
+        let status_h = renderer.status_bar_height();
+        let content_h = (size.height as f32 - tab_h - status_h).max(0.0);
+        let rects = self.session.split_root.compute_rects();
         for (&id, &(_, _, nw, nh)) in &rects {
             let cols = renderer.cols_for(nw * size.width as f32);
             let rows = renderer.rows_for(nh * content_h);
-            if let Some(pane) = self.panes.get_mut(&id) {
+            if let Some(pane) = self.session.panes.get_mut(&id) {
                 pane.parser.screen_mut().resize(cols, rows);
                 let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
             }
@@ -1445,7 +1083,7 @@ impl App {
     }
 
     fn write_pty(&self, data: &[u8]) {
-        if let Some(pane) = self.panes.get(&self.active_pane) {
+        if let Some(pane) = self.session.panes.get(&self.session.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
         }
     }
@@ -1474,13 +1112,11 @@ impl App {
         // killed (Ctrl+U) so the local buffer is the sole source of truth on
         // Enter; Ctrl+U is a no-op on an empty line.
         let line = self.current_line();
-        let mut state = EditingState::new();
-        state.buffer.extend(line.chars());
-        state.cursor = state.buffer.len();
-        if !state.buffer.is_empty() {
+        let state = EditingState::from_line(&line);
+        if !state.is_empty() {
             self.write_pty(b"\x15");
         }
-        self.scroll_offset = 0;
+        self.session.scroll_offset = 0;
         self.editing = Some(state);
     }
 
@@ -1499,6 +1135,7 @@ impl App {
                 // expansion). Falls back to raw bytes when the shell never
                 // enabled it. Empty buffer submits a bare newline.
                 let bracketed = self
+                    .session
                     .active_pane()
                     .is_some_and(|p| p.parser.bracketed_paste());
                 let mut data = Vec::new();
@@ -1522,12 +1159,12 @@ impl App {
             KeyCode::KeyE if ctrl && !alt => self.editing.as_mut().unwrap().end(),
             KeyCode::KeyK if ctrl && !alt => {
                 let state = self.editing.as_mut().unwrap();
-                state.buffer.truncate(state.cursor);
+                state.truncate_to_cursor();
             }
             // Cancel like Esc, discarding the buffer without touching the shell.
             KeyCode::KeyC if ctrl && !alt => self.editing = None,
             KeyCode::KeyD if ctrl && !alt => {
-                if self.editing.as_ref().unwrap().buffer.is_empty() {
+                if self.editing.as_ref().unwrap().is_empty() {
                     self.editing = None;
                 } else {
                     return true;
@@ -1552,7 +1189,7 @@ impl App {
 
     /// Text of the line the cursor sits on, up to the cursor column.
     fn current_line(&self) -> String {
-        let Some(pane) = self.active_pane() else {
+        let Some(pane) = self.session.active_pane() else {
             return String::new();
         };
         let screen = pane.parser.screen();
@@ -1569,6 +1206,7 @@ impl App {
     /// Run a loaded plugin against the current line and write its stdout into
     /// the active pane as if typed at a fresh prompt. Errors land dimmed via a
     /// leading red escape. No-op when the pane/plugin is missing.
+    #[cfg(feature = "plugins")]
     fn run_plugin(&mut self, name: &str) {
         let input = self.current_line();
         let result = {
@@ -1592,23 +1230,15 @@ impl App {
     }
 
     fn max_scroll_offset(&self) -> usize {
-        if let Some(pane) = self.active_pane() {
-            let screen = pane.parser.screen();
-            let total_rows = screen.scrollback().len() + screen.buffer().len();
-            let visible_rows = screen.size().rows;
-            total_rows.saturating_sub(visible_rows)
-        } else {
-            0
-        }
+        self.session.max_scroll_offset()
     }
 
     fn scroll_up(&mut self, lines: usize) {
-        let max = self.max_scroll_offset();
-        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
+        self.session.scroll_up(lines);
     }
 
     fn scroll_down(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.session.scroll_down(lines);
     }
 
     // Jump scroll to nearest command block in delta direction (-1 = prev, +1 = next)
@@ -1617,7 +1247,7 @@ impl App {
     // the scrollable range, so a jump clamps to offset 0, landing the block at its
     // natural buffer row (near the top only when start_line is small).
     fn jump_to_block(&mut self, delta: i32) {
-        let Some(pane) = self.active_pane() else {
+        let Some(pane) = self.session.active_pane() else {
             return;
         };
         let screen = pane.parser.screen();
@@ -1628,7 +1258,7 @@ impl App {
         let visible = screen.size().rows;
         let total = scrollback + visible;
         let start = total
-            .saturating_sub(self.scroll_offset)
+            .saturating_sub(self.session.scroll_offset)
             .saturating_sub(visible);
         let mid = start + visible / 2;
         let target_row = if delta < 0 {
@@ -1651,13 +1281,105 @@ impl App {
         let offset = total
             .saturating_sub(target_row + visible)
             .min(self.max_scroll_offset());
-        if offset == self.scroll_offset {
+        if offset == self.session.scroll_offset {
             return;
         }
-        self.scroll_offset = offset;
+        self.session.scroll_offset = offset;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    // Search overlay
+    fn toggle_search(&mut self) {
+        self.search.toggle();
+        if self.search.open {
+            if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
+                self.search.save_screen(pane.parser.screen());
+            }
+        } else {
+            self.close_search();
+        }
+        self.draw_search_overlay();
+    }
+
+    // Quake mode: F12 toggles the window hidden/shown.
+    // ponytail: in-app toggle only. On X11 set_visible works; on Wayland
+    // winit 0.30 treats set_visible AND set_minimized(false) as no-ops, so
+    // hiding would strand the user — a true quake dropdown needs the
+    // Wayland global-shortcut portal / layer-shell. Here it's a no-op there.
+    fn toggle_quake(&mut self) {
+        self.window_visible = !self.window_visible;
+        if let Some(w) = &self.window {
+            w.set_visible(self.window_visible);
+            if self.window_visible {
+                w.focus_window();
+            }
+        }
+    }
+
+    fn close_search(&mut self) {
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
+            self.search.restore_screen(pane.parser.screen_mut());
+        }
+        self.search.open = false;
+        self.redraw();
+    }
+
+    fn draw_search_overlay(&mut self) {
+        if !self.search.open {
+            return;
+        }
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
+            return;
+        };
+        let (cols, rows) = {
+            let s = pane.parser.screen();
+            (s.size().cols, s.size().rows)
+        };
+        let bytes = self.search.overlay_bytes(cols, rows);
+        pane.parser.parse(&bytes);
+        self.redraw();
+    }
+
+    /// Re-run the scan for the current query and jump to the current match.
+    fn search_apply(&mut self) {
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
+            return;
+        };
+        let screen = pane.parser.screen();
+        self.search.find(screen);
+        self.search_jump();
+    }
+
+    fn search_step(&mut self, forward: bool) {
+        let moved = if forward {
+            self.search.next()
+        } else {
+            self.search.prev()
+        };
+        if moved {
+            self.search_jump();
+        }
+    }
+
+    /// Scroll so the current match row is the top visible row.
+    fn search_jump(&mut self) {
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
+            return;
+        };
+        let Some(target_row) = self.search.current_row() else {
+            return;
+        };
+        let screen = pane.parser.screen();
+        let scrollback = screen.scrollback().len();
+        let visible = screen.size().rows;
+        let total = scrollback + visible;
+        let offset = total
+            .saturating_sub(target_row + visible)
+            .min(total.saturating_sub(visible));
+        self.session.scroll_offset = offset;
+        self.draw_search_overlay();
     }
 
     // Selection methods
@@ -1666,16 +1388,24 @@ impl App {
         self.renderer.as_ref().map_or(0.0, |r| r.cell_size()[1])
     }
 
+    /// Status bar height in pixels = one cell row (must match render()'s content_h math).
+    fn status_bar_height(&self) -> f32 {
+        self.renderer
+            .as_ref()
+            .map_or(0.0, |r| r.status_bar_height())
+    }
+
     /// Map a window pixel point to the pane under it (normalized rects × window size).
     fn pane_at_point(&self, x: f32, y: f32) -> Option<usize> {
-        let rects = self.split_root.compute_rects();
+        let rects = self.session.split_root.compute_rects();
         if rects.len() <= 1 {
             return rects.keys().next().copied();
         }
         let window = self.window.as_ref()?;
         let win_w = window.inner_size().width as f32;
         let tab_h = self.tab_bar_height();
-        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+        let content_h =
+            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
         for (&id, &(nx, ny, nw, nh)) in &rects {
             let (px, py, pw, ph) = (
                 nx * win_w,
@@ -1694,16 +1424,17 @@ impl App {
     /// layout: sorted pane ids, starts at col 1, span = chars+2, col += span+1).
     fn tab_at_point(&self, x: f32, y: f32) -> Option<usize> {
         let tab_h = self.tab_bar_height();
-        if y < 0.0 || y >= tab_h || self.panes.is_empty() {
+        if y < 0.0 || y >= tab_h || self.session.panes.is_empty() {
             return None;
         }
         let renderer = self.renderer.as_ref()?;
         let cell_w = renderer.cell_size()[0];
-        let mut ids: Vec<usize> = self.panes.keys().copied().collect();
+        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
         ids.sort();
         let mut col = 1usize;
         for id in ids {
             let title = self
+                .session
                 .panes
                 .get(&id)
                 .map_or_else(String::new, |p| p.title.clone());
@@ -1719,16 +1450,46 @@ impl App {
         None
     }
 
-    /// The divider (if any) within `tolerance` pixels of x,y, as (target, dir).
+    /// Tab under a window-space x,y plus whether the point is over its close
+    /// button (the right padding cell of the tab span). Layout mirrors
+    /// tab_at_point / draw_tab_bar so hover and click land on the same cells.
+    fn tab_bar_hover(&self, x: f32, y: f32) -> Option<(usize, bool)> {
+        let tab_h = self.tab_bar_height();
+        if y < 0.0 || y >= tab_h || self.session.panes.is_empty() {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let cell_w = renderer.cell_size()[0];
+        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
+        ids.sort();
+        let mut col = 1usize;
+        for id in ids {
+            let title = self
+                .session
+                .panes
+                .get(&id)
+                .map_or_else(String::new, |p| p.title.clone());
+            let span = tab_span(&title, 20);
+            let start_px = col as f32 * cell_w;
+            let end_px = (col + span) as f32 * cell_w;
+            if x >= start_px && x < end_px {
+                let close_start = (col + span - 1) as f32 * cell_w;
+                return Some((id, x >= close_start));
+            }
+            col += span + 1;
+        }
+        None
+    }
     fn divider_at_point(&self, x: f32, y: f32, tolerance: f32) -> Option<(usize, SplitDir)> {
-        if self.split_root.leaves().len() <= 1 || y < self.tab_bar_height() {
+        if self.session.split_root.leaves().len() <= 1 || y < self.tab_bar_height() {
             return None;
         }
         let window = self.window.as_ref()?;
         let win_w = window.inner_size().width as f32;
         let tab_h = self.tab_bar_height();
-        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
-        for (dir, boundary, target) in self.split_root.dividers() {
+        let content_h =
+            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
+        for (dir, boundary, target) in self.session.split_root.dividers() {
             let (px, py) = match dir {
                 SplitDir::Vertical => (boundary * win_w, y),
                 SplitDir::Horizontal => (x, tab_h + boundary * content_h),
@@ -1747,14 +1508,21 @@ impl App {
     }
 
     fn screen_to_cell(&self, pane_id: usize, x: f32, y: f32) -> Option<(usize, usize)> {
-        let (Some(renderer), Some(pane)) = (&self.renderer, self.panes.get(&pane_id)) else {
+        let (Some(renderer), Some(pane)) = (&self.renderer, self.session.panes.get(&pane_id))
+        else {
             return None;
         };
-        let rect = self.split_root.compute_rects().get(&pane_id).copied()?;
+        let rect = self
+            .session
+            .split_root
+            .compute_rects()
+            .get(&pane_id)
+            .copied()?;
         let window = self.window.as_ref()?;
         let win_w = window.inner_size().width as f32;
         let tab_h = self.tab_bar_height();
-        let content_h = (window.inner_size().height as f32 - tab_h).max(0.0);
+        let content_h =
+            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
         let (px, py, pw, ph) = (
             rect.0 * win_w,
             rect.1 * content_h + tab_h,
@@ -1780,8 +1548,8 @@ impl App {
             let scrollback = screen.scrollback().len();
             let total_rows = scrollback + visible_rows;
             // scroll_offset is a single field owned by the active pane; inactive panes render at 0
-            let offset = if pane_id == self.active_pane {
-                self.scroll_offset
+            let offset = if pane_id == self.session.active_pane {
+                self.session.scroll_offset
             } else {
                 0
             };
@@ -1801,7 +1569,7 @@ impl App {
     }
 
     fn line_chars(&self, global_row: usize) -> Option<Vec<char>> {
-        let pane = self.active_pane()?;
+        let pane = self.session.active_pane()?;
         let screen = pane.parser.screen();
         let scrollback = screen.scrollback();
         let total = scrollback.len();
@@ -1819,7 +1587,7 @@ impl App {
             return false;
         }
         let (cursor_row, cursor_col, cols, total_rows) = {
-            let Some(pane) = self.active_pane() else {
+            let Some(pane) = self.session.active_pane() else {
                 return false;
             };
             let screen = pane.parser.screen();
@@ -1844,7 +1612,7 @@ impl App {
         let (mut end_row, mut end_col) = match &self.selection {
             Some(s) if s.active => (s.end_row, s.end_col),
             _ => {
-                self.scroll_offset = 0;
+                self.session.scroll_offset = 0;
                 (cursor_row, cursor_col)
             }
         };
@@ -1891,10 +1659,10 @@ impl App {
             return;
         };
         // Click focuses the clicked pane so selection renders/copies against its screen.
-        if pane_id != self.active_pane {
-            self.active_pane = pane_id;
+        if pane_id != self.session.active_pane {
+            self.session.active_pane = pane_id;
             self.editing = None;
-            self.scroll_offset = 0;
+            self.session.scroll_offset = 0;
         }
         if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
             self.selection = Some(Selection {
@@ -1911,7 +1679,7 @@ impl App {
     fn update_selection(&mut self, x: f32, y: f32) {
         if self.selecting {
             // Selection lives in the active pane (click focused it); leaving its rect clamps.
-            if let Some((row, col)) = self.screen_to_cell(self.active_pane, x, y) {
+            if let Some((row, col)) = self.screen_to_cell(self.session.active_pane, x, y) {
                 if let Some(sel) = &mut self.selection {
                     sel.end_row = row;
                     sel.end_col = col;
@@ -1927,7 +1695,7 @@ impl App {
     fn copy_selection(&mut self) {
         let sel = self.selection.clone();
         let text = sel.as_ref().and_then(|sel| {
-            self.active_pane().map(|pane| {
+            self.session.active_pane().map(|pane| {
                 let screen = pane.parser.screen();
                 let scrollback = screen.scrollback();
                 let buffer = screen.buffer();
@@ -1982,8 +1750,8 @@ impl App {
         let Some(pane_id) = self.pane_at_point(x, y) else {
             return false;
         };
-        let offset = if pane_id == self.active_pane {
-            self.scroll_offset
+        let offset = if pane_id == self.session.active_pane {
+            self.session.scroll_offset
         } else {
             0
         };
@@ -1993,7 +1761,7 @@ impl App {
         let Some((global_row, col)) = self.screen_to_cell(pane_id, x, y) else {
             return false;
         };
-        let Some(pane) = self.panes.get(&pane_id) else {
+        let Some(pane) = self.session.panes.get(&pane_id) else {
             return false;
         };
         let screen = pane.parser.screen();
@@ -2045,6 +1813,7 @@ impl App {
             self.font_path = config.font.path.clone();
             if let Some(renderer) = &mut self.renderer {
                 renderer.reload_config(config);
+                renderer.set_cursor_blink(config.cursor.blink, config.cursor.blink_interval_ms);
             }
         }
     }
@@ -2054,7 +1823,7 @@ impl App {
         if self.settings.open {
             let ctx = self.settings_ctx();
             self.settings.refresh(&ctx);
-            if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+            if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
                 self.settings.save_screen(pane.parser.screen());
             }
             self.draw_settings_overlay();
@@ -2064,7 +1833,7 @@ impl App {
     }
 
     fn close_settings(&mut self) {
-        if let Some(pane) = self.panes.get_mut(&self.active_pane) {
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
             self.settings.restore_screen(pane.parser.screen_mut());
         }
         self.settings.open = false;
@@ -2074,7 +1843,7 @@ impl App {
     }
 
     fn draw_settings_overlay(&mut self) {
-        let Some(pane) = self.panes.get_mut(&self.active_pane) else {
+        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
             return;
         };
         let (cols, rows) = {
@@ -2153,12 +1922,12 @@ impl ApplicationHandler for App {
                 info!("Close requested");
                 if let Err(e) = session::save_session(
                     &session::session_file_path(),
-                    &self.panes,
-                    Some(&self.split_root),
+                    &self.session.panes,
+                    Some(&self.session.split_root),
                 ) {
                     error!("Failed to save session: {}", e);
                 }
-                for (_, pane) in &self.panes {
+                for (_, pane) in &self.session.panes {
                     let _ = pane.pty_tx.send(PtyCommand::Kill);
                 }
                 event_loop.exit();
@@ -2183,6 +1952,43 @@ impl ApplicationHandler for App {
                 let ctrl = self.modifiers.control_key();
                 let shift = self.modifiers.shift_key();
                 let alt = self.modifiers.alt_key();
+
+                // Search overlay: while open, all keys route to the prompt.
+                if self.search.open {
+                    match &event.physical_key {
+                        PhysicalKey::Code(code) => match code {
+                            KeyCode::Escape => self.close_search(),
+                            KeyCode::KeyF if ctrl && shift => self.close_search(),
+                            KeyCode::Backspace => {
+                                self.search.backspace();
+                                self.search_apply();
+                            }
+                            KeyCode::Enter | KeyCode::ArrowDown if !shift => {
+                                self.search_step(true);
+                            }
+                            KeyCode::Enter | KeyCode::ArrowUp if shift => {
+                                self.search_step(false);
+                            }
+                            KeyCode::ArrowUp => self.search_step(false),
+                            KeyCode::ArrowDown => self.search_step(true),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    let text = event.text.clone().or_else(|| match &event.logical_key {
+                        winit::keyboard::Key::Character(c) => Some(c.clone()),
+                        _ => None,
+                    });
+                    if let Some(text) = &text {
+                        if !text.is_empty() && !ctrl && !alt {
+                            for c in text.chars() {
+                                self.search.append(c);
+                            }
+                            self.search_apply();
+                        }
+                    }
+                    return;
+                }
 
                 // Tab management shortcuts
                 match &event.physical_key {
@@ -2264,10 +2070,12 @@ impl ApplicationHandler for App {
                             self.update_window_title();
                             return;
                         }
+                        #[cfg(feature = "ai")]
                         if ctrl && shift && !alt && *code == KeyCode::KeyI {
                             self.ai_explain();
                             return;
                         }
+                        #[cfg(feature = "ai")]
                         if ctrl && shift && !alt && *code == KeyCode::KeyA {
                             self.ai_suggest();
                             return;
@@ -2276,8 +2084,8 @@ impl ApplicationHandler for App {
                             self.cycle_opacity();
                             return;
                         }
+                        #[cfg(all(unix, feature = "ssh"))]
                         if ctrl && shift && !alt && *code == KeyCode::KeyS {
-                            #[cfg(unix)]
                             if let Some(config) = &self.config {
                                 if !config.ssh.host.is_empty() {
                                     let host = config.ssh.host.clone();
@@ -2293,6 +2101,7 @@ impl ApplicationHandler for App {
                             }
                             return;
                         }
+                        #[cfg(feature = "plugins")]
                         if ctrl && shift && !alt && *code == KeyCode::KeyB {
                             if let Some(name) = self.plugins.keys().min().cloned() {
                                 self.run_plugin(&name);
@@ -2310,8 +2119,16 @@ impl ApplicationHandler for App {
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::KeyF {
+                            self.toggle_search();
+                            return;
+                        }
+                        if ctrl && shift && !alt && *code == KeyCode::KeyG {
                             self.toggle_floating_pane();
                             self.update_window_title();
+                            return;
+                        }
+                        if !ctrl && !shift && !alt && *code == KeyCode::F12 {
+                            self.toggle_quake();
                             return;
                         }
                         if ctrl && shift && !alt && *code == KeyCode::Tab {
@@ -2379,14 +2196,14 @@ impl ApplicationHandler for App {
                                     return;
                                 }
                                 KeyCode::Home if !ctrl => {
-                                    self.scroll_offset = self.max_scroll_offset();
+                                    self.session.scroll_offset = self.max_scroll_offset();
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
                                     return;
                                 }
                                 KeyCode::End if !ctrl => {
-                                    self.scroll_offset = 0;
+                                    self.session.scroll_offset = 0;
                                     if let Some(window) = &self.window {
                                         window.request_redraw();
                                     }
@@ -2477,6 +2294,7 @@ impl ApplicationHandler for App {
                                     if let Some(clipboard) = &mut self.clipboard {
                                         if let Ok(text) = clipboard.get_text() {
                                             let bracketed = self
+                                                .session
                                                 .active_pane()
                                                 .map_or(false, |p| p.parser.bracketed_paste());
                                             if bracketed {
@@ -2503,8 +2321,14 @@ impl ApplicationHandler for App {
                     _ => {}
                 }
 
-                // Handle printable text (IME text input)
-                if let Some(text) = &event.text {
+                // Handle printable text (IME text input). Some keymaps/dead
+                // keys/IME states report text=None; fall back to the
+                // logical key so printable characters still reach the pty.
+                let text = event.text.clone().or_else(|| match &event.logical_key {
+                    winit::keyboard::Key::Character(c) => Some(c.clone()),
+                    _ => None,
+                });
+                if let Some(text) = &text {
                     if !text.is_empty() && !ctrl && !alt {
                         if let Some(state) = self.editing.as_mut() {
                             for c in text.chars() {
@@ -2538,26 +2362,51 @@ impl ApplicationHandler for App {
                     if let Some(window) = &self.window {
                         window.request_redraw();
                     }
+                } else if self.renderer.is_none() {
+                    // Renderer still initializing on the background thread —
+                    // keep polling until check_renderer_ready() picks it up.
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                if self
+                    .renderer
+                    .as_mut()
+                    .is_some_and(|r| r.cursor_blink_tick().is_some())
+                {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = (position.x as f32, position.y as f32);
                 let x = position.x as f32;
                 let y = position.y as f32;
+                // Tab-bar hover: track the tab under the cursor (+ close button)
+                // so draw_tab_bar can show the pill accent and close glyph.
+                let hover = self.tab_bar_hover(x, y);
+                if hover != self.hovered_tab.map(|id| (id, self.hovered_tab_close)) {
+                    self.hovered_tab = hover.map(|(id, _)| id);
+                    self.hovered_tab_close = hover.is_some_and(|(_, c)| c);
+                    self.redraw();
+                }
                 // Split divider drag: resize from last position delta, then bail.
-                if let Some(target) = self.dragging_divider {
+                if let Some(target) = self.session.dragging_divider {
                     let window = self.window.as_ref();
                     let (win_w, content_h) = window.map_or((1.0, 1.0), |w| {
                         let tab = self.tab_bar_height();
+                        let status = self.status_bar_height();
                         (
                             w.inner_size().width as f32,
-                            (w.inner_size().height as f32 - tab).max(0.0),
+                            (w.inner_size().height as f32 - tab - status).max(0.0),
                         )
                     });
-                    let (ax, ay) = self.divider_anchor;
+                    let (ax, ay) = self.session.divider_anchor;
                     let (dx, dy) = (x - ax, y - ay);
                     // Find this target's current divider to resize against its real boundary.
                     let found = self
+                        .session
                         .split_root
                         .dividers()
                         .into_iter()
@@ -2567,9 +2416,9 @@ impl ApplicationHandler for App {
                             SplitDir::Vertical => dx / win_w,
                             SplitDir::Horizontal => dy / content_h,
                         };
-                        self.split_root.resize_leaf(target, boundary, delta);
+                        self.session.split_root.resize_leaf(target, boundary, delta);
                     }
-                    self.divider_anchor = (x, y);
+                    self.session.divider_anchor = (x, y);
                     self.resize_panes_to_rects();
                     if let Some(window) = &self.window {
                         window.request_redraw();
@@ -2581,18 +2430,19 @@ impl ApplicationHandler for App {
                 let hovered = self.pane_at_point(x, y);
                 if !self.selecting {
                     if let Some(id) = hovered {
-                        if id != self.active_pane {
-                            self.active_pane = id;
+                        if id != self.session.active_pane {
+                            self.session.active_pane = id;
                             self.editing = None;
-                            self.scroll_offset = 0;
+                            self.session.scroll_offset = 0;
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
                         }
                     }
                 }
-                let pane_id = hovered.unwrap_or(self.active_pane);
+                let pane_id = hovered.unwrap_or(self.session.active_pane);
                 let mouse_tracking = self
+                    .session
                     .panes
                     .get(&pane_id)
                     .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
@@ -2622,13 +2472,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (x, y) = self.mouse_pos;
-                // Left press may start a divider drag or a tab switch; release ends drags.
+                // Left press may close a tab (close button), start a divider
+                // drag, or switch tabs; release ends drags.
                 if button == MouseButton::Left && state == winit::event::ElementState::Pressed {
+                    if let Some((pane_id, true)) = self.tab_bar_hover(x, y) {
+                        self.close_tab(pane_id);
+                        return;
+                    }
                     if let Some(pane_id) = self.tab_at_point(x, y) {
-                        if pane_id != self.active_pane {
-                            self.active_pane = pane_id;
+                        if pane_id != self.session.active_pane {
+                            self.session.active_pane = pane_id;
                             self.editing = None;
-                            self.scroll_offset = 0;
+                            self.session.scroll_offset = 0;
                         }
                         self.end_selection();
                         if let Some(window) = &self.window {
@@ -2637,8 +2492,8 @@ impl ApplicationHandler for App {
                         return;
                     }
                     if let Some((target, _)) = self.divider_at_point(x, y, 8.0) {
-                        self.dragging_divider = Some(target);
-                        self.divider_anchor = (x, y);
+                        self.session.dragging_divider = Some(target);
+                        self.session.divider_anchor = (x, y);
                         self.end_selection();
                         if let Some(window) = &self.window {
                             window.request_redraw();
@@ -2647,10 +2502,11 @@ impl ApplicationHandler for App {
                     }
                 }
                 if button == MouseButton::Left && state == winit::event::ElementState::Released {
-                    self.dragging_divider = None;
+                    self.session.dragging_divider = None;
                 }
-                let pane_id = self.pane_at_point(x, y).unwrap_or(self.active_pane);
+                let pane_id = self.pane_at_point(x, y).unwrap_or(self.session.active_pane);
                 let mouse_tracking = self
+                    .session
                     .panes
                     .get(&pane_id)
                     .map_or(MouseTrackingMode::Off, |p| p.parser.mouse_tracking());
@@ -2682,19 +2538,29 @@ impl ApplicationHandler for App {
                             self.start_selection(x, y);
                         }
                     } else {
+                        // copy-on-select: a drag that actually selected something copies on release
+                        let dragged = self.selecting;
                         self.end_selection();
+                        if dragged
+                            && self.selection.as_ref().is_some_and(|s| {
+                                s.start_row != s.end_row || s.start_col != s.end_col
+                            })
+                        {
+                            self.copy_selection();
+                        }
                         // Click-to-position: send CSI CUP so the shell moves its cursor.
                         if self.keybindings().click_to_position
-                            && self.scroll_offset == 0
+                            && self.session.scroll_offset == 0
                             && y >= self.tab_bar_height()
-                            && self.pane_at_point(x, y) == Some(self.active_pane)
+                            && self.pane_at_point(x, y) == Some(self.session.active_pane)
                         {
                             if let Some((global_row, col)) =
-                                self.screen_to_cell(self.active_pane, x, y)
+                                self.screen_to_cell(self.session.active_pane, x, y)
                             {
                                 let row = global_row.saturating_sub(
-                                    self.panes
-                                        .get(&self.active_pane)
+                                    self.session
+                                        .panes
+                                        .get(&self.session.active_pane)
                                         .map_or(0, |p| p.parser.screen().scrollback().len()),
                                 );
                                 self.write_pty(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
@@ -2711,10 +2577,11 @@ impl ApplicationHandler for App {
                 // ponytail: single scroll_offset field; wheel over another pane focuses it
                 // first, then scrolls (per-pane scroll map skipped)
                 if let Some(id) = self.pane_at_point(x, y) {
-                    if id != self.active_pane {
-                        self.active_pane = id;
+                    if id != self.session.active_pane {
+                        self.session.active_pane = id;
                         self.editing = None;
-                        self.scroll_offset = 0;
+                        self.session.scroll_offset = 0;
+                        self.scroll_fraction = 0.0;
                     }
                 }
                 match delta {
@@ -2731,11 +2598,14 @@ impl ApplicationHandler for App {
                             .as_ref()
                             .map(|r| r.cell_size()[1])
                             .unwrap_or(20.0);
-                        let lines = (pos.y as f32 / cell_h).round() as usize;
-                        if pos.y > 0.0 {
-                            self.scroll_up(lines.max(1));
-                        } else {
-                            self.scroll_down(lines.max(1));
+                        let (up, down, rem) =
+                            split_scroll_fraction(self.scroll_fraction + pos.y as f32 / cell_h);
+                        self.scroll_fraction = rem;
+                        if up > 0 {
+                            self.scroll_up(up);
+                        }
+                        if down > 0 {
+                            self.scroll_down(down);
                         }
                     }
                 }
@@ -2817,87 +2687,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_bounds() {
-        let line: Vec<char> = "  hello world  ".chars().collect();
-        assert_eq!(word_left(&line, 7), 2);
-        assert_eq!(word_left(&line, 12), 8);
-        assert_eq!(word_right(&line, 2, 20), 6);
-        assert_eq!(word_right(&line, 8, 20), 12);
-    }
-
-    #[test]
-    fn editing_state_ops() {
-        let mut e = EditingState::new();
-        assert_eq!(e.line(), "");
-        assert_eq!(e.display(), "[edit] ▌");
-        for c in "hello".chars() {
-            e.insert(c);
+    fn split_scroll_fraction_keeps_sub_line_remainder() {
+        fn near(a: f32, b: f32) -> bool {
+            (a - b).abs() < 1e-6
         }
-        assert_eq!(e.line(), "hello");
-        e.backspace();
-        assert_eq!(e.line(), "hell");
-        e.insert('o');
-        e.left();
-        e.left();
-        e.insert('_');
-        assert_eq!(e.line(), "hel_lo");
-        e.home();
-        e.delete();
-        assert_eq!(e.line(), "el_lo");
-        e.end();
-        e.insert('!');
-        assert_eq!(e.line(), "el_lo!");
-        e.right(); // cursor already at end: clamp
-        assert_eq!(e.line(), "el_lo!");
-        e.backspace();
-        assert_eq!(e.line(), "el_lo");
-        // display places the block cursor at the edit position
-        e.home();
-        assert_eq!(e.display(), "[edit] ▌el_lo");
+        // Whole lines extracted, remainder carries the sign and stays < 1.
+        let (up, down, rem) = split_scroll_fraction(2.3);
+        assert_eq!((up, down), (2, 0));
+        assert!(near(rem, 0.3));
+        let (up, down, rem) = split_scroll_fraction(-1.7);
+        assert_eq!((up, down), (0, 1));
+        assert!(near(rem, -0.7));
+        // Sub-line deltas accumulate: 0.4 + 0.4 crosses the line threshold.
+        let (up, down, rem) = split_scroll_fraction(0.4);
+        assert_eq!((up, down), (0, 0));
+        assert!(near(rem, 0.4));
+        let (up, down, rem) = split_scroll_fraction(rem + 0.4);
+        assert_eq!((up, down), (0, 0));
+        assert!(near(rem, 0.8));
+        let (up, down, rem) = split_scroll_fraction(rem + 0.4);
+        assert_eq!((up, down), (1, 0));
+        assert!(near(rem, 0.2));
     }
 
     #[test]
     fn editing_readline_bindings() {
-        let mut e = EditingState::new();
-        for c in "hello world".chars() {
-            e.insert(c);
-        }
-        e.home();
-        e.word_right();
-        assert_eq!(e.cursor, 5); // end of "hello"
-        e.word_right();
-        assert_eq!(e.cursor, 11); // end of "world"
-        e.word_left();
-        assert_eq!(e.cursor, 6); // start of "world"
-        e.word_left();
-        assert_eq!(e.cursor, 0); // start of "hello"
-        e.word_left(); // clamp at start
-        assert_eq!(e.cursor, 0);
-        e.home();
-        e.delete_word_after();
-        assert_eq!(e.line(), " world");
-        e.delete_word_after();
-        assert_eq!(e.line(), "");
-        e.delete_word_after(); // clamp on empty buffer
-        assert_eq!(e.line(), "");
-
-        let mut e = EditingState::new();
-        for c in "hello world".chars() {
-            e.insert(c);
-        }
-        e.delete_word_before();
-        assert_eq!(e.line(), "hello ");
-        e.delete_word_before();
-        assert_eq!(e.line(), "");
-        e.delete_word_before(); // clamp at start
-        assert_eq!(e.line(), "");
-
-        // Ctrl+K deletes to end of buffer, Ctrl+C cancels editing.
+        // Ctrl+K deletes to end of buffer, Ctrl+C cancels editing (App-level).
         let mut app = App::new();
-        app.editing = Some(EditingState::new());
-        for c in "hello world".chars() {
-            app.editing.as_mut().unwrap().insert(c);
-        }
+        app.editing = Some(EditingState::from_line("hello world"));
         app.editing.as_mut().unwrap().home();
         app.editing.as_mut().unwrap().word_right();
         assert!(app.handle_editing_key(KeyCode::KeyK, true, false));
@@ -2932,7 +2749,7 @@ mod tests {
         let mut app = App::new();
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
         drop(tx); // pty already gone -> Disconnected on first drain
-        app.panes.insert(
+        app.session.panes.insert(
             0,
             PaneState {
                 parser: Parser::new(10, 5),
@@ -2943,31 +2760,31 @@ mod tests {
                 pty_dead: false,
             },
         );
-        app.active_pane = 0;
+        app.session.active_pane = 0;
 
         app.drain_pty();
-        let first: String = app.panes[&0]
+        let first: String = app.session.panes[&0]
             .parser
             .screen()
             .buffer()
             .iter()
             .flat_map(|row| row.iter().map(|c| c.ch))
             .collect();
-        let scrollback_before = app.panes[&0].parser.screen().scrollback().len();
+        let scrollback_before = app.session.panes[&0].parser.screen().scrollback().len();
         assert!(
             first.contains("Process exited"),
             "first drain should append the exit notice"
         );
 
         app.drain_pty();
-        let second: String = app.panes[&0]
+        let second: String = app.session.panes[&0]
             .parser
             .screen()
             .buffer()
             .iter()
             .flat_map(|row| row.iter().map(|c| c.ch))
             .collect();
-        let scrollback_after = app.panes[&0].parser.screen().scrollback().len();
+        let scrollback_after = app.session.panes[&0].parser.screen().scrollback().len();
         assert_eq!(first, second, "visible buffer unchanged by a second drain");
         assert_eq!(
             scrollback_before, scrollback_after,
@@ -2975,6 +2792,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, feature = "ssh"))]
     #[test]
     fn host_picker_overlay_survives_tiny_window() {
         let mut hp = HostPicker::new();

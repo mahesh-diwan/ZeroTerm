@@ -1,4 +1,4 @@
-# ZeroTerm — Implementation Roadmap
+o# ZeroTerm — Implementation Roadmap
 
 > **Project**: ZeroTerm — GPU-accelerated terminal emulator in Rust
 > **Goal**: Build the fastest terminal with the most features, without compromise

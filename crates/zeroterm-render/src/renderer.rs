@@ -1,6 +1,5 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +11,20 @@ use winit::window::Window;
 
 use zeroterm_core::cell::Color;
 use zeroterm_core::screen::Screen as CoreScreen;
+
+pub type Result<T> = std::result::Result<T, RendererError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RendererError {
+    #[error("wgpu surface creation failed: {0}")]
+    CreateSurface(#[from] wgpu::CreateSurfaceError),
+    #[error("wgpu device request failed: {0}")]
+    Device(#[from] wgpu::RequestDeviceError),
+    #[error("no suitable GPU adapter found; ZeroTerm requires Vulkan, Metal, DX11/12, or OpenGL")]
+    NoAdapter,
+    #[error("font not found: {0}")]
+    FontNotFound(String),
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Selection {
@@ -50,6 +63,8 @@ impl Selection {
 pub struct TabInfo {
     pub title: String,
     pub active: bool,
+    pub hovered: bool,
+    pub close_hovered: bool,
 }
 
 const ATLAS_SIZE: u32 = 1024;
@@ -239,9 +254,11 @@ impl GlyphAtlas {
 
     fn load_font(font_path: Option<String>) -> Result<Vec<u8>> {
         if let Some(path) = font_path {
-            return std::fs::read(&path).map_err(|_| anyhow::anyhow!("Font not found: {}", path));
+            return std::fs::read(&path).map_err(|_| RendererError::FontNotFound(path));
         }
         let paths = [
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+            "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
             "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/GeistMonoVF.ttf",
@@ -439,6 +456,9 @@ impl GlyphAtlas {
     }
 }
 
+/// Generous max rows for the scrollbar overlay storage buffer (2 col cells each).
+const SCROLLBAR_MAX_ROWS: usize = 512;
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -453,6 +473,12 @@ pub struct Renderer {
     tab_bar_buffer: wgpu::Buffer,
     tab_bar_uniform_buffer: wgpu::Buffer,
     tab_bar_bind_group: wgpu::BindGroup,
+    status_bar_buffer: wgpu::Buffer,
+    status_bar_uniform_buffer: wgpu::Buffer,
+    status_bar_bind_group: wgpu::BindGroup,
+    scrollbar_buffer: wgpu::Buffer,
+    scrollbar_uniform_buffer: wgpu::Buffer,
+    scrollbar_bind_group: wgpu::BindGroup,
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
@@ -461,12 +487,14 @@ pub struct Renderer {
     cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
     viewport_origin: [f32; 2],
+    padding: [f32; 4],
     current_frame: Option<wgpu::SurfaceTexture>,
     current_view: Option<wgpu::TextureView>,
     current_encoder: Option<wgpu::CommandEncoder>,
     needs_clear: bool,
     clear_color: [f64; 3],
     opacity: f64,
+    theme: crate::theme::Theme,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     image_texture: Option<wgpu::Texture>,
     image_view: Option<wgpu::TextureView>,
@@ -475,6 +503,11 @@ pub struct Renderer {
     anim_frame_index: usize,
     anim_last_swap: std::time::Instant,
     is_animated: bool,
+    cursor_blink: bool,
+    blink_visible: bool,
+    blink_last_toggle: std::time::Instant,
+    blink_interval: std::time::Duration,
+    cursor_blink_enabled: bool,
 }
 
 impl Renderer {
@@ -487,32 +520,72 @@ impl Renderer {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
         let surface = instance.create_surface(window.clone())?;
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = {
+            let mut options = wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            })
-            .await
-            .ok_or_else(|| anyhow::anyhow!("No suitable adapter found"))?;
+            };
+            let mut found = instance.request_adapter(&options).await;
+            if found.is_none() {
+                log::warn!("No high-performance GPU found, trying low-power (iGPU)");
+                options.power_preference = wgpu::PowerPreference::LowPower;
+                found = instance.request_adapter(&options).await;
+            }
+            if found.is_none() {
+                log::warn!(
+                    "No hardware GPU found, trying software fallback (lavapipe/WARP/SwiftShader)"
+                );
+                options.force_fallback_adapter = true;
+                found = instance.request_adapter(&options).await;
+            }
+            found
+        }
+        .ok_or(RendererError::NoAdapter)?;
+
+        let supports_pipeline_cache = adapter.features().contains(wgpu::Features::PIPELINE_CACHE);
 
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ZeroTerm Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: if supports_pipeline_cache {
+                        wgpu::Features::PIPELINE_CACHE
+                    } else {
+                        wgpu::Features::empty()
+                    },
                     required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                 },
                 None,
             )
             .await?;
+
+        // Pipeline cache (wgpu 23 API): reuse compiled shader state across launches.
+        // Vulkan-only in this wgpu version; on other backends this degrades to no caching.
+        let pipeline_cache = if supports_pipeline_cache {
+            let cache_file = wgpu::util::pipeline_cache_key(&adapter.get_info())
+                .and_then(|key| dirs::cache_dir().map(|dir| dir.join("zeroterm").join(key)));
+            let cache_data = cache_file.as_ref().and_then(|p| std::fs::read(p).ok());
+            let cache = unsafe {
+                // SAFETY: cache_data (if any) was produced by PipelineCache::get_data in a
+                // prior run; fallback:true makes invalid/outdated data degrade to an empty cache.
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("ZeroTerm Pipeline Cache"),
+                    data: cache_data.as_deref(),
+                    fallback: true,
+                })
+            };
+            Some((cache, cache_file))
+        } else {
+            None
+        };
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -524,19 +597,39 @@ impl Renderer {
 
         let alpha_mode = if surface_caps
             .alpha_modes
-            .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
+            .contains(&wgpu::CompositeAlphaMode::Auto)
         {
-            wgpu::CompositeAlphaMode::PostMultiplied
+            wgpu::CompositeAlphaMode::Auto
+        } else if surface_caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            wgpu::CompositeAlphaMode::Opaque
         } else {
             surface_caps.alpha_modes[0]
         };
+
+        let present_mode = if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::Fifo)
+        {
+            wgpu::PresentMode::Fifo
+        } else {
+            surface_caps.present_modes[0]
+        };
+        log::info!(
+            "Using present mode: {:?}, alpha mode: {:?}, surface format: {:?}",
+            present_mode,
+            alpha_mode,
+            surface_format
+        );
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -768,8 +861,21 @@ impl Renderer {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
-            cache: None,
+            cache: pipeline_cache.as_ref().map(|(cache, _)| cache),
         });
+
+        // Persist cache results for the next launch (atomic write, per wgpu docs).
+        if let Some((cache, Some(file))) = pipeline_cache.as_ref() {
+            if let Some(data) = cache.get_data() {
+                if let Some(parent) = file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp = file.with_extension("tmp");
+                if std::fs::write(&tmp, &data).is_ok() {
+                    let _ = std::fs::rename(&tmp, file);
+                }
+            }
+        }
 
         log::info!(
             "Renderer initialized: {}x{} (cell buffer capacity: {} cells)",
@@ -810,6 +916,72 @@ impl Renderer {
             ],
         });
 
+        let status_bar_buffer = {
+            let cells = vec![CellData::zeroed(); 512];
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Status Bar Cell Buffer"),
+                contents: bytemuck::cast_slice(&cells),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let status_bar_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Status Bar Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let status_bar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Status Bar Bind Group"),
+            layout: &render_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        status_bar_uniform_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        status_bar_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        });
+
+        let scrollbar_buffer = {
+            let cells = vec![CellData::zeroed(); SCROLLBAR_MAX_ROWS * 2];
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Scrollbar Cell Buffer"),
+                contents: bytemuck::cast_slice(&cells),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let scrollbar_uniform_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Scrollbar Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let scrollbar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scrollbar Bind Group"),
+            layout: &render_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        scrollbar_uniform_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(
+                        scrollbar_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+            ],
+        });
+
         Ok(Self {
             surface,
             device,
@@ -824,6 +996,12 @@ impl Renderer {
             tab_bar_buffer,
             tab_bar_uniform_buffer,
             tab_bar_bind_group,
+            status_bar_buffer,
+            status_bar_uniform_buffer,
+            status_bar_bind_group,
+            scrollbar_buffer,
+            scrollbar_uniform_buffer,
+            scrollbar_bind_group,
             atlas_bind_group_layout,
             atlas_bind_group,
             glyph_atlas,
@@ -833,12 +1011,14 @@ impl Renderer {
             cell_buffer_capacity,
             dirty_cells: Vec::new(),
             viewport_origin: [0.0, 0.0],
+            padding: [16.0, 16.0, 16.0, 16.0],
             current_frame: None,
             current_view: None,
             current_encoder: None,
             needs_clear: false,
-            clear_color: [0.117, 0.117, 0.117],
+            clear_color: [0.102, 0.106, 0.149],
             opacity,
+            theme: crate::theme::Theme::tokyo_night(),
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
             uploaded_image_id: None,
@@ -846,6 +1026,11 @@ impl Renderer {
             anim_frame_index: 0,
             anim_last_swap: std::time::Instant::now(),
             is_animated: false,
+            cursor_blink: false,
+            blink_visible: true,
+            blink_last_toggle: std::time::Instant::now(),
+            blink_interval: std::time::Duration::from_millis(530),
+            cursor_blink_enabled: true,
         })
     }
 
@@ -923,6 +1108,61 @@ impl Renderer {
                     },
                 ],
             });
+            self.status_bar_buffer = {
+                let cells = vec![CellData::zeroed(); new_cols];
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Status Bar Cell Buffer"),
+                        contents: bytemuck::cast_slice(&cells),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    })
+            };
+            self.status_bar_bind_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Status Bar Bind Group"),
+                    layout: &self.render_pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(
+                                self.status_bar_uniform_buffer.as_entire_buffer_binding(),
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(
+                                self.status_bar_buffer.as_entire_buffer_binding(),
+                            ),
+                        },
+                    ],
+                });
+            self.scrollbar_buffer = {
+                let cells = vec![CellData::zeroed(); SCROLLBAR_MAX_ROWS * 2];
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Scrollbar Cell Buffer"),
+                        contents: bytemuck::cast_slice(&cells),
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    })
+            };
+            self.scrollbar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Scrollbar Bind Group"),
+                layout: &self.render_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(
+                            self.scrollbar_uniform_buffer.as_entire_buffer_binding(),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(
+                            self.scrollbar_buffer.as_entire_buffer_binding(),
+                        ),
+                    },
+                ],
+            });
         }
 
         let uniforms = Uniforms {
@@ -943,23 +1183,29 @@ impl Renderer {
     }
 
     pub fn cols_for(&self, width: f32) -> usize {
-        (width / self.cell_size[0]).floor().max(1.0) as usize
+        let usable = width - self.padding[1] - self.padding[3];
+        (usable / self.cell_size[0]).floor().max(1.0) as usize
     }
 
     pub fn rows_for(&self, height: f32) -> usize {
-        (height / self.cell_size[1]).floor().max(1.0) as usize
+        let usable = height - self.padding[0] - self.padding[2];
+        (usable / self.cell_size[1]).floor().max(1.0) as usize
     }
 
     pub fn begin_frame(&mut self) -> Result<()> {
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!("Surface error: {}", e);
-                return Ok(());
+        let frame = loop {
+            match self.surface.get_current_texture() {
+                Ok(frame) => break frame,
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    self.surface.configure(&self.device, &self.config);
+                    // Surface was recreated; retry so a real frame is
+                    // acquired instead of silently rendering nothing.
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("Surface error: {}", e);
+                    return Ok(());
+                }
             }
         };
         let view = frame
@@ -977,6 +1223,72 @@ impl Renderer {
         Ok(())
     }
 
+    /// Fill the entire window with a solid background so hairline gaps
+    /// between cell quads (fractional device-pixel rounding) don't show the
+    /// clear color underneath. Must be called after begin_frame() and before
+    /// any render_screen()/draw_tab_bar() pass.
+    pub fn draw_background(&mut self, color: [f32; 4]) -> Result<()> {
+        if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
+        let bg = CellData {
+            glyph_uv_min: [0.0, 0.0],
+            glyph_uv_max: [0.0, 0.0],
+            glyph_size: [0.0, 0.0],
+            _pad0: [0.0, 0.0],
+            fg: color,
+            bg: color,
+            attrs: 0,
+            _pad1: [0; 3],
+        };
+        self.queue
+            .write_buffer(&self.tab_bar_buffer, 0, bytemuck::cast_slice(&[bg]));
+
+        let uniforms = Uniforms {
+            screen_size: [self.size.width as f32, self.size.height as f32],
+            cell_size: [self.size.width as f32, self.size.height as f32],
+            viewport_origin: [0.0, 0.0],
+            cols: 1,
+            rows: 1,
+        };
+        self.queue.write_buffer(
+            &self.tab_bar_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+
+        let view = self.current_view.as_ref().unwrap();
+        let encoder = self.current_encoder.as_mut().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Background Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: self.clear_color[0],
+                        g: self.clear_color[1],
+                        b: self.clear_color[2],
+                        a: self.opacity,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.tab_bar_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        render_pass.draw(0..6, 0..1);
+
+        self.needs_clear = false;
+        Ok(())
+    }
+
     pub fn render_screen(
         &mut self,
         screen: &CoreScreen,
@@ -988,8 +1300,18 @@ impl Renderer {
         }
 
         let buffer = screen.buffer();
-        let visible_rows = buffer.len();
-        let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+        let mut visible_rows = buffer.len();
+        let mut cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+        // GPU cell buffer is sized from the window (resize()). A resize race
+        // or split-pane math can hand us a screen larger than that capacity —
+        // clamp so the batch write and instance count never overrun the
+        // storage buffer.
+        let capacity = self.cell_buffer_capacity.max(1);
+        if visible_rows.saturating_mul(cols) > capacity {
+            visible_rows = (capacity / cols.max(1)).min(visible_rows);
+            cols = (capacity / visible_rows.max(1)).min(cols);
+        }
 
         // All cells dirty every frame — GPU handles <200KB writes trivially
         self.dirty_cells.clear();
@@ -998,7 +1320,6 @@ impl Renderer {
                 self.dirty_cells.push((row, col));
             }
         }
-
         self.update_image_from_screen(screen);
 
         // Build and upload vertices for dirty cells only
@@ -1010,7 +1331,10 @@ impl Renderer {
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
             cell_size: [self.cell_width, self.cell_height],
-            viewport_origin: self.viewport_origin,
+            viewport_origin: [
+                self.viewport_origin[0] + self.padding[3],
+                self.viewport_origin[1] + self.padding[0],
+            ],
             cols: cols as u32,
             rows: visible_rows as u32,
         };
@@ -1070,44 +1394,94 @@ impl Renderer {
 
     /// Render a horizontal tab strip at the top of the window (one cell tall).
     /// Runs as its own instanced pass after the pane(s); shader is unchanged.
-    pub fn draw_tab_bar(&mut self, tabs: &[TabInfo], active: usize) -> Result<()> {
+    pub fn draw_tab_bar(&mut self, tabs: &[TabInfo]) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
             return Ok(());
         }
 
-        const INACTIVE_BG: [f32; 4] = [0.10, 0.11, 0.13, 1.0];
-        const ACTIVE_BG: [f32; 4] = [0.28, 0.43, 0.62, 1.0];
-        const FG: [f32; 4] = [0.85, 0.88, 0.92, 1.0];
-        const FG_DIM: [f32; 4] = [0.55, 0.57, 0.62, 1.0];
+        let t = self.theme;
+        let inactive_bg: [f32; 4] = [
+            t.surface.r as f32 / 255.0,
+            t.surface.g as f32 / 255.0,
+            t.surface.b as f32 / 255.0,
+            1.0,
+        ];
+        // Active tab bg: surface_highlight tinted ~30% toward accent (the pill).
+        let active_bg: [f32; 4] = [
+            (t.accent.r as f32 * 0.3 + t.surface_highlight.r as f32 * 0.7) / 255.0,
+            (t.accent.g as f32 * 0.3 + t.surface_highlight.g as f32 * 0.7) / 255.0,
+            (t.accent.b as f32 * 0.3 + t.surface_highlight.b as f32 * 0.7) / 255.0,
+            1.0,
+        ];
+        let fg: [f32; 4] = [
+            t.fg.r as f32 / 255.0,
+            t.fg.g as f32 / 255.0,
+            t.fg.b as f32 / 255.0,
+            1.0,
+        ];
+        let fg_dim: [f32; 4] = [
+            t.border.r as f32 / 255.0,
+            t.border.g as f32 / 255.0,
+            t.border.b as f32 / 255.0,
+            1.0,
+        ];
+        let accent_fg: [f32; 4] = [
+            t.accent.r as f32 / 255.0,
+            t.accent.g as f32 / 255.0,
+            t.accent.b as f32 / 255.0,
+            1.0,
+        ];
+        let hover_bg: [f32; 4] = [
+            t.border.r as f32 / 255.0,
+            t.border.g as f32 / 255.0,
+            t.border.b as f32 / 255.0,
+            1.0,
+        ];
+        let close_red: [f32; 4] = [
+            t.ansi[1].r as f32 / 255.0,
+            t.ansi[1].g as f32 / 255.0,
+            t.ansi[1].b as f32 / 255.0,
+            1.0,
+        ];
 
-        let cols = self.cols_for(self.size.width as f32);
+        let cols = (self.size.width as f32 / self.cell_size[0])
+            .floor()
+            .max(1.0) as usize;
         let space = self
             .glyph_atlas
             .get_or_insert_glyph(' ', &self.device, &self.queue);
 
         let mut batch = vec![CellData::zeroed(); cols];
         for cell in &mut batch {
-            cell.bg = INACTIVE_BG;
-            cell.fg = FG_DIM;
+            cell.bg = inactive_bg;
+            cell.fg = fg_dim;
             cell.glyph_uv_min = [space.0, space.1];
             cell.glyph_uv_max = [space.2, space.3];
             cell.glyph_size = [space.4, space.5];
         }
 
         let mut col = 1usize;
-        for (i, tab) in tabs.iter().enumerate() {
+        for tab in tabs {
             if col >= cols {
                 break;
             }
             let title = truncate_title(&tab.title, 20);
             let span = tab_span(&tab.title, 20);
-            let is_active = i == active;
-            let bg = if is_active { ACTIVE_BG } else { INACTIVE_BG };
-            let fg = if is_active { FG } else { FG_DIM };
+            let (bg, fgc) = if tab.active {
+                (active_bg, accent_fg)
+            } else if tab.hovered {
+                (hover_bg, fg)
+            } else {
+                (inactive_bg, fg_dim)
+            };
             let end = (col + span).min(cols);
             for cell in batch.iter_mut().take(end).skip(col) {
                 cell.bg = bg;
-                cell.fg = fg;
+                cell.fg = fgc;
+            }
+            // 1-cell accent line under the active tab (left padding cell).
+            if tab.active && col < end {
+                batch[col].bg = accent_fg;
             }
             for (k, ch) in title.chars().enumerate() {
                 let c = col + 1 + k;
@@ -1120,6 +1494,23 @@ impl Renderer {
                 batch[c].glyph_uv_min = [u0, v0];
                 batch[c].glyph_uv_max = [u1, v1];
                 batch[c].glyph_size = [gw, gh];
+            }
+            // Close button occupies the right padding cell; only drawn while hovered.
+            if tab.hovered {
+                let close_c = col + span - 1;
+                if close_c < cols {
+                    let (u0, v0, u1, v1, gw, gh) =
+                        self.glyph_atlas
+                            .get_or_insert_glyph('×', &self.device, &self.queue);
+                    batch[close_c].glyph_uv_min = [u0, v0];
+                    batch[close_c].glyph_uv_max = [u1, v1];
+                    batch[close_c].glyph_size = [gw, gh];
+                    batch[close_c].fg = if tab.close_hovered {
+                        close_red
+                    } else {
+                        accent_fg
+                    };
+                }
             }
             col += span + 1;
         }
@@ -1166,6 +1557,216 @@ impl Renderer {
         Ok(())
     }
 
+    /// Height of the status bar in pixels (one cell row).
+    pub fn status_bar_height(&self) -> f32 {
+        self.cell_height
+    }
+
+    /// Render a one-cell-tall status bar across the bottom of the window,
+    /// with the active pane title left and a scroll indicator right.
+    pub fn draw_status_bar(&mut self, left: &str, right: &str) -> Result<()> {
+        if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
+        let t = self.theme;
+        let bg: [f32; 4] = [
+            t.surface.r as f32 / 255.0,
+            t.surface.g as f32 / 255.0,
+            t.surface.b as f32 / 255.0,
+            1.0,
+        ];
+        let fg: [f32; 4] = [
+            t.fg.r as f32 / 255.0,
+            t.fg.g as f32 / 255.0,
+            t.fg.b as f32 / 255.0,
+            1.0,
+        ];
+
+        let cols = (self.size.width as f32 / self.cell_width).floor().max(1.0) as usize;
+        let space = self
+            .glyph_atlas
+            .get_or_insert_glyph(' ', &self.device, &self.queue);
+        let mut batch = vec![CellData::zeroed(); cols];
+        for cell in &mut batch {
+            cell.bg = bg;
+            cell.fg = fg;
+            cell.glyph_uv_min = [space.0, space.1];
+            cell.glyph_uv_max = [space.2, space.3];
+            cell.glyph_size = [space.4, space.5];
+        }
+
+        let title = truncate_title(left, cols.saturating_sub(2));
+        for (k, ch) in title.chars().enumerate() {
+            let c = 1 + k;
+            if c >= cols {
+                break;
+            }
+            let (u0, v0, u1, v1, gw, gh) =
+                self.glyph_atlas
+                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+            batch[c].glyph_uv_min = [u0, v0];
+            batch[c].glyph_uv_max = [u1, v1];
+            batch[c].glyph_size = [gw, gh];
+        }
+        let mut c = cols.saturating_sub(1);
+        for ch in right.chars().rev() {
+            let (u0, v0, u1, v1, gw, gh) =
+                self.glyph_atlas
+                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+            batch[c].glyph_uv_min = [u0, v0];
+            batch[c].glyph_uv_max = [u1, v1];
+            batch[c].glyph_size = [gw, gh];
+            if c == 0 {
+                break;
+            }
+            c -= 1;
+        }
+
+        self.queue
+            .write_buffer(&self.status_bar_buffer, 0, bytemuck::cast_slice(&batch));
+        let uniforms = Uniforms {
+            screen_size: [self.size.width as f32, self.size.height as f32],
+            cell_size: [self.cell_width, self.cell_height],
+            viewport_origin: [0.0, self.size.height as f32 - self.cell_height],
+            cols: cols as u32,
+            rows: 1,
+        };
+        self.queue.write_buffer(
+            &self.status_bar_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+
+        let view = self.current_view.as_ref().unwrap();
+        let encoder = self.current_encoder.as_mut().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Status Bar Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.status_bar_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        render_pass.draw(0..6, 0..cols as u32);
+        Ok(())
+    }
+
+    /// Right-edge scrollbar overlay over the active pane. `fraction` is
+    /// scroll_offset/max_scroll_offset, so 0.0 = at the bottom (thumb at the
+    /// bottom). Track fills the pane's 2 rightmost cells, thumb is accent.
+    pub fn draw_scrollbar(
+        &mut self,
+        vx: f32,
+        vy: f32,
+        vw: f32,
+        vh: f32,
+        fraction: f32,
+    ) -> Result<()> {
+        if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
+        let t = self.theme;
+        let track: [f32; 4] = [
+            t.surface.r as f32 / 255.0,
+            t.surface.g as f32 / 255.0,
+            t.surface.b as f32 / 255.0,
+            1.0,
+        ];
+        let thumb: [f32; 4] = [
+            t.accent.r as f32 / 255.0,
+            t.accent.g as f32 / 255.0,
+            t.accent.b as f32 / 255.0,
+            1.0,
+        ];
+        let space = self
+            .glyph_atlas
+            .get_or_insert_glyph(' ', &self.device, &self.queue);
+
+        let bar_x = vx + vw - 2.0 * self.cell_width;
+        let bar_y = vy + self.padding[0];
+        let bar_h = (vh - self.padding[0] - self.padding[2]).max(0.0);
+        // Clamp to the storage buffer's row capacity (never overrun).
+        let rows = ((bar_h / self.cell_height).floor() as usize).min(SCROLLBAR_MAX_ROWS);
+        if rows == 0 {
+            return Ok(());
+        }
+        let batch_len = 2 * rows;
+        let mut batch = vec![CellData::zeroed(); batch_len];
+        for cell in &mut batch {
+            cell.bg = track;
+            cell.glyph_uv_min = [space.0, space.1];
+            cell.glyph_uv_max = [space.2, space.3];
+            cell.glyph_size = [space.4, space.5];
+        }
+
+        let visible_fraction = 1.0 - fraction;
+        let mut thumb_rows = (rows as f32 * visible_fraction)
+            .ceil()
+            .max(2.0)
+            .min(rows as f32) as usize;
+        if thumb_rows < 1 {
+            thumb_rows = 1;
+        }
+        let max_start = rows.saturating_sub(thumb_rows);
+        let tstart =
+            (rows as f32 - thumb_rows as f32 - fraction * (rows as f32 - thumb_rows as f32))
+                .round()
+                .clamp(0.0, max_start as f32) as usize;
+        for r in tstart..(tstart + thumb_rows).min(rows) {
+            let base = 2 * r;
+            batch[base].bg = thumb;
+            batch[base + 1].bg = thumb;
+        }
+
+        self.queue
+            .write_buffer(&self.scrollbar_buffer, 0, bytemuck::cast_slice(&batch));
+        let uniforms = Uniforms {
+            screen_size: [self.size.width as f32, self.size.height as f32],
+            cell_size: [self.cell_width, self.cell_height],
+            viewport_origin: [bar_x, bar_y],
+            cols: 2,
+            rows: rows as u32,
+        };
+        self.queue.write_buffer(
+            &self.scrollbar_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[uniforms]),
+        );
+
+        let view = self.current_view.as_ref().unwrap();
+        let encoder = self.current_encoder.as_mut().unwrap();
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Scrollbar Render Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_pipeline(&self.render_pipeline);
+        render_pass.set_bind_group(0, &self.scrollbar_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
+        render_pass.draw(0..6, 0..batch_len as u32);
+        Ok(())
+    }
+
     fn update_cell_data(
         &mut self,
         screen: &CoreScreen,
@@ -1173,8 +1774,17 @@ impl Renderer {
         selection: Option<Selection>,
     ) -> Result<()> {
         let buffer = screen.buffer();
-        let visible_rows = buffer.len();
-        let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+        let mut visible_rows = buffer.len();
+        let mut cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
+
+        // Same clamp as render_screen: the GPU cell buffer is window-sized;
+        // never build a batch that overruns it.
+        let capacity = self.cell_buffer_capacity.max(1);
+        if visible_rows.saturating_mul(cols) > capacity {
+            visible_rows = (capacity / cols.max(1)).min(visible_rows);
+            cols = (capacity / visible_rows.max(1)).min(cols);
+        }
+
         let cursor = screen.cursor();
         let cursor_col = cursor.col;
         let cursor_visible = cursor.visible;
@@ -1219,33 +1829,38 @@ impl Renderer {
 
             let cell = &line[dirty_col];
 
-            let mut fg = cell.fg;
-            let bg = cell.bg;
+            let mut fg = self.theme.map_cell_color(cell.fg);
+            let bg = self.theme.map_cell_color(cell.bg);
 
             // Syntax classes are tagged into cells at write time (see Screen),
             // so scrollback rows carry their colors too — no scroll_offset gate.
+            let mut cell_attrs = cell.attrs;
             if cell.syntax_color != 0 {
-                if let Some(c) = Self::highlight_color(cell.syntax_color) {
+                if let Some(c) = Self::highlight_color(cell.syntax_color, &self.theme) {
                     fg = c;
+                }
+                if cell.syntax_color == zeroterm_core::highlight::HL_URL {
+                    cell_attrs.underline = zeroterm_core::cell::UnderlineStyle::Single;
                 }
             }
 
             let is_cursor_cell = cursor_visible
+                && self.blink_visible
                 && scroll_offset == 0
                 && dirty_row == cursor.row
                 && dirty_col == cursor_col;
             let (fg, bg, cell_attrs) = if is_cursor_cell {
                 match cursor_shape {
-                    zeroterm_core::cell::CursorShape::Block => (bg, fg, cell.attrs),
+                    zeroterm_core::cell::CursorShape::Block => (bg, fg, cell_attrs),
                     zeroterm_core::cell::CursorShape::Underline => {
-                        let mut a = cell.attrs;
+                        let mut a = cell_attrs;
                         a.underline = zeroterm_core::cell::UnderlineStyle::Single;
                         (fg, bg, a)
                     }
-                    zeroterm_core::cell::CursorShape::Bar => (fg, bg, cell.attrs),
+                    zeroterm_core::cell::CursorShape::Bar => (fg, bg, cell_attrs),
                 }
             } else {
-                (fg, bg, cell.attrs)
+                (fg, bg, cell_attrs)
             };
 
             let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
@@ -1333,10 +1948,34 @@ impl Renderer {
     }
 
     pub fn reload_config(&mut self, config: &zeroterm_config::Config) {
-        if let Some((r, g, b)) = Self::parse_hex_color(&config.colors.background) {
-            self.clear_color = [r, g, b];
-        }
+        self.theme = crate::theme::Theme::by_name(&config.colors.theme);
+        let (r, g, b) = (
+            self.theme.bg.r as f64 / 255.0,
+            self.theme.bg.g as f64 / 255.0,
+            self.theme.bg.b as f64 / 255.0,
+        );
+        self.clear_color = [r, g, b];
         self.opacity = config.window.opacity;
+        self.set_cursor_blink(config.cursor.blink, config.cursor.blink_interval_ms);
+    }
+
+    pub fn theme_bg(&self) -> [f32; 4] {
+        [
+            self.theme.bg.r as f32 / 255.0,
+            self.theme.bg.g as f32 / 255.0,
+            self.theme.bg.b as f32 / 255.0,
+            1.0,
+        ]
+    }
+
+    pub fn set_theme(&mut self, name: &str) {
+        self.theme = crate::theme::Theme::by_name(name);
+        let (r, g, b) = (
+            self.theme.bg.r as f64 / 255.0,
+            self.theme.bg.g as f64 / 255.0,
+            self.theme.bg.b as f64 / 255.0,
+        );
+        self.clear_color = [r, g, b];
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {
@@ -1456,6 +2095,34 @@ impl Renderer {
         }
     }
 
+    pub fn set_cursor_blink(&mut self, enabled: bool, interval_ms: u64) {
+        self.cursor_blink_enabled = enabled;
+        self.cursor_blink = enabled;
+        self.blink_interval = std::time::Duration::from_millis(interval_ms);
+    }
+
+    /// Progress the cursor blink phase if its interval has elapsed and return
+    /// how long until the next toggle, or `None` when blinking is disabled.
+    /// The caller should request a redraw whenever this returns `Some`.
+    pub fn cursor_blink_tick(&mut self) -> Option<std::time::Duration> {
+        if !self.cursor_blink_enabled {
+            if self.cursor_blink {
+                self.cursor_blink = false;
+            }
+            self.blink_visible = true;
+            return None;
+        }
+        let elapsed = self.blink_last_toggle.elapsed();
+        if elapsed >= self.blink_interval {
+            self.blink_visible = !self.blink_visible;
+            self.cursor_blink = self.blink_visible;
+            self.blink_last_toggle = std::time::Instant::now();
+            Some(self.blink_interval)
+        } else {
+            Some(self.blink_interval.saturating_sub(elapsed))
+        }
+    }
+
     pub fn reload_font(&mut self, font_path: Option<String>) {
         self.glyph_atlas.font_path = font_path.clone();
         if let Ok(data) = GlyphAtlas::load_font(font_path) {
@@ -1464,30 +2131,15 @@ impl Renderer {
         }
     }
 
-    /// Palette for `highlight` classes, reusing the core Color accents.
-    fn highlight_color(idx: u8) -> Option<Color> {
+    /// Palette for `highlight` classes, mapped through the active theme's ANSI colors.
+    fn highlight_color(idx: u8, theme: &crate::theme::Theme) -> Option<Color> {
         match idx {
-            zeroterm_core::highlight::HL_KEYWORD => Some(Color::CYAN),
-            zeroterm_core::highlight::HL_STRING => Some(Color::YELLOW),
-            zeroterm_core::highlight::HL_NUMBER => Some(Color::MAGENTA),
-            zeroterm_core::highlight::HL_COMMENT => Some(Color {
-                r: 0x80,
-                g: 0x80,
-                b: 0x80,
-            }),
+            zeroterm_core::highlight::HL_KEYWORD => Some(theme.ansi[6]),
+            zeroterm_core::highlight::HL_STRING => Some(theme.ansi[3]),
+            zeroterm_core::highlight::HL_NUMBER => Some(theme.ansi[5]),
+            zeroterm_core::highlight::HL_COMMENT => Some(theme.ansi[8]),
+            zeroterm_core::highlight::HL_URL => Some(theme.accent),
             _ => None,
-        }
-    }
-
-    fn parse_hex_color(hex: &str) -> Option<(f64, f64, f64)> {
-        let hex = hex.trim_start_matches('#');
-        if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f64 / 255.0;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f64 / 255.0;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f64 / 255.0;
-            Some((r, g, b))
-        } else {
-            None
         }
     }
 }

@@ -46,3 +46,6 @@ coverage/
 .env.local
 .env.production.local
 .env.development.local
+# Build artifacts
+/dist/
+zeroterm_screenshot.png

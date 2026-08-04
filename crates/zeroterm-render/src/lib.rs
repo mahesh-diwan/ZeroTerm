@@ -1,6 +1,7 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
 pub mod renderer;
+pub mod theme;
 
 pub use renderer::{tab_span, Renderer, Selection, TabInfo};
 

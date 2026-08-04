@@ -58,20 +58,32 @@ fn vs_main(input: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput
     let x = pos.x / uniforms.screen_size.x * 2.0 - 1.0;
     let y = 1.0 - pos.y / uniforms.screen_size.y * 2.0;
 
+    // Inflate the quad by half a device pixel so adjacent cells overlap
+    // at fractional scaling (no hairline seams from rasterizer coverage).
+    var clip_xy = vec2<f32>(x, y);
+    clip_xy += (local * 2.0 - 1.0) / uniforms.screen_size;
+
     var output: VertexOutput;
-    output.clip_position = vec4<f32>(x, y, 0.0, 1.0);
+    output.clip_position = vec4<f32>(clip_xy, 0.0, 1.0);
     output.color = data.fg;
     output.bg_color = data.bg;
-    output.tex_coord = mix(data.glyph_uv_min, data.glyph_uv_max, local);
+    output.tex_coord = mix(data.glyph_uv_min, data.glyph_uv_max, clamp(local, vec2<f32>(0.0), vec2<f32>(1.0)));
     output.cell_size = local;
     output.attrs = data.attrs;
     return output;
 }
 
+fn srgb_to_linear(c: vec4<f32>) -> vec4<f32> {
+    let low = c.rgb / 12.92;
+    let high = pow((c.rgb + 0.055) / 1.055, vec3<f32>(2.4));
+    let cond = c.rgb <= vec3<f32>(0.04045);
+    return vec4<f32>(select(high, low, cond), c.a);
+}
+
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    var fg = input.color;
-    var bg = input.bg_color;
+    var fg = srgb_to_linear(input.color);
+    var bg = srgb_to_linear(input.bg_color);
 
     if (input.attrs & 0x40u) != 0u {
         let temp = fg;

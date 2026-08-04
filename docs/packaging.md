@@ -49,6 +49,10 @@ details, the WiX MSI template, and cross-compile caveats.
   `~/.cache/zeroterm-appimage`), stages binary + `.desktop` + icon, outputs
   `dist/ZeroTerm-<arch>.AppImage`. Uses `APPIMAGE_EXTRACT_AND_RUN=1` so FUSE is not needed.
   (`scripts/build-appimage.sh` is the older appimagetool-only variant.)
+- **zstd tarball:** `scripts/package-zstd.sh [--rebuild]` builds the release binary if missing
+  (or with `--rebuild`) and emits `dist/zeroterm-v<VERSION>-<ARCH>.tar.zst` (binary + README,
+  sorted entries + fixed mtime for reproducible builds). Falls back to `.tar.gz` if `zstd` is
+  not on PATH. Version read from `crates/zeroterm/Cargo.toml`.
 - **deb/rpm/flatpak:** `scripts/build-deb.sh`, `scripts/build-rpm.sh`,
   `scripts/io.github.zeroterm.ZeroTerm.yml`.
 

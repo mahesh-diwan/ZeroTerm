@@ -10,6 +10,7 @@ pub trait PtyBackend: Send {
         program: &str,
         args: &[&str],
         cwd: Option<&str>,
+        env: &[(&str, &str)],
     ) -> Result<Box<dyn PtyProcess>>;
     fn resize(&mut self, size: Size) -> Result<()>;
 }
@@ -20,6 +21,12 @@ pub trait PtyProcess: Send {
     fn resize(&mut self, size: Size) -> Result<()>;
     fn wait(&mut self) -> Result<i32>;
     fn kill(&mut self) -> Result<()>;
+    /// Detach the read handle so output can be consumed on a dedicated
+    /// thread while writes/resizes continue on another. Fixes the PTY I/O
+    /// deadlock where a blocking read starved the command channel.
+    fn split_reader(
+        self: Box<Self>,
+    ) -> Result<(Box<dyn std::io::Read + Send>, Box<dyn PtyProcess>)>;
 }
 
 pub struct PortablePtyBackend {
@@ -39,11 +46,15 @@ impl PtyBackend for PortablePtyBackend {
         program: &str,
         args: &[&str],
         cwd: Option<&str>,
+        env: &[(&str, &str)],
     ) -> Result<Box<dyn PtyProcess>> {
         let mut cmd = CommandBuilder::new(program);
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.cwd(cwd);
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
 
         let pair = self.system.openpty(PtySize {
@@ -58,7 +69,7 @@ impl PtyBackend for PortablePtyBackend {
         let writer = pair.master.take_writer()?;
 
         Ok(Box::new(PortablePtyProcess {
-            reader,
+            reader: Some(reader),
             writer,
             child: Some(child),
             master: pair.master,
@@ -72,7 +83,7 @@ impl PtyBackend for PortablePtyBackend {
 }
 
 pub struct PortablePtyProcess {
-    reader: Box<dyn std::io::Read + Send>,
+    reader: Option<Box<dyn std::io::Read + Send>>,
     writer: Box<dyn std::io::Write + Send>,
     child: Option<Box<dyn portable_pty::Child + Send>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
@@ -81,7 +92,10 @@ pub struct PortablePtyProcess {
 impl PtyProcess for PortablePtyProcess {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         use std::io::Read;
-        self.reader.read(buf).map_err(Into::into)
+        match self.reader.as_mut() {
+            Some(r) => r.read(buf).map_err(Into::into),
+            None => Ok(0),
+        }
     }
 
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
@@ -115,5 +129,16 @@ impl PtyProcess for PortablePtyProcess {
         } else {
             Ok(())
         }
+    }
+
+    fn split_reader(
+        self: Box<Self>,
+    ) -> Result<(Box<dyn std::io::Read + Send>, Box<dyn PtyProcess>)> {
+        let mut this = *self;
+        let reader = this
+            .reader
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("PTY reader already split"))?;
+        Ok((reader, Box::new(this)))
     }
 }

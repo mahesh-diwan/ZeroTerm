@@ -32,6 +32,8 @@ pub struct Config {
     pub colors: ColorConfig,
     pub shell: ShellConfig,
     pub window: WindowConfig,
+    #[serde(default)]
+    pub cursor: CursorConfig,
     pub ai: AiConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
@@ -85,6 +87,14 @@ impl Config {
         }
 
         Ok(config)
+    }
+
+    pub fn load_async(path: Option<PathBuf>) -> (Self, std::sync::mpsc::Receiver<Self>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::load(path.as_deref()).unwrap_or_default());
+        });
+        (Self::default(), rx)
     }
 
     pub fn apply_overrides(&mut self, overrides: HashMap<String, String>) {
@@ -178,11 +188,108 @@ impl Config {
         self.colors = new_config.colors;
         self.shell = new_config.shell;
         self.window = new_config.window;
+        self.cursor = new_config.cursor;
         self.ai = new_config.ai;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
         self.keybindings = new_config.keybindings;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn load_async_returns_defaults_then_hydrates_from_file() {
+        let path = std::env::temp_dir().join(format!("zeroterm-test-{}.toml", std::process::id()));
+        let mut expected = Config::default();
+        expected.colors.foreground = "#112233".to_string();
+        fs::write(&path, toml::to_string_pretty(&expected).unwrap()).unwrap();
+
+        let (defaults, rx) = Config::load_async(Some(path.clone()));
+        assert_eq!(
+            defaults.colors.foreground,
+            Config::default().colors.foreground
+        );
+
+        let hydrated = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(hydrated.colors.foreground, "#112233");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn window_config_defaults_are_correct() {
+        let win = WindowConfig::default();
+        assert_eq!(win.opacity, 1.0);
+        assert!(!win.blur);
+        assert_eq!(win.blur_radius, 8.0);
+    }
+
+    #[test]
+    fn window_config_deserializes_with_new_keys() {
+        let win: WindowConfig = toml::from_str(
+            "width = 1200\nheight = 800\nopacity = 0.7\nblur = true\nblur_radius = 16.0",
+        )
+        .unwrap();
+        assert_eq!(win.opacity, 0.7);
+        assert!(win.blur);
+        assert_eq!(win.blur_radius, 16.0);
+    }
+
+    #[test]
+    fn window_config_without_new_keys_uses_defaults() {
+        let win: WindowConfig =
+            toml::from_str("width = 1200\nheight = 800\nopacity = 1.0").unwrap();
+        assert!(!win.blur);
+        assert_eq!(win.blur_radius, 8.0);
+    }
+
+    #[test]
+    fn window_config_toml_round_trips() {
+        let config = WindowConfig {
+            width: 1200,
+            height: 800,
+            opacity: 0.7,
+            blur: true,
+            blur_radius: 16.0,
+        };
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: WindowConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.opacity, 0.7);
+        assert!(parsed.blur);
+        assert_eq!(parsed.blur_radius, 16.0);
+    }
+
+    #[test]
+    fn cursor_config_defaults_are_correct() {
+        let cursor = CursorConfig::default();
+        assert!(cursor.blink);
+        assert_eq!(cursor.blink_interval_ms, 530);
+    }
+
+    #[test]
+    fn cursor_config_deserializes_with_new_keys() {
+        let mut config = Config::default();
+        config.cursor.blink = false;
+        config.cursor.blink_interval_ms = 900;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.cursor.blink);
+        assert_eq!(parsed.cursor.blink_interval_ms, 900);
+    }
+
+    #[test]
+    fn cursor_config_without_keys_uses_defaults() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("cursor");
+        let parsed: Config = table.try_into().unwrap();
+        assert!(parsed.cursor.blink);
+        assert_eq!(parsed.cursor.blink_interval_ms, 530);
     }
 }
 
@@ -209,6 +316,7 @@ impl Default for FontConfig {
 pub struct ColorConfig {
     pub foreground: String,
     pub background: String,
+    pub theme: String,
 }
 
 impl Default for ColorConfig {
@@ -216,6 +324,7 @@ impl Default for ColorConfig {
         Self {
             foreground: "#e0e0e0".to_string(),
             background: "#1e1e1e".to_string(),
+            theme: "tokyo-night".to_string(),
         }
     }
 }
@@ -244,6 +353,18 @@ pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
     pub opacity: f64,
+    #[serde(default = "default_blur")]
+    pub blur: bool,
+    #[serde(default = "default_blur_radius")]
+    pub blur_radius: f64,
+}
+
+fn default_blur() -> bool {
+    false
+}
+
+fn default_blur_radius() -> f64 {
+    8.0
 }
 
 impl Default for WindowConfig {
@@ -252,6 +373,33 @@ impl Default for WindowConfig {
             width: 1200,
             height: 800,
             opacity: 1.0,
+            blur: false,
+            blur_radius: 8.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorConfig {
+    #[serde(default = "default_cursor_blink")]
+    pub blink: bool,
+    #[serde(default = "default_cursor_blink_interval")]
+    pub blink_interval_ms: u64,
+}
+
+fn default_cursor_blink() -> bool {
+    true
+}
+
+fn default_cursor_blink_interval() -> u64 {
+    530
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            blink: true,
+            blink_interval_ms: 530,
         }
     }
 }
