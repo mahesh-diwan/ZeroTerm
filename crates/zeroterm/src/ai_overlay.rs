@@ -5,8 +5,14 @@
 //! blocks. Drawn into the active pane's parser screen via synthetic CSI,
 //! snapshot on open / restore on close (same pattern as the settings overlay).
 
+#[cfg(feature = "ai")]
+use std::sync::Arc;
+
 use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
+
+#[cfg(feature = "ai")]
+use zeroterm_ai::client::{AiClient, AiError};
 
 use crate::app::block_output_text;
 
@@ -177,7 +183,70 @@ impl AiOverlay {
     }
 }
 
-/// Build the explain prompt from the last non-empty command block: its
+/// Pending AI line completion for the prompt editor. Mirrors the AiOverlay
+/// fire-and-poll channel pattern: the request runs on a background thread, the
+/// render loop polls it, and the staged suffix is accepted into the buffer on
+/// the next Tab.
+#[cfg_attr(not(feature = "ai"), allow(dead_code))]
+#[derive(Default)]
+pub struct AiCompletion {
+    /// Suffix to accept on the next Tab (set by poll() once a result lands).
+    pub text: String,
+    /// In-flight request; Some until the result is collected.
+    pub pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+}
+
+#[cfg_attr(not(feature = "ai"), allow(dead_code))]
+impl AiCompletion {
+    /// True when a suggestion is staged and ready to accept.
+    pub fn ready(&self) -> bool {
+        !self.text.is_empty() && self.pending.is_none()
+    }
+
+    /// Fire a completion request for `context`; the result lands via poll().
+    #[cfg(feature = "ai")]
+    pub fn request(&mut self, ai_client: Arc<AiClient>, context: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.text.clear();
+        self.pending = Some(rx);
+        std::thread::spawn(move || {
+            let result = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(ai_client.complete(&context)),
+                Err(e) => Err(AiError::RequestFailed(e.to_string())),
+            };
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+    }
+
+    /// Collect a finished result if one arrived; true when the state changed.
+    pub fn poll(&mut self) -> bool {
+        let Some(rx) = &self.pending else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(suffix)) => {
+                self.text = suffix;
+                self.pending = None;
+                true
+            }
+            Ok(Err(_)) => {
+                self.text.clear();
+                self.pending = None;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// Pure Tab policy for the line editor: accept the staged suffix when one is
+/// ready, otherwise fall back to inserting a literal tab.
+#[cfg_attr(not(feature = "ai"), allow(dead_code))]
+pub fn completion_tab(comp: Option<&AiCompletion>) -> Option<String> {
+    comp.filter(|c| c.ready()).map(|c| c.text.clone())
+}
+
+// Build the explain prompt from the last non-empty command block: its
 /// command plus the plain text of its output rows.
 #[cfg_attr(not(feature = "ai"), allow(dead_code))]
 pub fn explain_prompt(screen: &Screen) -> Option<String> {
@@ -288,5 +357,46 @@ mod tests {
         let (_, rx) = std::sync::mpsc::channel::<Result<String, String>>();
         ai.pending = Some(rx);
         assert!(!ai.poll());
+    }
+
+    #[test]
+    fn completion_tab_accepts_ready_and_falls_back() {
+        // Nothing staged -> literal tab.
+        assert_eq!(completion_tab(None), None);
+        let comp = AiCompletion::default();
+        assert_eq!(completion_tab(Some(&comp)), None);
+        // In-flight request, no result yet -> literal tab.
+        let (_, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        let mut in_flight = AiCompletion {
+            pending: Some(rx),
+            ..Default::default()
+        };
+        assert_eq!(completion_tab(Some(&in_flight)), None);
+        // Staged result -> accept suffix.
+        in_flight.pending = None;
+        in_flight.text = "ld".to_string();
+        assert_eq!(completion_tab(Some(&in_flight)), Some("ld".to_string()));
+    }
+
+    #[test]
+    fn completion_poll_stages_result() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok("ld".to_string())).unwrap();
+        let mut comp = AiCompletion {
+            pending: Some(rx),
+            ..Default::default()
+        };
+        assert!(comp.poll());
+        assert_eq!(comp.text, "ld");
+        assert!(comp.pending.is_none());
+        assert!(comp.ready());
+        // Error clears the suggestion instead of staging it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Err("bad".to_string())).unwrap();
+        comp.text = "stale".to_string();
+        comp.pending = Some(rx);
+        assert!(comp.poll());
+        assert_eq!(comp.text, "");
+        assert!(!comp.ready());
     }
 }

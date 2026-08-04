@@ -75,6 +75,11 @@ const ATTR_DIM: u32 = 0x10;
 
 const COPY_MARKER: &str = "[copy]";
 
+/// Supported Gaussian kernel sizes (odd). `blur_radius` is quantized to the
+/// nearest one; each entry is the tap count along one axis.
+const BLUR_TAPS: [usize; 5] = [3, 5, 7, 9, 11];
+const MAX_BLUR_TAPS: usize = 16;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Uniforms {
@@ -102,6 +107,17 @@ struct CellData {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct QuadVertex {
     position: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+struct BlurParams {
+    // header.x = tap count. vec4 (not u32 + pads) keeps the struct 16-aligned
+    // for the uniform address space; kernel entries are vec4 for the same
+    // reason (array element stride must be a multiple of 16).
+    header: [u32; 4],
+    // Each entry: [weight, x_offset_norm, y_offset_norm, unused].
+    kernel: [[f32; 4]; MAX_BLUR_TAPS],
 }
 
 const QUAD_VERTS: [QuadVertex; 6] = [
@@ -475,6 +491,15 @@ pub struct Renderer {
     needs_clear: bool,
     clear_color: [f64; 3],
     opacity: f64,
+    blur: bool,
+    blur_radius: f32,
+    offscreen_texture: Option<wgpu::Texture>,
+    offscreen_view: Option<wgpu::TextureView>,
+    blur_bind_group: Option<wgpu::BindGroup>,
+    blur_params_buffer: wgpu::Buffer,
+    blur_pipeline: wgpu::RenderPipeline,
+    blur_bind_group_layout: wgpu::BindGroupLayout,
+    scene_sampler: wgpu::Sampler,
     theme: crate::theme::Theme,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     image_texture: Option<wgpu::Texture>,
@@ -866,6 +891,98 @@ impl Renderer {
             cell_buffer_capacity
         );
 
+        // Blur composite pipeline: full-screen triangle post-process that blurs
+        // the offscreen scene texture onto the surface. Created unconditionally
+        // (cheap); the offscreen target itself is only allocated when the blur
+        // path is actually requested.
+        let blur_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blur Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Blur Pipeline Layout"),
+            bind_group_layouts: &[&blur_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let blur_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Blur Params Buffer"),
+            contents: bytemuck::cast_slice(&[BlurParams {
+                header: [BLUR_TAPS[0] as u32, 0, 0, 0],
+                kernel: [[0.0; 4]; MAX_BLUR_TAPS],
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Blur Scene Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Blur Composite Pipeline"),
+            layout: Some(&blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_blur"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_blur"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: pipeline_cache.as_ref().map(|(cache, _)| cache),
+        });
+
         let tab_bar_buffer = {
             let cells = vec![CellData::zeroed(); cols as usize];
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1000,6 +1117,15 @@ impl Renderer {
             needs_clear: false,
             clear_color: [0.102, 0.106, 0.149],
             opacity,
+            blur: false,
+            blur_radius: 8.0,
+            offscreen_texture: None,
+            offscreen_view: None,
+            blur_bind_group: None,
+            blur_params_buffer,
+            blur_pipeline,
+            blur_bind_group_layout,
+            scene_sampler,
             theme: crate::theme::Theme::tokyo_night(),
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
@@ -1156,6 +1282,7 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.recreate_offscreen();
     }
 
     /// Offset added to every cell position in the shader (pixels).
@@ -1239,7 +1366,14 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = self.current_view.as_ref().unwrap();
+        let view = if self.blur_active() {
+            self.offscreen_view.as_ref()
+        } else {
+            self.current_view.as_ref()
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
         let encoder = self.current_encoder.as_mut().unwrap();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Background Pass"),
@@ -1323,7 +1457,14 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let view = self.current_view.as_ref().unwrap();
+        let view = if self.blur_active() {
+            self.offscreen_view.as_ref()
+        } else {
+            self.current_view.as_ref()
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
         let encoder = self.current_encoder.as_mut().unwrap();
         let load = if self.needs_clear {
             self.needs_clear = false;
@@ -1364,6 +1505,8 @@ impl Renderer {
     }
 
     pub fn end_frame(&mut self) -> Result<()> {
+        // Blur composite must join the frame's encoder before it is submitted.
+        self.run_blur_composite();
         if let Some(encoder) = self.current_encoder.take() {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -1513,7 +1656,14 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = self.current_view.as_ref().unwrap();
+        let view = if self.blur_active() {
+            self.offscreen_view.as_ref()
+        } else {
+            self.current_view.as_ref()
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
         let encoder = self.current_encoder.as_mut().unwrap();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Tab Bar Render Pass"),
@@ -1619,7 +1769,14 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = self.current_view.as_ref().unwrap();
+        let view = if self.blur_active() {
+            self.offscreen_view.as_ref()
+        } else {
+            self.current_view.as_ref()
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
         let encoder = self.current_encoder.as_mut().unwrap();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Status Bar Render Pass"),
@@ -1725,7 +1882,14 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = self.current_view.as_ref().unwrap();
+        let view = if self.blur_active() {
+            self.offscreen_view.as_ref()
+        } else {
+            self.current_view.as_ref()
+        };
+        let Some(view) = view else {
+            return Ok(());
+        };
         let encoder = self.current_encoder.as_mut().unwrap();
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Scrollbar Render Pass"),
@@ -1938,6 +2102,7 @@ impl Renderer {
         );
         self.clear_color = [r, g, b];
         self.opacity = config.window.opacity;
+        self.set_blur(config.window.blur, config.window.blur_radius);
         self.set_cursor_blink(config.cursor.blink, config.cursor.blink_interval_ms);
     }
 
@@ -1962,6 +2127,141 @@ impl Renderer {
 
     pub fn set_opacity(&mut self, opacity: f64) {
         self.opacity = opacity;
+        self.recreate_offscreen();
+    }
+
+    /// Enable/disable the blur composite path and its kernel radius (px).
+    /// The path only activates when blur, radius, AND opacity<1.0 all hold.
+    pub fn set_blur(&mut self, blur: bool, radius: f64) {
+        self.blur = blur;
+        self.blur_radius = radius.clamp(0.0, 32.0) as f32;
+        self.recreate_offscreen();
+    }
+
+    fn blur_requested(&self) -> bool {
+        blur_path_requested(self.blur, self.opacity, self.blur_radius)
+    }
+
+    fn blur_active(&self) -> bool {
+        self.blur_requested() && self.offscreen_view.is_some()
+    }
+
+    /// (Re)allocate the offscreen scene texture + its blur bind group when the
+    /// blur path is requested, or drop them when it is not. Resource creation
+    /// in wgpu is infallible, but the Option fields + `blur_active` guard keep
+    /// the composite step defensive: any missing resource degrades to the
+    /// non-blur fast path instead of panicking.
+    fn recreate_offscreen(&mut self) {
+        if !self.blur_requested() {
+            self.offscreen_texture = None;
+            self.offscreen_view = None;
+            self.blur_bind_group = None;
+            return;
+        }
+        let width = self.size.width.max(1);
+        let height = self.size.height.max(1);
+        let same_size = self
+            .offscreen_texture
+            .as_ref()
+            .is_some_and(|t| t.width() == width && t.height() == height);
+        if same_size {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Blur Offscreen Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blur Scene Bind Group"),
+            layout: &self.blur_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(
+                        self.blur_params_buffer.as_entire_buffer_binding(),
+                    ),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
+                },
+            ],
+        });
+        log::debug!("Blur offscreen target created: {}x{}", width, height);
+        self.offscreen_texture = Some(texture);
+        self.offscreen_view = Some(view);
+        self.blur_bind_group = Some(bind_group);
+    }
+
+    /// Blur the offscreen scene onto the surface. Runs at the start of
+    /// `end_frame` so it shares the frame's encoder; a no-op unless the blur
+    /// path is active.
+    fn run_blur_composite(&mut self) {
+        if !self.blur_active() {
+            return;
+        }
+        let (Some(encoder), Some(surface_view), Some(bind_group)) = (
+            self.current_encoder.as_mut(),
+            self.current_view.as_ref(),
+            self.blur_bind_group.as_ref(),
+        ) else {
+            log::warn!("Blur requested but composite resources unavailable; skipping blur");
+            return;
+        };
+        let width = self.size.width.max(1) as f32;
+        let height = self.size.height.max(1) as f32;
+        let taps = blur_taps(self.blur_radius);
+        let weights = blur_weights(taps);
+        let center = ((taps - 1) / 2) as i32;
+        let mut params = BlurParams {
+            header: [taps as u32, 0, 0, 0],
+            kernel: [[0.0; 4]; MAX_BLUR_TAPS],
+        };
+        for (i, &w) in weights.iter().enumerate() {
+            let offset = (i as i32 - center) as f32;
+            params.kernel[i] = [w, offset / width, offset / height, 0.0];
+        }
+        self.queue
+            .write_buffer(&self.blur_params_buffer, 0, bytemuck::cast_slice(&[params]));
+
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Blur Composite Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: surface_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: self.clear_color[0],
+                        g: self.clear_color[1],
+                        b: self.clear_color[2],
+                        a: self.opacity,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        render_pass.set_pipeline(&self.blur_pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+        log::debug!("Blur composite applied: {}x{} taps", taps, taps);
     }
 
     fn update_image_from_screen(&mut self, screen: &CoreScreen) {
@@ -2162,6 +2462,43 @@ fn latest_new_image(
     }
 }
 
+/// Whether the blur composite path should be requested at all: it is only
+/// meaningful when blur is enabled, the radius is positive, AND the window is
+/// actually translucent — blurring an opaque scene is pure cost.
+fn blur_path_requested(blur: bool, opacity: f64, radius: f32) -> bool {
+    blur && opacity < 1.0 && radius > 0.0
+}
+
+/// Quantize a blur radius (px) to the nearest supported kernel tap count.
+/// Rounding is half-up so the default radius (8.0) lands on the 9-tap kernel.
+fn blur_taps(radius: f32) -> usize {
+    let nearest = (2.0 * ((radius - 1.0) / 2.0).round() + 1.0).clamp(3.0, 11.0) as usize;
+    BLUR_TAPS
+        .iter()
+        .copied()
+        .find(|&t| t == nearest)
+        .expect("quantized tap count is always one of the supported kernels")
+}
+
+/// 1D Gaussian weights for `taps` taps, normalized to sum to 1. `taps` must be
+/// odd and in `BLUR_TAPS`. The shader outer-products this with itself for the
+/// 2D kernel.
+fn blur_weights(taps: usize) -> Vec<f32> {
+    let sigma = (taps as f32) / 4.0;
+    let center = ((taps - 1) / 2) as i32;
+    let mut weights: Vec<f32> = (0..taps as i32)
+        .map(|i| {
+            let d = (i - center) as f32;
+            (-d * d / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let sum: f32 = weights.iter().sum();
+    for w in &mut weights {
+        *w /= sum;
+    }
+    weights
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,5 +2546,58 @@ mod tests {
         assert_eq!(tab_span(&"x".repeat(30), 20), 23);
         // Empty title: 2 padding cells only.
         assert_eq!(tab_span("", 20), 2);
+    }
+
+    #[test]
+    fn blur_taps_quantizes_to_supported_kernel() {
+        assert_eq!(blur_taps(0.0), 3);
+        assert_eq!(blur_taps(2.0), 3);
+        assert_eq!(blur_taps(4.9), 5);
+        assert_eq!(blur_taps(6.1), 7);
+        assert_eq!(blur_taps(8.0), 9); // default radius -> 9-tap kernel
+        assert_eq!(blur_taps(10.1), 11);
+        assert_eq!(blur_taps(100.0), 11); // clamped
+        for &t in &BLUR_TAPS {
+            assert_eq!(blur_taps(t as f32), t); // exact radii stay put
+        }
+    }
+
+    #[test]
+    fn blur_weights_are_positive_symmetric_and_normalized() {
+        for &taps in &BLUR_TAPS {
+            let w = blur_weights(taps);
+            assert_eq!(w.len(), taps);
+            let sum: f32 = w.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "weights must sum to 1 (taps={}, sum={})",
+                taps,
+                sum
+            );
+            let center = (taps - 1) / 2;
+            for i in 0..taps {
+                assert!(w[i] > 0.0, "weight {} must be positive", i);
+                assert!(
+                    (w[i] - w[taps - 1 - i]).abs() < 1e-6,
+                    "weights must be symmetric at tap {}",
+                    i
+                );
+            }
+            assert!(
+                w[center] >= w[center - 1] && w[center] >= w[center + 1],
+                "center tap must be the peak"
+            );
+        }
+    }
+
+    #[test]
+    fn blur_path_is_gated_on_flag_opacity_and_radius() {
+        assert!(blur_path_requested(true, 0.5, 8.0));
+        assert!(!blur_path_requested(false, 0.5, 8.0));
+        assert!(!blur_path_requested(true, 1.0, 8.0));
+        assert!(!blur_path_requested(true, 0.5, 0.0));
+        assert!(!blur_path_requested(true, 1.0, 0.0));
+        // Default config (blur=false, opacity=1.0) must never take the path.
+        assert!(!blur_path_requested(false, 1.0, 8.0));
     }
 }

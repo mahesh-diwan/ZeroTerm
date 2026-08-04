@@ -106,6 +106,15 @@ DejaVu Sans Mono) before the embedded DejaVu fallback. `family` is reserved.
 support it. Because they carry serde defaults, both may be omitted even though
 `[window]` itself is required.
 
+Blur is implemented as a renderer pass (see `ARCHITECTURE.md` "Window
+Transparency + Blur"): when `blur = true` and `opacity < 1.0` the frame is
+rendered to an offscreen texture and composited through a single-pass Gaussian
+blur before present. `blur_radius` is quantized to `[3, 5, 7, 9, 11]` taps
+(half-up). Setting `opacity = 1.0` (the default) disables the pass entirely —
+the renderer stays on the fast path. Note this blurs the terminal's own
+translucent content; real backdrop blur behind the window is a compositor
+feature and is not reimplemented here.
+
 ### `[cursor]`
 
 | Key                 | Type | Default | Notes                    |

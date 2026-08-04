@@ -106,6 +106,29 @@ space plus padding, letting `render_screen` draw only the visible window of the
 scrollback. `render_screen` is the only pass that reads `Screen` state; the UI
 bar passes take plain slices (`&[TabInfo]`, `&str`).
 
+### Window Transparency + Blur
+
+When `window.blur` is enabled and `window.opacity < 1.0`, the frame is
+transparent and composited through a blur pass. The pipeline above is rerouted
+instead of drawn twice:
+
+- The five scene passes (background, grid, tab/status/scrollbar bars) render
+  into an offscreen `Rgba8Unorm` texture (allocated by `recreate_offscreen()`,
+  which also runs on resize) instead of the swapchain surface.
+- `end_frame()` then runs a dedicated blur composite pass before present: the
+  offscreen texture is sampled by `fs_blur`, a single-pass outer-product
+  Gaussian. Kernel size is quantized from `blur_radius` to
+  `[3, 5, 7, 9, 11]` taps (`blur_taps`, half-up), so a sample runs 9..=121
+  taps with symmetric weights (`blur_weights`); output is the blurred scene
+  with the scene's alpha re-emitted.
+- When blur is inactive the offscreen target is dropped and every pass keeps
+  drawing straight to the surface — the fast path is byte-for-byte unchanged.
+
+Note: this blurs the terminal's own translucent content (e.g. text read
+through a partially transparent scrollback). Real backdrop blur of the
+window's surroundings is a window-manager/compositor feature and is not
+reimplemented here.
+
 ## Block Tracking
 
 The parser recognizes command boundaries: when a line starts with a prompt

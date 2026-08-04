@@ -27,6 +27,15 @@ fn suggest_prompt(context: &str) -> String {
     )
 }
 
+fn complete_prompt(context: &str) -> String {
+    format!(
+        "Complete this partial terminal command. Reply with ONLY the completion suffix: \
+         the exact text to append right after the cursor so this line becomes the full \
+         command. No explanation, no prompt echo, no surrounding text, no newline:\n\n{}",
+        context
+    )
+}
+
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
@@ -51,6 +60,30 @@ impl AiClient {
     }
 
     pub async fn explain(&self, prompt: &str) -> Result<String, AiError> {
+        self.generate(prompt).await
+    }
+
+    pub async fn suggest(&self, context: &str) -> Result<String, AiError> {
+        self.generate(&suggest_prompt(context)).await
+    }
+
+    /// Complete the current (possibly partial) command line. `context` is the
+    /// text typed so far; the model replies with ONLY the completion suffix,
+    /// which the editor appends at the cursor via `accept_suffix`.
+    pub async fn complete(&self, context: &str) -> Result<String, AiError> {
+        self.generate(&complete_prompt(context)).await
+    }
+
+    pub async fn health(&self) -> bool {
+        self.client
+            .get(format!("{}/api/tags", self.endpoint))
+            .send()
+            .await
+            .is_ok()
+    }
+
+    /// Post `prompt` to /api/generate and return the parsed model response.
+    async fn generate(&self, prompt: &str) -> Result<String, AiError> {
         let body = serde_json::json!({
             "model": self.model,
             "prompt": prompt,
@@ -84,54 +117,11 @@ impl AiClient {
 
         Ok(parsed.response)
     }
-
-    pub async fn suggest(&self, context: &str) -> Result<String, AiError> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "prompt": suggest_prompt(context),
-            "stream": false,
-        });
-
-        let resp = self
-            .client
-            .post(format!("{}/api/generate", self.endpoint))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AiError::RequestFailed(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(AiError::RequestFailed(format!(
-                "HTTP {}: {}",
-                status.as_u16(),
-                resp.text().await.unwrap_or_default()
-            )));
-        }
-
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
-
-        let parsed: OllamaResponse =
-            serde_json::from_str(&text).map_err(|e| AiError::ResponseParseFailed(e.to_string()))?;
-
-        Ok(parsed.response)
-    }
-
-    pub async fn health(&self) -> bool {
-        self.client
-            .get(format!("{}/api/tags", self.endpoint))
-            .send()
-            .await
-            .is_ok()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::suggest_prompt;
+    use super::{complete_prompt, suggest_prompt};
 
     #[test]
     fn prompt_embeds_history_and_asks_for_one_command() {
@@ -141,5 +131,13 @@ mod tests {
         assert!(prompt.contains("Reply with just the command"));
         // Single instruction, no explanation requested.
         assert!(prompt.matches("no explanation").count() >= 1);
+    }
+
+    #[test]
+    fn complete_prompt_embeds_line_and_asks_for_suffix_only() {
+        let prompt = complete_prompt("cargo bu");
+        assert!(prompt.contains("cargo bu"));
+        assert!(prompt.contains("ONLY the completion suffix"));
+        assert!(prompt.contains("append right after the cursor"));
     }
 }

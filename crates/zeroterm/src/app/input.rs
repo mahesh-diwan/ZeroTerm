@@ -119,15 +119,37 @@ impl EditingState {
         s
     }
 
+    /// Buffer content only (the partial command line, no prompt prefix).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    pub fn buffer_text(&self) -> String {
+        self.buffer.iter().collect()
+    }
+
+    /// Insert `suffix` at the cursor and advance past it (accept a completion).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    pub fn accept_suffix(&mut self, suffix: &str) {
+        for c in suffix.chars() {
+            self.buffer.insert(self.cursor, c);
+            self.cursor += 1;
+        }
+    }
+
     /// Tab-title rendering: prompt + buffer with a block cursor at the edit
-    /// position.
-    pub fn display(&self) -> String {
+    /// position, optionally followed by a ghost suffix (pending completion).
+    pub fn display_with_suffix(&self, suffix: &str) -> String {
         let mut s = String::from("[edit] ");
         s.push_str(&self.prompt);
         s.extend(self.buffer[..self.cursor].iter());
         s.push('▌');
         s.extend(self.buffer[self.cursor..].iter());
+        s.push_str(suffix);
         s
+    }
+
+    /// Tab-title rendering: prompt + buffer with a block cursor at the edit
+    /// position.
+    pub fn display(&self) -> String {
+        self.display_with_suffix("")
     }
 }
 
@@ -181,5 +203,29 @@ mod tests {
         e.home();
         e.delete_word_after();
         assert_eq!(e.line(), " two");
+    }
+
+    #[test]
+    fn buffer_text_and_accept_suffix() {
+        let mut e = EditingState::from_line("hello wor");
+        assert_eq!(e.buffer_text(), "hello wor");
+        e.accept_suffix("ld");
+        assert_eq!(e.buffer_text(), "hello world");
+        assert_eq!(e.line(), "hello world");
+    }
+
+    #[test]
+    fn accept_suffix_inserts_at_cursor() {
+        let mut e = EditingState::from_line("ab");
+        e.home();
+        e.accept_suffix("X");
+        assert_eq!(e.line(), "Xab");
+    }
+
+    #[test]
+    fn display_with_suffix_shows_ghost_after_cursor() {
+        let e = EditingState::from_line("hel");
+        assert!(e.display_with_suffix("lo").contains("hel▌lo"));
+        assert!(e.display().contains("hel▌"));
     }
 }

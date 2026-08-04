@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use crate::session::{detached_start_cmd, remote_attach_cmd, unix_now, SessionRegistry};
+#[cfg(unix)]
 use anyhow::Context;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -95,6 +97,8 @@ fn expand_home(path: &str) -> String {
 pub struct SshSession {
     session: Option<ssh2::Session>,
     channel: Option<ssh2::Channel>,
+    registry: SessionRegistry,
+    host: Option<String>,
 }
 
 /// Non-unix stub so the crate compiles on Windows/macOS-other targets with an
@@ -114,6 +118,8 @@ impl SshSession {
         Self {
             session: None,
             channel: None,
+            registry: SessionRegistry::new(),
+            host: None,
         }
     }
 
@@ -173,6 +179,8 @@ impl SshSession {
             anyhow::bail!("SSH authentication failed for {}@{}", user, host);
         }
 
+        self.host = Some(host.to_string());
+
         let mut channel = session
             .channel_session()
             .context("failed to open SSH channel")?;
@@ -225,6 +233,58 @@ impl SshSession {
             session.set_timeout(timeout_ms);
         }
     }
+
+    /// Start `command` in a detached remote session and return its id. The work
+    /// is delegated to a remote `tmux` server (see [`crate::session`]), so the
+    /// session survives this client disconnecting. Runs on a throwaway channel
+    /// so the interactive shell channel is left untouched.
+    pub fn daemon_start(&mut self, command: &str) -> Result<String> {
+        let session = self
+            .session
+            .as_ref()
+            .context("SSH session is not connected")?;
+        let id = format!("zt-{}", unix_now());
+        let host = self.host.clone().unwrap_or_default();
+        self.registry.create(id.clone(), host, command.to_string());
+        let mut channel = session
+            .channel_session()
+            .context("failed to open SSH channel")?;
+        channel
+            .exec(&detached_start_cmd(&id, command))
+            .context("failed to exec detached-start command")?;
+        let _ = channel.send_eof();
+        let _ = channel.wait_close();
+        Ok(id)
+    }
+
+    /// Re-attach to a detached remote session by id. libssh2 cannot exec a
+    /// second command on an already-exec'd channel, so a new channel is opened
+    /// running the remote attach command and replaces the current one.
+    pub fn daemon_attach(&mut self, id: &str) -> Result<()> {
+        if !self.registry.has(id) {
+            anyhow::bail!("unknown detached session '{id}'");
+        }
+        let session = self
+            .session
+            .as_ref()
+            .context("SSH session is not connected")?;
+        let mut channel = session
+            .channel_session()
+            .context("failed to open SSH channel")?;
+        channel
+            .exec(&remote_attach_cmd(id))
+            .context("failed to exec re-attach command")?;
+        self.channel = Some(channel);
+        Ok(())
+    }
+
+    pub fn registry(&self) -> &SessionRegistry {
+        &self.registry
+    }
+
+    pub fn registry_mut(&mut self) -> &mut SessionRegistry {
+        &mut self.registry
+    }
 }
 
 #[cfg(not(unix))]
@@ -261,4 +321,12 @@ impl SshSession {
     }
 
     pub fn set_timeout(&mut self, _timeout_ms: u32) {}
+
+    pub fn daemon_start(&mut self, _command: &str) -> Result<String> {
+        anyhow::bail!("SSH is not supported on this platform")
+    }
+
+    pub fn daemon_attach(&mut self, _id: &str) -> Result<()> {
+        anyhow::bail!("SSH is not supported on this platform")
+    }
 }

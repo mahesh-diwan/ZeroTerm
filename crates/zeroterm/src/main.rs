@@ -28,9 +28,9 @@ use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
-use crate::ai_overlay::AiOverlay;
 #[cfg(feature = "ai")]
-use crate::ai_overlay::{explain_prompt, suggest_context, AiKind, AiState};
+use crate::ai_overlay::{completion_tab, explain_prompt, suggest_context, AiKind, AiState};
+use crate::ai_overlay::{AiCompletion, AiOverlay};
 #[cfg(feature = "plugins")]
 use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
@@ -109,6 +109,9 @@ struct App {
     // editing keys are intercepted (not forwarded to the shell) and accumulated
     // into the buffer until Enter submits the line or Esc discards it.
     editing: Option<EditingState>,
+    // Pending AI line completion for the active editor (Tab). None when AI is
+    // disabled or no request is in flight / staged.
+    ai_completion: Option<AiCompletion>,
 }
 
 // Split an accumulated pixel-wheel scroll into whole lines to apply (up/down)
@@ -165,6 +168,7 @@ impl App {
             #[cfg(feature = "plugins")]
             plugins: HashMap::new(),
             editing: None,
+            ai_completion: None,
         }
     }
 
@@ -953,6 +957,11 @@ impl App {
         self.renderer = Some(renderer);
         zt("renderer received on main");
         info!("GPU renderer ready: {}x{}", cols, rows);
+        // The async config load may have been consumed while the renderer was
+        // still initializing on the background thread (its try_recv above was
+        // a no-op then); re-apply so window.opacity/blur and fonts actually
+        // reach the fresh renderer. Harmless if the config already applied.
+        self.apply_config_to_renderer();
     }
 
     fn render(&mut self) -> Result<()> {
@@ -980,6 +989,22 @@ impl App {
             self.ai.poll();
             self.draw_ai_overlay();
         }
+        // Collect an in-flight AI line completion only while the editor is
+        // open; closing the editor discards the pending request.
+        if self.editing.is_some() {
+            if let Some(comp) = self.ai_completion.as_mut() {
+                comp.poll();
+            }
+        } else {
+            self.ai_completion = None;
+        }
+        // Ghost completion string for the editor title; computed before the
+        // renderer borrow below (completion_ghost borrows all of self).
+        let edit_ghost = if self.editing.is_some() {
+            self.completion_ghost()
+        } else {
+            None
+        };
         let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
             return Ok(());
         };
@@ -995,8 +1020,12 @@ impl App {
         tab_ids.sort();
         // While editing, the active tab shows the live buffer instead of the
         // shell title. Editing is bound to the active pane and cleared on any
-        // pane switch, so this is only ever the pane that owns the editor.
-        let edit_display = self.editing.as_ref().map(|e| e.display());
+        // pane switch, so this is only ever the pane that owns the editor. A
+        // pending AI completion appends a ghost suffix after the cursor marker.
+        let edit_display = self.editing.as_ref().map(|e| match &edit_ghost {
+            Some(ghost) => e.display_with_suffix(ghost),
+            None => e.display(),
+        });
         let tab_infos: Vec<TabInfo> = tab_ids
             .iter()
             .map(|&id| TabInfo {
@@ -1239,7 +1268,7 @@ impl App {
             KeyCode::ArrowRight => self.editing.as_mut().unwrap().right(),
             KeyCode::Home => self.editing.as_mut().unwrap().home(),
             KeyCode::End => self.editing.as_mut().unwrap().end(),
-            KeyCode::Tab => self.editing.as_mut().unwrap().insert('\t'),
+            KeyCode::Tab => self.editor_tab(),
             // Let Alt+E fall through so the same key exits edit mode.
             KeyCode::KeyE if alt && !ctrl => return false,
             // Swallow other ctrl/alt chords; plain keys fall through to the
@@ -1248,6 +1277,48 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Tab in the line editor. Accepts a staged AI completion when one is
+    /// ready; otherwise, with AI configured and idle, fires a new completion
+    /// request for the current buffer; otherwise inserts a literal tab.
+    fn editor_tab(&mut self) {
+        #[cfg(feature = "ai")]
+        {
+            if let Some(suffix) = completion_tab(self.ai_completion.as_ref()) {
+                self.editing.as_mut().unwrap().accept_suffix(&suffix);
+                self.ai_completion = None;
+                return;
+            }
+            let idle = match self.ai_completion.as_ref() {
+                Some(c) => c.pending.is_none(),
+                None => true,
+            };
+            if idle {
+                if let Some(client) = self.ai_client.clone() {
+                    let buffer = self.editing.as_ref().unwrap().buffer_text();
+                    let comp = self.ai_completion.get_or_insert_with(AiCompletion::default);
+                    comp.request(client, buffer);
+                    return;
+                }
+            }
+        }
+        self.editing.as_mut().unwrap().insert('\t');
+    }
+
+    /// Ghost text appended after the edit cursor in the tab title: the staged
+    /// suffix once a completion result lands, or a "completing…" indicator
+    /// while the request is in flight. Non-ai builds always have no completion,
+    /// so this yields None.
+    fn completion_ghost(&self) -> Option<String> {
+        let comp = self.ai_completion.as_ref()?;
+        if comp.pending.is_some() {
+            Some(" completing\u{2026} ".to_string())
+        } else if comp.ready() {
+            Some(comp.text.clone())
+        } else {
+            None
+        }
     }
 
     /// Text of the line the cursor sits on, up to the cursor column.
@@ -2817,6 +2888,18 @@ mod tests {
         assert!(app.editing.is_some());
         assert!(app.handle_editing_key(KeyCode::KeyC, true, false));
         assert!(app.editing.is_none());
+    }
+
+    #[test]
+    fn editing_tab_inserts_tab_without_completion() {
+        // No AI client (App::new) and no staged/requested completion: Tab must
+        // fall back to inserting a literal tab, never a panic or a no-op.
+        let mut app = App::new();
+        app.editing = Some(EditingState::from_line("ab"));
+        app.editing.as_mut().unwrap().home();
+        assert!(app.handle_editing_key(KeyCode::Tab, false, false));
+        assert_eq!(app.editing.as_ref().unwrap().line(), "\tab");
+        assert!(app.ai_completion.is_none());
     }
 
     #[test]
