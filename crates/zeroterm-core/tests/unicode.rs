@@ -271,19 +271,38 @@ fn truncated_lead_byte_recovers() {
     assert_eq!(p.screen().cursor().col, 1);
 }
 
+/// First non-FFFD column at/after `start`, and the char there.
+fn next_text_after_replacement(
+    screen: &zeroterm_core::screen::Screen,
+    start: usize,
+) -> (usize, char) {
+    let mut col = start;
+    while screen.cell(0, col).unwrap().ch == '\u{FFFD}' {
+        col += 1;
+    }
+    (col, screen.cell(0, col).unwrap().ch)
+}
+
 #[test]
 fn lone_surrogate_encoding_no_crash() {
     // 0xED 0xA0 0x80 is a UTF-8-encoded lone surrogate (U+D800) — invalid.
+    // It renders as U+FFFD replacement char(s), never panics, and the parser
+    // resyncs so following text is never swallowed.
     parse_and_check(&[0xED, 0xA0, 0x80]);
-    // Embedded between valid text: subsequent text must still render.
     let mut p = Parser::new(80, 24);
     p.parse(b"ab");
     p.parse(&[0xED, 0xA0, 0x80, 0xED, 0xB0, 0x80]);
     p.parse(b"cd");
-    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'a');
-    assert_eq!(p.screen().cell(0, 1).unwrap().ch, 'b');
-    assert_eq!(p.screen().cell(0, 2).unwrap().ch, 'c');
-    assert_eq!(p.screen().cell(0, 3).unwrap().ch, 'd');
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, 'a');
+    assert_eq!(screen.cell(0, 1).unwrap().ch, 'b');
+    // The invalid bytes render as at least one replacement char, then the
+    // "cd" text lands immediately after the replacement run.
+    assert_eq!(screen.cell(0, 2).unwrap().ch, '\u{FFFD}');
+    let (col, ch) = next_text_after_replacement(screen, 2);
+    assert!(col > 2, "invalid bytes must produce replacement chars");
+    assert_eq!(ch, 'c');
+    assert_eq!(screen.cell(0, col + 1).unwrap().ch, 'd');
     assert_screen_ok(&p);
 }
 
@@ -292,8 +311,13 @@ fn overlong_and_overmax_invalid_utf8() {
     // Overlong '/' (C0 AF) and >4-byte lead abuse — no panic, state recovers.
     parse_and_check(&[0xC0, 0xAF, 0xE2, 0x82, 0xF0, 0x9F, 0x8E, 0x89]);
     let mut p = Parser::new(80, 24);
+    // C1 81 is an overlong '/' — invalid; 'q' must follow the replacements.
     p.parse(&[0xC1, 0x81, b'q']);
-    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'q');
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, '\u{FFFD}');
+    let (col, ch) = next_text_after_replacement(screen, 0);
+    assert_eq!(ch, 'q');
+    assert!(col <= 2, "resync must happen quickly, got col {}", col);
 }
 
 // --------------------------- Control handling ----------------------------

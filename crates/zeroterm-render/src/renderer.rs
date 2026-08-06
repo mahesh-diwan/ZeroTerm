@@ -2049,7 +2049,10 @@ impl Renderer {
             ];
 
             let mut ch = cell.ch;
-            if divider_rows.contains(&dirty_row) {
+            // block.start_line is buffer-local; view row == buffer row only at
+            // scroll_offset 0, so scrolled dividers are skipped entirely (the
+            // [copy]/metadata overlay would land on the wrong row otherwise).
+            if scroll_offset == 0 && divider_rows.contains(&dirty_row) {
                 attrs |= ATTR_BLOCK_DIVIDER;
                 let meta = divider_meta.get(&dirty_row);
                 let meta_len = meta.map_or(0, Vec::len);

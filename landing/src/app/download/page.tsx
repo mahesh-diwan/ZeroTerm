@@ -8,33 +8,34 @@ const platforms = [
     name: 'Linux',
     icon: '🐧',
     gradient: 'from-orange-500 to-red-500',
-    install: 'curl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-installer.sh | sh',
-    alt: 'sudo dpkg -i zeroterm_0.1.0_amd64.deb',
-    pkg: 'yay -S zeroterm',
-    assets: ['zeroterm-x86_64-unknown-linux-gnu.tar.gz', 'zeroterm_0.1.0_amd64.deb', 'zeroterm-0.1.0-1.x86_64.rpm'],
+    install: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh',
+    alt: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release',
+    pkg: 'not on crates.io yet — build from source',
+    assets: ['ZeroTerm-x86_64.AppImage', 'zeroterm_v0.3.0_amd64.deb', 'zeroterm-0.3.0-1.x86_64.rpm'],
   },
   {
     name: 'macOS',
     icon: '🍎',
     gradient: 'from-purple-500 to-pink-500',
-    install: 'brew install zeroterm',
-    alt: 'curl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-installer.sh | sh',
-    pkg: 'cargo install zeroterm',
-    assets: ['ZeroTerm-0.1.0-x86_64.dmg', 'ZeroTerm-0.1.0-aarch64.dmg', 'zeroterm-x86_64-apple-darwin.tar.gz'],
+    install: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh',
+    alt: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release',
+    pkg: 'not on Homebrew yet — build from source',
+    assets: ['zeroterm-v0.3.0-macos-arm64.zip', 'zeroterm-v0.3.0-macos-x86_64.zip'],
   },
   {
     name: 'Windows',
     icon: '🪟',
     gradient: 'from-blue-500 to-cyan-500',
-    install: 'winget install zeroterm',
-    alt: 'scoop install zeroterm',
-    pkg: 'cargo install zeroterm',
-    assets: ['ZeroTerm-0.1.0-x64.msi', 'ZeroTerm-0.1.0-x64-portable.zip'],
+    install: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh',
+    alt: 'cargo build --release -p zeroterm',
+    pkg: 'experimental — not yet verified in CI',
+    assets: ['zeroterm-v0.3.0-windows-x86_64.zip'],
   },
 ];
 
 const releaseNotes = [
-  { tag: 'v0.1.0', date: '2026-07-30', notes: ['Initial public beta release', 'GPU-accelerated rendering with wgpu', 'Native multiplexing (tabs + splits)', 'SSH integration with persistent sessions', 'Kitty/Sixel/iTerm2 image protocols', 'Local AI integration (Ollama/LM Studio)', 'TOML + Lua configuration'] },
+  { tag: 'v0.3.0', date: '2026-08-06', notes: ['Fixed split panes never appearing in the split tree', '`clear` no longer wipes scrollback', 'Window resizes preserve scrollback', 'Invalid UTF-8 no longer swallows following text', 'Release pipeline publishes prebuilt binaries to GitHub Releases', '`scripts/install.sh` resolves the latest tag and installs prebuilt packages'] },
+  { tag: 'v0.2.0', date: '2026-07-30', notes: ['GPU-accelerated rendering with wgpu', 'Native multiplexing (tabs + splits)', 'SSH integration with persistent sessions', 'Kitty/Sixel/iTerm2 image protocols', 'Local AI integration (Ollama/LM Studio)', 'TOML + Lua configuration', 'E2E-encrypted sync, WASM plugins'] },
 ];
 
 function CommandCopy({ cmd, label }: { cmd: string; label: string }) {
@@ -52,7 +53,7 @@ function CommandCopy({ cmd, label }: { cmd: string; label: string }) {
   );
 }
 
-const DOWNLOAD_FILE = 'zeroterm-v0.1.0-linux-x86_64.tar.gz';
+const DOWNLOAD_FILE = 'ZeroTerm-x86_64.AppImage';
 const TOTAL_MB = 24.8;
 const DL_LINE = `Downloading ${DOWNLOAD_FILE}`;
 const EX_LINE = 'Extracting...';
@@ -196,7 +197,7 @@ export default function DownloadPage() {
         <div className="max-w-5xl mx-auto">
           <div className="text-center mb-12">
             <h1 className="text-4xl md:text-5xl font-bold">Download ZeroTerm</h1>
-            <p className="mt-4 text-lg text-[var(--fg-muted)]">Version 0.1.0 &mdash; Public Beta</p>
+            <p className="mt-4 text-lg text-[var(--fg-muted)]">Version 0.3.0</p>
           </div>
           <div className="grid md:grid-cols-3 gap-6 mb-16">
             {platforms.map((p) => (
@@ -213,7 +214,7 @@ export default function DownloadPage() {
                   <ul className="space-y-1">
                     {p.assets.map((a) => (
                       <li key={a}>
-                        <a href={`https://github.com/mahesh-diwan/ZeroTerm/releases/download/v0.1.0/${a}`} className="text-xs text-[var(--accent)] hover:underline">
+                        <a href={`https://github.com/mahesh-diwan/ZeroTerm/releases/download/v0.3.0/${a}`} className="text-xs text-[var(--accent)] hover:underline">
                           {a}
                         </a>
                       </li>

@@ -6,7 +6,7 @@ setlocal
 if not defined VERSION (
   for /f "delims=" %%i in ('git describe --tags --always 2^>nul') do set "VERSION=%%i"
 )
-if not defined VERSION set "VERSION=0.2.0"
+if not defined VERSION set "VERSION=0.3.0"
 
 REM uname guard: present under Git Bash/MSYS, absent in plain cmd.exe.
 REM Used only to print a cross-compile hint; packaging works either way.

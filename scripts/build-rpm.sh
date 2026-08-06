@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP=zeroterm
-VERSION="$(git describe --tags --always 2>/dev/null || echo "0.1.0")"
+VERSION="$(git describe --tags --always 2>/dev/null || echo "0.3.0")"
 VERSION="${VERSION#v}"
 VERSION="${VERSION//-/_}"
 
@@ -62,7 +62,7 @@ cat >"${STAGE}/usr/share/metainfo/io.github.zeroterm.ZeroTerm.metainfo.xml" <<'X
   <categories>
     <category>TerminalEmulator</category>
   </categories>
-  <url type="homepage">https://github.com/zeroterm/zeroterm</url>
+  <url type="homepage">https://github.com/mahesh-diwan/ZeroTerm</url>
   <project_license>MIT</project_license>
 </component>
 XML
@@ -73,7 +73,7 @@ Version: ${VERSION}
 Release: 1
 Summary: GPU-accelerated terminal emulator
 License: MIT
-URL: https://github.com/zeroterm/zeroterm
+URL: https://github.com/mahesh-diwan/ZeroTerm
 Requires: glibc, libX11
 BuildArch: x86_64
 

@@ -6,21 +6,21 @@ import Link from 'next/link';
 // ─── data ───────────────────────────────────────────────────────────────────
 
 const features = [
-  { title: 'GPU Accelerated', desc: 'wgpu rendering at 120 FPS at 4K. No Electron. No JS runtime.', tag: 'Performance' },
-  { title: 'Pure Rust', desc: 'Zero bloat. Under 50MB RAM at idle. Cold start in under 200ms.', tag: 'Core' },
+  { title: 'GPU Accelerated', desc: 'Rendering on the GPU via wgpu — Metal, DX12, or Vulkan. No Electron. No JS runtime.', tag: 'Performance' },
+  { title: 'Pure Rust', desc: 'One language across the entire stack, from the VT parser to the renderer.', tag: 'Core' },
   { title: 'Native Multiplexing', desc: 'Tabs, splits, sessions built in. No tmux or screen config needed.', tag: 'UX' },
   { title: 'SSH First', desc: 'Native SSH client. Persistent sessions survive disconnects.', tag: 'Network' },
   { title: 'Graphics Protocols', desc: 'Kitty, Sixel, iTerm2 inline images in your terminal.', tag: 'Graphics' },
   { title: 'Local AI', desc: 'Ollama and LM Studio integration. Explain output and suggest commands.', tag: 'AI' },
-  { title: 'Cross-Platform', desc: 'Metal on macOS, DX12 on Windows, Vulkan on Linux.', tag: 'Platform' },
+  { title: 'Cross-Platform', desc: 'Metal on macOS, Vulkan on Linux — Windows builds are still experimental.', tag: 'Platform' },
   { title: 'Zero Config', desc: 'Works out of the box. TOML and Lua for power users.', tag: 'Setup' },
 ];
 
 const stats = [
-  { value: '120', suffix: 'FPS', label: 'at 4K' },
-  { value: '<50', suffix: 'MB', label: 'RAM idle' },
-  { value: '<200', suffix: 'ms', label: 'cold start' },
-  { value: '100', suffix: '%', label: 'Unicode' },
+  { value: '9', suffix: '', label: 'Rust crates' },
+  { value: '348+', suffix: '', label: 'tests passing' },
+  { value: '0', suffix: '', label: 'JS runtime' },
+  { value: 'MIT', suffix: '', label: 'open source' },
 ];
 
 const platforms = [
@@ -30,25 +30,24 @@ const platforms = [
 ];
 
 const installers = [
-  { id: 'cargo', label: 'Cargo', cmd: 'cargo install zeroterm' },
-  { id: 'brew', label: 'Homebrew', cmd: 'brew install zeroterm' },
-  { id: 'binary', label: 'Binary', cmd: 'curl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-installer.sh | sh' },
+  { id: 'script', label: 'Script', cmd: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh' },
+  { id: 'source', label: 'Source', cmd: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release' },
 ];
 
 const faqs = [
   { q: 'What is ZeroTerm?', a: 'ZeroTerm is a GPU-accelerated terminal emulator built from scratch in Rust. It uses wgpu for rendering and supports native multiplexing, SSH, image protocols, and optional local AI integration.' },
-  { q: 'How do I install it?', a: 'Use Cargo, Homebrew, or download a binary from GitHub Releases. No external dependencies required.' },
+  { q: 'How do I install it?', a: 'Run the install script or build from source. ZeroTerm is not yet on crates.io, Homebrew, or Flathub; prebuilt binaries are attached to GitHub Releases.' },
   { q: 'Does it support tmux?', a: 'ZeroTerm has built-in multiplexing — tabs, splits, and session management. No tmux or screen needed, though tmux works if you prefer it.' },
-  { q: 'Is it available on Windows?', a: 'Yes. ZeroTerm runs on Windows via DX12, macOS via Metal, and Linux via Vulkan — all through wgpu.' },
+  { q: 'Is it available on Windows?', a: 'Linux and macOS are the primary targets and run the full CI suite. A Windows build target exists, but it is not yet verified in CI — treat it as experimental.' },
   { q: 'Can I use it over SSH?', a: 'Yes. ZeroTerm has a native SSH client with persistent sessions. Disconnect without killing remote work.' },
   { q: 'Is it open source?', a: 'Yes. ZeroTerm is MIT licensed. Source code is available on GitHub.' },
 ];
 
 const roadmap = [
   { phase: 1, title: 'The Engine', status: 'Complete', items: ['PTY Integration', 'VT100 Parser', 'Screen Buffer', 'wgpu Rendering', 'Input Handling'] },
-  { phase: 2, title: 'Multiplexing', status: 'In Progress', items: ['Tab System', 'Splits (Tiling)', 'SSH Integration', 'Session Restore'] },
-  { phase: 3, title: 'Modern UX', status: 'Planned', items: ['Block Output', 'Graphics Protocols', 'Local AI', 'GUI Settings'] },
-  { phase: 4, title: 'Ecosystem', status: 'Planned', items: ['macOS Native', 'Windows Native', 'Linux Native', 'Encrypted Sync', 'WASM Plugins'] },
+  { phase: 2, title: 'Multiplexing', status: 'Complete', items: ['Tab System', 'Splits (Tiling)', 'SSH Integration', 'Session Restore'] },
+  { phase: 3, title: 'Modern UX', status: 'Complete', items: ['Block Output', 'Graphics Protocols', 'Local AI', 'GUI Settings'] },
+  { phase: 4, title: 'Ecosystem', status: 'In Progress', items: ['macOS Native', 'Linux Native', 'Encrypted Sync', 'WASM Plugins', 'Windows Native (unverified)'] },
 ];
 
 // ─── hooks ──────────────────────────────────────────────────────────────────
@@ -89,7 +88,7 @@ type DemoLine =
 
 const demoLines: DemoLine[] = [
   { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'zeroterm --version' },
-  { kind: 'out', out: 'ZeroTerm v0.2.0 (rustc 1.81)' },
+  { kind: 'out', out: 'zeroterm 0.3.0' },
   { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'echo "GPU accelerated"' },
   { kind: 'out', out: 'GPU accelerated' },
   { kind: 'cmd', prompt: 'user@zeroterm:~', cmd: 'cat /proc/cpuinfo | grep cores' },
@@ -355,7 +354,7 @@ function Platforms() {
 }
 
 function InstallSection() {
-  const [active, setActive] = useState('cargo');
+  const [active, setActive] = useState('script');
   const [copied, setCopied] = useState(false);
   const activeCmd = installers.find((i) => i.id === active)?.cmd ?? '';
 
@@ -364,7 +363,7 @@ function InstallSection() {
       <div className="max-w-6xl mx-auto px-6">
         <AnimatedSection className="max-w-2xl mb-16">
           <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Install in seconds.</h2>
-          <p className="mt-4 text-fg-muted leading-relaxed text-balance">Pick your package manager. One command. No dependencies.</p>
+          <p className="mt-4 text-fg-muted leading-relaxed text-balance">One command, no dependencies. Prebuilt binaries on every release.</p>
         </AnimatedSection>
         <AnimatedSection delay={100} className="max-w-2xl mx-auto">
           <div className="rounded-xl border border-border overflow-hidden">

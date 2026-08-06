@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP=zeroterm
-PKG_DIR="${APP}_$(git describe --tags --always 2>/dev/null || echo "0.1.0")_amd64"
+PKG_DIR="${APP}_$(git describe --tags --always 2>/dev/null || echo "0.3.0")_amd64"
 
 if ! command -v cargo &>/dev/null; then
 	echo "Rust not installed. Install from: https://rustup.rs"
@@ -23,7 +23,7 @@ cp target/release/"${APP}" "${PKG_DIR}/usr/bin/"
 
 cat >"${PKG_DIR}/DEBIAN/control" <<EOF
 Package: ${APP}
-Version: $(git describe --tags --always 2>/dev/null || echo "0.1.0")
+Version: $(git describe --tags --always 2>/dev/null || echo "0.3.0")
 Section: x11
 Priority: optional
 Architecture: amd64
@@ -66,7 +66,7 @@ cat >"${PKG_DIR}/usr/share/metainfo/io.github.zeroterm.ZeroTerm.metainfo.xml" <<
   <categories>
     <category>TerminalEmulator</category>
   </categories>
-  <url type="homepage">https://github.com/zeroterm/zeroterm</url>
+  <url type="homepage">https://github.com/mahesh-diwan/ZeroTerm</url>
   <project_license>MIT</project_license>
 </component>
 EOF

@@ -8,24 +8,26 @@ usage; see [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) for settings and
 
 ### Requirements
 
-- Rust 1.79+
-- Linux / macOS / Windows (wgpu backend: Vulkan / Metal / DX12)
+- Rust stable (via [rustup](https://rustup.rs))
+- Linux or macOS (Windows builds are not yet verified in CI)
 - A GPU with Vulkan/Metal/DX12 support
 
 ### Install
 
 ```bash
-# Linux/macOS one-liner
-curl -fsSL https://zeroterm.dev/install.sh | sh
-
-# Flatpak
-flatpak install flathub com.zeroterm.ZeroTerm
+# Linux/macOS one-liner (resolves the latest release, downloads a prebuilt
+# binary when available, otherwise builds from source)
+curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh
 
 # From source
-git clone https://github.com/zeroterm/zeroterm.git
-cd zeroterm
+git clone https://github.com/mahesh-diwan/ZeroTerm.git
+cd ZeroTerm
 cargo run --release
 ```
+
+> ZeroTerm is not yet published to crates.io, Homebrew, or Flathub; use the
+> install script or build from source. Prebuilt binaries are attached to each
+> [GitHub Release](https://github.com/mahesh-diwan/ZeroTerm/releases).
 
 ### First Run
 

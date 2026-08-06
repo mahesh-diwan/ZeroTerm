@@ -8,7 +8,7 @@ use winit::keyboard::KeyCode;
 use zeroterm_core::parser::Parser;
 use zeroterm_core::pty::{PortablePtyBackend, PtyBackend};
 use zeroterm_core::screen::Size as PtySize;
-use zeroterm_mux::split::SplitNode;
+use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
 
 /// Commands the UI thread sends to the pty/ssh command thread.
@@ -444,11 +444,165 @@ impl SessionManager {
     pub fn scroll_down(&mut self, lines: usize) {
         self.scroll_offset = self.scroll_offset.saturating_sub(lines);
     }
+
+    /// Insert a freshly spawned pane into the split tree as a `dir` split of
+    /// the active pane. Insert first, then reconcile: normally the tree is in
+    /// sync (close_tab/drain reconcile it), so the new leaf lands next to the
+    /// active pane; if the tree was stale the insert is a no-op and the
+    /// reconcile rebuilds it from the full pane set. Either way the new pane
+    /// renders exactly once.
+    pub fn insert_pane_as_split(&mut self, new_id: usize, dir: SplitDir) {
+        let parent = self.active_pane;
+        self.split_root.insert_leaf(new_id, dir, parent, 0.5);
+        self.reconcile_tree();
+    }
+
+    /// Rebuild the split tree from the pane map whenever its leaves have
+    /// drifted out of sync — e.g. after `close_tab` removed the tree's only
+    /// leaf (remove_leaf leaves the tree pointing at the removed pane, which
+    /// would blank the screen) or after any structural change.
+    ///
+    /// The floating pane is intentionally absent from the tree (it renders as
+    /// the fullscreen overlay), so it is excluded from the comparison and the
+    /// rebuild — otherwise a drain-triggered reconcile would silently dock it
+    /// back into the tree and double-render it.
+    pub fn reconcile_tree(&mut self) {
+        let mut ids = self.pane_ids();
+        if ids.is_empty() {
+            return;
+        }
+        ids.retain(|id| self.floating != Some(*id));
+        let mut leaves = self.split_root.leaves();
+        leaves.sort_unstable();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort_unstable();
+        if leaves != sorted_ids {
+            self.split_root = SplitNode::from_ids(&ids);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insert_pane_as_split_adds_leaf_next_to_active() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state()); // caller inserts the pane first
+        m.active_pane = 0;
+        m.insert_pane_as_split(1, SplitDir::Vertical);
+        assert_eq!(m.split_root.leaves(), vec![0, 1]);
+        // The new pane's rect exists and shares the screen.
+        let rects = m.split_root.compute_rects();
+        assert!(rects.contains_key(&1));
+        assert!((rects[&0].2 + rects[&1].2 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn insert_pane_as_split_with_stale_tree_still_renders_new_pane() {
+        // Tree points at a dead pane 1 (post-close); inserting pane 2 with the
+        // stale tree must still land pane 2 in the tree exactly once.
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(2, pane_state());
+        m.split_root = SplitNode::Leaf(1); // stale
+        m.active_pane = 0;
+        m.insert_pane_as_split(2, SplitDir::Vertical);
+        let mut leaves = m.split_root.leaves();
+        leaves.sort_unstable();
+        assert_eq!(leaves, vec![0, 2], "no dead id, no duplicate leaf");
+    }
+
+    #[test]
+    fn reconcile_tree_repairs_stale_sole_leaf() {
+        // close_tab removes the pane then remove_leaf; when the removed pane
+        // was the tree's only leaf the tree is left pointing at a dead id.
+        // reconcile_tree must rebuild it from the live panes.
+        let mut m = SessionManager::new();
+        // Pane 1 was closed: removed from the map, but the tree was left
+        // pointing at it (the sole-leaf close path).
+        m.panes.insert(0, pane_state());
+        m.split_root = SplitNode::Leaf(1);
+        m.split_root.remove_leaf(1);
+        assert_eq!(
+            m.split_root.leaves(),
+            vec![1],
+            "stale leaf survives remove_leaf"
+        );
+        m.reconcile_tree();
+        assert_eq!(m.split_root.leaves(), vec![0], "tree repaired to live pane");
+    }
+
+    #[test]
+    fn reconcile_tree_is_noop_when_in_sync() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.split_root = SplitNode::from_ids(&[0, 1]);
+        m.reconcile_tree();
+        assert_eq!(m.split_root.leaves(), vec![0, 1]);
+    }
+
+    #[test]
+    fn reconcile_tree_rebuilds_after_pane_drop() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.panes.insert(2, pane_state());
+        m.split_root = SplitNode::from_ids(&[0, 1, 2]);
+        m.panes.remove(&1);
+        m.reconcile_tree();
+        let mut leaves = m.split_root.leaves();
+        leaves.sort_unstable();
+        assert_eq!(leaves, vec![0, 2]);
+    }
+
+    #[test]
+    fn reconcile_tree_preserves_floating_pane() {
+        // The floating pane is intentionally absent from the tree (it renders
+        // as the overlay). A drain-triggered reconcile must not dock it back.
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.split_root = SplitNode::Leaf(0);
+        m.floating = Some(1);
+        m.reconcile_tree();
+        assert_eq!(
+            m.split_root.leaves(),
+            vec![0],
+            "floating pane must stay out of the tree"
+        );
+    }
+
+    #[test]
+    fn insert_pane_as_split_keeps_floating_pane_floating() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.panes.insert(2, pane_state());
+        m.split_root = SplitNode::Leaf(0);
+        m.floating = Some(1);
+        m.active_pane = 0;
+        m.insert_pane_as_split(2, SplitDir::Vertical);
+        let mut leaves = m.split_root.leaves();
+        leaves.sort_unstable();
+        assert_eq!(leaves, vec![0, 2], "new pane in tree, float preserved");
+        assert_eq!(m.floating, Some(1));
+    }
+
+    fn pane_state() -> PaneState {
+        let (_tx, rx) = mpsc::channel();
+        PaneState {
+            parser: Parser::new(80, 24),
+            pty_rx: rx,
+            pty_tx: mpsc::channel().0,
+            title: String::new(),
+            pane_cmd: String::new(),
+            pty_dead: false,
+        }
+    }
 
     #[test]
     fn spawn_err_channels_delivers_ansi_error_and_swallows_commands() {

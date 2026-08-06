@@ -58,7 +58,7 @@ cat >"${APP_DIR}/usr/share/metainfo/io.github.zeroterm.ZeroTerm.metainfo.xml" <<
   <categories>
     <category>TerminalEmulator</category>
   </categories>
-  <url type="homepage">https://github.com/zeroterm/zeroterm</url>
+  <url type="homepage">https://github.com/mahesh-diwan/ZeroTerm</url>
   <project_license>MIT</project_license>
 </component>
 EOF

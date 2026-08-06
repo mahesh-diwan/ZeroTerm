@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="${REPO_ROOT}/target/release/zeroterm"
 DIST_DIR="${REPO_ROOT}/dist"
-VERSION="${1:-$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo 0.2.0)}"
+VERSION="${1:-$(git -C "${REPO_ROOT}" describe --tags --always 2>/dev/null || echo 0.3.0)}"
 ARCH="$(uname -m)"
 # install.sh expects macos-<arch>.zip with x86_64/arm64 (never aarch64)
 [[ "${ARCH}" == "aarch64" ]] && ARCH="arm64"

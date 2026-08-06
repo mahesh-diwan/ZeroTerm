@@ -20,7 +20,7 @@ use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
 use zeroterm_mux::session::{PaneSpec, Session, SessionLayout};
-use zeroterm_mux::split::{SplitDir, SplitNode};
+use zeroterm_mux::split::SplitDir;
 use zeroterm_mux::tab::Tab;
 #[cfg(feature = "plugins")]
 use zeroterm_plugin::Plugin;
@@ -53,6 +53,9 @@ mod session;
 mod settings;
 
 const COPY_MARKER: &str = "[copy]";
+// Derived from the crate version so the window title can never drift from the
+// actual release (CARGO_PKG_VERSION is set at compile time from Cargo.toml).
+const VERSION_LABEL: &str = concat!("ZeroTerm v", env!("CARGO_PKG_VERSION"));
 
 fn zt(mark: &str) {
     if std::env::var("ZTIME").is_ok() {
@@ -208,9 +211,9 @@ impl App {
             let title = pane.parser.screen().title();
             if let Some(window) = &self.window {
                 if title.is_empty() {
-                    window.set_title("ZeroTerm v0.2.0");
+                    window.set_title(VERSION_LABEL);
                 } else {
-                    window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
+                    window.set_title(&format!("{} - {}", VERSION_LABEL, title));
                 }
             }
         }
@@ -225,7 +228,7 @@ impl App {
         info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
         let window_attrs = WindowAttributes::default()
-            .with_title("ZeroTerm v0.2.0")
+            .with_title(VERSION_LABEL)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 config.window.width,
                 config.window.height,
@@ -298,7 +301,7 @@ impl App {
                 parser,
                 pty_rx,
                 pty_tx,
-                title: "ZeroTerm v0.2.0".into(),
+                title: VERSION_LABEL.into(),
                 pane_cmd: shell.clone(),
                 pty_dead: false,
             },
@@ -493,20 +496,23 @@ impl App {
                     parser,
                     pty_rx,
                     pty_tx,
-                    title: "ZeroTerm v0.2.0".into(),
+                    title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
                 },
             );
             self.session.active_pane = id;
             self.session.scroll_offset = 0;
-            self.session.split_root = SplitNode::Leaf(id);
+            // A new tab is another pane in the global tree; insert it next to
+            // the active pane instead of replacing the whole tree (which hid
+            // every existing split and orphaned the other panes).
+            self.session.insert_pane_as_split(id, SplitDir::Vertical);
             self.session.tabs.push(Tab::new(id));
         }
         Ok(())
     }
 
-    fn create_split_pane(&mut self, _dir: SplitDir) -> Result<()> {
+    fn create_split_pane(&mut self, dir: SplitDir) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
             let cell_size = self
@@ -542,13 +548,16 @@ impl App {
                     parser,
                     pty_rx,
                     pty_tx,
-                    title: "ZeroTerm v0.2.0".into(),
+                    title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
                 },
             );
             self.session.active_pane = id;
             self.session.scroll_offset = 0;
+            // The split only exists once the pane is in the tree: Ctrl+Shift+E/D
+            // inserts the new pane as a split of the active pane.
+            self.session.insert_pane_as_split(id, dir);
             self.resize_panes_to_rects();
         }
         Ok(())
@@ -567,6 +576,9 @@ impl App {
             let _ = pane.pty_tx.send(PtyCommand::Kill);
         }
         self.session.split_root.remove_leaf(id);
+        // remove_leaf leaves the tree pointing at the removed pane when it was
+        // the tree's only leaf; rebuild so rendering never dereferences a dead id.
+        self.session.reconcile_tree();
         self.session.tabs.retain(|t| t.id != id);
         if self.session.floating == Some(id) {
             self.session.floating = None;
@@ -723,7 +735,7 @@ impl App {
             );
             self.session.active_pane = id;
             self.session.scroll_offset = 0;
-            self.session.split_root = SplitNode::Leaf(id);
+            self.session.insert_pane_as_split(id, SplitDir::Vertical);
             self.session.tabs.push(Tab::new(id));
         }
         Ok(())
@@ -922,10 +934,12 @@ impl App {
                 }
             }
         }
+        // Keep the tree in sync after any pane removal (see close_tab).
+        self.session.reconcile_tree();
         self.resize_panes_to_rects();
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {
-                window.set_title(&format!("ZeroTerm v0.2.0 - {}", title));
+                window.set_title(&format!("{} - {}", VERSION_LABEL, title));
             }
         }
         if self.sync_active
@@ -2975,7 +2989,7 @@ fn upgrade() -> Result<()> {
     }
     println!("Update ZeroTerm with:");
     println!(
-        "  curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/install.sh | bash -s -- upgrade"
+        "  curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash -s -- upgrade"
     );
     Ok(())
 }

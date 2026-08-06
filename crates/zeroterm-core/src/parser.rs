@@ -8,7 +8,10 @@ const MAX_CSI_PARAM_DIGITS: usize = 32;
 const MAX_CSI_INTERMEDIATES: usize = 2;
 const MAX_OSC_BUFFER: usize = 1 << 20;
 const MAX_DCS_BUFFER: usize = 1 << 22;
-const MAX_APC_BUFFER: usize = 4096;
+// kitty graphics chunks carry up to 4096 raw image bytes (~5.5KB of base64)
+// and many emitters send the whole image in one APC; 4096 CHARS truncated
+// every real image. Memory stays bounded by the decode/dimension caps below.
+const MAX_APC_BUFFER: usize = 1 << 22;
 const MAX_SIXEL_W: u32 = 8192;
 const MAX_SIXEL_H: u32 = 8192;
 const MAX_SIXEL_BYTES: usize = 100 << 20;
@@ -213,28 +216,47 @@ impl Parser {
                 self.screen.put_char(ch);
             }
             // UTF-8 lead/continuation bytes: accumulate, emit on complete sequence.
-            // Max code point is 4 bytes; anything longer or invalid is dropped.
             0x80..=0xFF => {
                 self.utf8_pending.push(byte);
                 if self.utf8_pending.len() > 4 {
+                    // 5+ bytes can never form one code point — invalid input.
                     self.utf8_pending.clear();
+                    self.emit_char('\u{FFFD}');
                     return;
                 }
                 match std::str::from_utf8(&self.utf8_pending) {
-                    Ok(s) if !s.is_empty() => {
-                        let ch = s.chars().next().unwrap();
+                    Ok(s) => {
+                        // May hold several code points when continuation bytes
+                        // piled up behind a completed one; emit them all.
+                        let chars: Vec<char> = s.chars().collect();
                         self.utf8_pending.clear();
-                        self.after_newline = false;
-                        if self.collecting_command {
-                            self.command_buf.push(ch);
+                        for ch in chars {
+                            self.emit_char(ch);
                         }
-                        self.screen.put_char(ch);
                     }
-                    // Still accumulating (or invalid) — wait for more bytes.
-                    _ => {}
+                    Err(e) if e.error_len().is_some() => {
+                        // A genuinely invalid sequence (bad lead, bad
+                        // continuation, overlong): emit U+FFFD and resync
+                        // instead of letting the bad bytes swallow later text.
+                        self.utf8_pending.clear();
+                        self.emit_char('\u{FFFD}');
+                    }
+                    // Incomplete prefix of a valid code point — keep buffering.
+                    Err(_) => {}
                 }
             }
         }
+    }
+
+    /// Route one decoded character to the screen, keeping block-command
+    /// capture in sync. Multibyte characters never match prompt sigils, so
+    /// only the after-newline flag and command buffer need handling here.
+    fn emit_char(&mut self, ch: char) {
+        self.after_newline = false;
+        if self.collecting_command {
+            self.command_buf.push(ch);
+        }
+        self.screen.put_char(ch);
     }
 
     fn handle_escape(&mut self, byte: u8) {
@@ -249,22 +271,27 @@ impl Parser {
             0x5B => {
                 // '['
                 self.state = ParserState::CsiEntry;
+                self.escape_intermediates.clear();
                 self.csi.reset();
             }
             0x5D => {
                 // ']'
                 self.state = ParserState::OscString;
+                self.escape_intermediates.clear();
                 self.osc_buffer.clear();
             }
             0x50 => {
                 // 'P'
                 self.state = ParserState::DcsEntry;
+                self.escape_intermediates.clear();
                 self.dcs_buffer.clear();
                 self.csi.reset();
             }
             0x58 | 0x5E | 0x5F => {
                 // 'X' '^' '_' - SOS, PM, APC
                 self.state = ParserState::SosPmApcString;
+                self.escape_intermediates.clear();
+                self.apc_buffer.clear();
             }
             0x30..=0x4F => {
                 // Final byte of an escape sequence (single-char or after intermediates)

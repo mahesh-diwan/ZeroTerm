@@ -1,33 +1,50 @@
-import Link from 'next/link';
+const REPO_DOCS = 'https://github.com/mahesh-diwan/ZeroTerm/tree/main/docs';
 
 const sections = [
   {
     id: 'quickstart',
     title: 'Quick Start',
     items: [
-      { label: 'Installation', content: 'Install via your preferred package manager:\n\n```bash\n# Homebrew (macOS)\nbrew install zeroterm\n\n# Cargo\ncargo install zeroterm\n\n# Linux binary\ncurl -LsSf https://github.com/mahesh-diwan/ZeroTerm/releases/latest/download/zeroterm-installer.sh | sh\n```\n\nOn first launch, ZeroTerm creates default config at `~/.config/zeroterm/config.toml`.' },
-      { label: 'First Run', content: 'Run `zeroterm` from your terminal. ZeroTerm opens as a standalone window. Create a new tab with `Cmd+T` (macOS) or `Ctrl+T` (Linux/Windows).\n\nSessions persist across restarts. Close the window and reopen — your tabs are restored.' },
-      { label: 'Keyboard Shortcuts', content: '| Shortcut | Action |\n|---|---|\n| `Cmd/Ctrl + T` | New tab |\n| `Cmd/Ctrl + W` | Close tab |\n| `Cmd/Ctrl + D` | Split right |\n| `Cmd/Ctrl + Shift + D` | Split down |\n| `Cmd/Ctrl + [` | Previous tab |\n| `Cmd/Ctrl + ]` | Next tab |\n| `Cmd/Ctrl + Shift + Enter` | Fullscreen |\n| `Cmd/Ctrl + K` | Clear scrollback |\n| `Cmd/Ctrl + Shift + F` | Search |\n| `Ctrl + L` | Toggle AI assistant |' },
-      { label: 'SSH Connections', content: '```bash\nzeroterm ssh user@hostname\n```\n\nSSH sessions are persistent — disconnect with `~.` and reconnect later. Sessions survive network interruptions.' },
+      {
+        label: 'Installation',
+        content: 'ZeroTerm is not yet published to crates.io, Homebrew, or Flathub, so the supported paths are the install script and building from source:\n\n```bash\n# Linux/macOS — resolves the latest release tag, downloads a prebuilt\n# binary when one exists, otherwise builds from source at that tag\ncurl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh\n\n# Build from source\n# Requires Rust stable: https://rustup.rs\ngit clone https://github.com/mahesh-diwan/ZeroTerm.git\ncd ZeroTerm\ncargo run --release\n```\n\nPrebuilt binaries (AppImage, macOS zip, Windows zip, .deb, .rpm) are attached to each GitHub Release once the release pipeline publishes them. On first launch, ZeroTerm writes a default config to `~/.config/zeroterm/config.toml`.',
+      },
+      {
+        label: 'First Run',
+        content: 'Run `zeroterm` from your terminal — it opens as a standalone window. Sessions persist across restarts: close the window and reopen, and your tabs are restored.\n\nLaunch it in a shell, start the demo, or connect to a remote host with `Ctrl+Shift+S` (uses the host in `config.ssh`, or opens a host picker).',
+      },
+      {
+        label: 'Keyboard Shortcuts',
+        content: '| Shortcut | Action |\n|---|---|\n| `Ctrl+Shift+T` | New tab |\n| `Ctrl+Shift+W` | Close active tab |\n| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |\n| `Alt+1` … `Alt+9` | Switch to tab 1-9 |\n| `Ctrl+Shift+E` | Split pane vertically |\n| `Ctrl+Shift+D` | Split pane horizontally |\n| `Ctrl+Shift+G` | Float active pane (overlay) |\n| `Alt+Arrow` | Focus adjacent pane |\n| `Ctrl+Shift+F` | Toggle search overlay |\n| `Ctrl+Shift+J` / `K` | Jump to next / previous output block |\n| `Ctrl+Shift+C` / `V` | Copy selection / paste |\n| `Ctrl+Shift+O` | Cycle window opacity |\n| `F12` | Toggle quake (drop-down) mode |\n| `Shift+PageUp/Down` | Scroll back / forward |\n| `Shift+Home` / `Shift+End` | Jump to oldest / newest scrollback |\n\nA plain `PageUp`/`PageDown`/`Home`/`End` is forwarded to the shell (for `less`, `vim`, etc.); only the `Shift` variants scroll the scrollback.',
+      },
+      {
+        label: 'SSH',
+        content: 'SSH is a built-in feature (Unix): configure a host under `[ssh]` in `config.toml` and press `Ctrl+Shift+S` to connect. Sessions are persistent — disconnect without killing the remote work, and reconnect later. See the user guide for details.',
+      },
     ],
   },
   {
     id: 'configuration',
     title: 'Configuration',
     items: [
-      { label: 'Config File Locations', content: '| Platform | Path |\n|---|---|\n| Linux | `~/.config/zeroterm/config.toml` |\n| macOS | `~/Library/Application Support/zeroterm/config.toml` |\n| Windows | `%APPDATA%/zeroterm/config.toml` |\n| Portable | `./zeroterm.toml` (same directory as binary) |' },
-      { label: 'Available Settings', content: '```toml\n[terminal]\nfont_size = 14\nfont_family = "JetBrains Mono"\nopacity = 0.95\ncursor_style = "block"  # block | underline | bar\ncursor_blink = false\nscrollback_lines = 10000\n\n[theme]\nbackground = "#0a0a0f"\nforeground = "#e8e8ed"\nblack = "#222233"\nred = "#ff3333"\ngreen = "#00d4aa"\nyellow = "#ffaa00"\nblue = "#5599ff"\nmagenta = "#ff66aa"\ncyan = "#44ddff"\nwhite = "#cccccc"\n\n[multiplexer]\nhistory_size = 100\nrestore_sessions = true\n\n[performance]\ngpu_vsync = true\nmax_fps = 120\n\n[ai]\nenabled = false\nmodel = "llama3.2"\nprovider = "ollama"  # ollama | lm_studio\nendpoint = "http://localhost:11434"\n```' },
-      { label: 'Lua Scripting', content: 'Create `~/.config/zeroterm/init.lua` to customize behavior:\n\n```lua\n-- Custom keybinding\nzeroterm.bind("Ctrl+Shift+N", function()\n  zeroterm.new_tab()\n  zeroterm.run("htop")\nend)\n\n-- Auto-execute on tab creation\nzeroterm.on("tab_created", function(tab)\n  if tab.name == "dev" then\n    zeroterm.run("cd ~/projects && ls")\n  end\nend)\n\n-- Custom prompt format\nzeroterm.on("prompt", function()\n  return os.getenv("USER") .. "@" .. os.getenv("HOSTNAME") .. " $ "\nend)\n```' },
+      {
+        label: 'Config File Locations',
+        content: 'ZeroTerm reads `~/.config/zeroterm/config.toml` for core settings and an optional `~/.zeroterm.lua` Lua script for advanced customization.\n\n| Path | Purpose |\n|---|---|\n| `~/.config/zeroterm/config.toml` | Core settings (window, fonts, colors, keybindings, SSH, sync) |\n| `~/.zeroterm.lua` | Optional Lua scripting |\n\nSee the [config reference](https://github.com/mahesh-diwan/ZeroTerm/blob/main/docs/CONFIG_REFERENCE.md) for every setting and its default.',
+      },
+      {
+        label: 'Documentation',
+        content: 'The full, current documentation lives in the repository:\n\n- [User guide](https://github.com/mahesh-diwan/ZeroTerm/blob/main/docs/USER_GUIDE.md) — shortcuts, selection, search, blocks, images\n- [Config reference](https://github.com/mahesh-diwan/ZeroTerm/blob/main/docs/CONFIG_REFERENCE.md) — every TOML key and Lua hook\n- [Plugin development guide](https://github.com/mahesh-diwan/ZeroTerm/blob/main/docs/PLUGIN_DEV_GUIDE.md) — writing WASM plugins\n- [Architecture](https://github.com/mahesh-diwan/ZeroTerm/blob/main/docs/ARCHITECTURE.md) — how the crates fit together',
+      },
     ],
   },
   {
     id: 'features',
     title: 'Features',
     items: [
-      { label: 'Tabs & Splits', content: 'ZeroTerm supports native tab management and tiling split panes. Drag tabs to reorder. Split vertically or horizontally. Each pane independently runs a shell, SSH session, or custom command.\n\nSessions persist in the background — switching tabs preserves scrollback and running processes.' },
-      { label: 'AI Integration', content: 'Connect to a local Ollama or LM Studio instance for AI-powered terminal assistance:\n\n- **Explain output**: Select command output and ask AI to explain it\n- **Suggest commands**: Describe what you want to do, get command suggestions\n- **Complete code**: AI suggests completions for multi-line commands\n- **Fix errors**: Paste error messages, get fix suggestions\n\nAll processing is local. No data leaves your machine.' },
-      { label: 'Sync', content: 'Encrypted configuration sync across machines:\n\n```toml\n[sync]\nenable = true\nprovider = "manual"  # manual | s3 | webdav\nencryption_key = "your-base64-key"\n```\n\nSyncs: config.toml, init.lua, themes, session history, SSH known hosts.' },
-      { label: 'Theming', content: 'Full 256-color and truecolor support. import themes from:\n\n- iTerm2 color schemes (`.itermcolors`)\n- Xresources\n- Windows Terminal themes (`.json`)\n- ZeroTerm native TOML format\n\nThemes live in `~/.config/zeroterm/themes/`.' },
+      {
+        label: 'What is implemented',
+        content: '- **Tabs & split panes** — tiling splits, floating-pane overlay, session restore\n- **Scrollback** — search overlay, output-block navigation, syntax highlighting\n- **Graphics protocols** — Kitty, Sixel, and iTerm2 inline images\n- **SSH** — native client with persistent sessions (Unix)\n- **Local AI** — optional Ollama / LM Studio integration for explain & suggest (`ai` feature)\n- **Encrypted sync** — ChaCha20-Poly1305 settings sync (`sync` feature)\n- **Plugins** — WASM sandbox via wasmtime (`plugins` feature)\n- **Line editor** — readline-style multi-line editing with history\n\nAll claims on this site correspond to code in the repository; features are feature-gated in `crates/zeroterm/Cargo.toml`.',
+      },
     ],
   },
 ];
@@ -40,8 +57,12 @@ function DocSection({ section }: { section: typeof sections[number] }) {
         {section.items.map((item) => (
           <div key={item.label} className="bg-[var(--card)] border border-[var(--border)] rounded-xl p-6">
             <h3 className="text-xl font-semibold mb-4">{item.label}</h3>
-            <div className="text-sm text-[var(--fg-muted)] leading-relaxed prose-invert max-w-none [&_code]:text-[var(--accent)] [&_code]:text-xs [&_code]:bg-[var(--bg-elevated)] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_pre]:bg-[var(--bg)] [&_pre]:border [&_pre]:border-[var(--border)] [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:overflow-x-auto [&_pre]:my-4 [&_table]:w-full [&_table]:text-sm [&_th]:text-left [&_th]:p-2 [&_th]:border-b [&_th]:border-[var(--border)] [&_th]:text-[var(--fg)] [&_td]:p-2 [&_td]:border-b [&_td]:border-[var(--border)] [&_td]:text-[var(--fg-muted)]">
-              <div dangerouslySetInnerHTML={{ __html: item.content.replace(/\n/g, '<br/>').replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>').replace(/\|(.+)\|/g, (m) => { if (m.includes('---')) return ''; return m; }) }} />
+            <div className="text-sm text-[var(--fg-muted)] leading-relaxed prose-invert max-w-none [&_code]:text-[var(--accent)] [&_code]:text-xs [&_code]:bg-[var(--bg-elevated)] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_pre]:bg-[var(--bg)] [&_pre]:border [&_pre]:border-[var(--border)] [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:overflow-x-auto [&_pre]:my-4 [&_pre]:text-[var(--fg)] [&_table]:w-full [&_table]:text-sm [&_th]:text-left [&_th]:p-2 [&_th]:border-b [&_th]:border-[var(--border)] [&_th]:text-[var(--fg)] [&_td]:p-2 [&_td]:border-b [&_td]:border-[var(--border)] [&_td]:text-[var(--fg-muted)]">
+              <div dangerouslySetInnerHTML={{ __html: item.content
+                .replace(/\n/g, '<br/>')
+                .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+                .replace(/\|(.+)\|/g, (m) => { if (m.includes('---')) return ''; return m; })
+                .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" class="text-[var(--accent)] hover:underline">$1</a>') }} />
             </div>
           </div>
         ))}

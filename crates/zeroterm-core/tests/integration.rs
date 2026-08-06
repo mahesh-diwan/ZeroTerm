@@ -410,12 +410,13 @@ fn test_insert_lines() {
 
 #[test]
 fn test_delete_lines() {
-    // delete_lines removes from scroll_top (0) and appends empty at bottom
+    // delete_lines removes at the cursor row and appends empty at the bottom
+    // of the scroll region (xterm DL semantics, not scroll-top).
     let mut p = setup(10, 3);
     p.parse(b"ABC\r\nDEF\r\nGHI");
     p.parse(b"\x1b[2;1H\x1b[1M");
     let screen = p.screen();
-    assert_eq!(screen.cell(0, 0).unwrap().ch, 'D');
+    assert_eq!(screen.cell(0, 0).unwrap().ch, 'A');
     assert_eq!(screen.cell(1, 0).unwrap().ch, 'G');
     assert!(screen.cell(2, 0).unwrap().is_empty());
 }
@@ -777,28 +778,28 @@ fn test_alternate_screen_preserves_normal_buffer() {
 // --------------------- insert/delete line stress ---------------------
 
 #[test]
-fn test_insert_lines_operates_from_scroll_top() {
+fn test_insert_lines_operates_from_cursor_row() {
     let mut p = setup(10, 5);
     p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
-    p.parse(b"\x1b[2L");
+    p.parse(b"\x1b[3;1H\x1b[2L");
     let screen = p.screen();
-    // ponytail: IL always inserts at scroll_top (0), not cursor row
-    assert!(screen.cell(0, 0).unwrap().is_empty());
-    assert!(screen.cell(1, 0).unwrap().is_empty());
-    assert_eq!(screen.cell(2, 0).unwrap().ch, 'A');
-    assert_eq!(screen.cell(3, 0).unwrap().ch, 'B');
+    // IL inserts blank lines at the cursor row (row 2), pushing content down.
+    assert_eq!(screen.cell(0, 0).unwrap().ch, 'A');
+    assert_eq!(screen.cell(1, 0).unwrap().ch, 'B');
+    assert!(screen.cell(2, 0).unwrap().is_empty());
+    assert!(screen.cell(3, 0).unwrap().is_empty());
     assert_eq!(screen.cell(4, 0).unwrap().ch, 'C');
 }
 
 #[test]
-fn test_delete_lines_operates_from_scroll_top() {
+fn test_delete_lines_operates_from_cursor_row() {
     let mut p = setup(10, 5);
     p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
-    p.parse(b"\x1b[2M");
+    p.parse(b"\x1b[3;1H\x1b[2M");
     let screen = p.screen();
-    // ponytail: DL always deletes from scroll_top (0), not cursor row
-    assert_eq!(screen.cell(0, 0).unwrap().ch, 'C');
-    assert_eq!(screen.cell(1, 0).unwrap().ch, 'D');
+    // DL deletes from the cursor row (row 2), pulling content up.
+    assert_eq!(screen.cell(0, 0).unwrap().ch, 'A');
+    assert_eq!(screen.cell(1, 0).unwrap().ch, 'B');
     assert_eq!(screen.cell(2, 0).unwrap().ch, 'E');
     assert!(screen.cell(3, 0).unwrap().is_empty());
     assert!(screen.cell(4, 0).unwrap().is_empty());
@@ -892,4 +893,131 @@ fn test_backspace_at_zero_with_wraparound_off() {
     p.screen_mut().set_autowrap(false);
     p.parse(b"\x08");
     assert_eq!(p.screen().cursor().col, 0);
+}
+
+// --------------------- ED scrollback semantics ---------------------
+
+#[test]
+fn test_erase_display_mode_2_preserves_scrollback() {
+    // `clear` (ESC [ 2 J) must NOT wipe history: ED 2 erases the display only.
+    let mut p = setup(5, 3);
+    for line in 0..6 {
+        p.parse(format!("L{}\r\n", line).as_bytes());
+    }
+    assert!(
+        !p.screen().scrollback().is_empty(),
+        "scrollback must be populated before ED 2"
+    );
+    p.parse(b"\x1b[2J");
+    assert!(
+        !p.screen().scrollback().is_empty(),
+        "ED 2 must not clear scrollback"
+    );
+    // Display is erased.
+    for row in 0..3 {
+        for col in 0..5 {
+            assert_eq!(p.screen().cell(row, col).unwrap().ch, ' ');
+        }
+    }
+}
+
+#[test]
+fn test_erase_display_mode_3_clears_scrollback_only() {
+    // xterm ED 3 = "Erase Saved Lines": scrollback is cleared, display kept.
+    let mut p = setup(5, 3);
+    p.parse(b"L0\r\nL1\r\nL2");
+    p.parse(b"\x1b[2J"); // keep display only (mode 2 semantics)
+    p.parse(b"\x1b[3J");
+    assert!(
+        p.screen().scrollback().is_empty(),
+        "ED 3 must clear scrollback"
+    );
+}
+
+// --------------------- resize preserves scrollback ---------------------
+
+#[test]
+fn test_resize_shrink_pushes_rows_to_scrollback() {
+    let mut p = setup(5, 5);
+    p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
+    p.screen_mut().resize(5, 3);
+    // The two rows that fell off the top (A, B) must survive in scrollback,
+    // newest-at-front: index 0 holds B (the row just above the viewport).
+    assert_eq!(
+        p.screen().scrollback().len(),
+        2,
+        "dropped rows must be kept"
+    );
+    let sb = p.screen().scrollback();
+    assert_eq!(sb[0][0].ch, 'B', "newest dropped row at index 0");
+    assert_eq!(sb[1][0].ch, 'A', "oldest dropped row at index 1");
+    // Remaining view still holds the bottom rows C, D, E.
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'C');
+    assert_eq!(p.screen().cell(2, 0).unwrap().ch, 'E');
+}
+
+#[test]
+fn test_resize_grow_pulls_rows_from_scrollback() {
+    let mut p = setup(5, 5);
+    p.parse(b"AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE");
+    p.screen_mut().resize(5, 3); // shrink: A, B into scrollback
+    assert_eq!(p.screen().scrollback().len(), 2);
+    p.screen_mut().resize(5, 5); // grow back: pull them above the view
+    assert_eq!(
+        p.screen().scrollback().len(),
+        0,
+        "grown rows are pulled out"
+    );
+    // Order restored: A above B above C D E.
+    assert_eq!(p.screen().cell(0, 0).unwrap().ch, 'A');
+    assert_eq!(p.screen().cell(1, 0).unwrap().ch, 'B');
+    assert_eq!(p.screen().cell(2, 0).unwrap().ch, 'C');
+    assert_eq!(p.screen().cell(4, 0).unwrap().ch, 'E');
+}
+
+// --------------------- invalid UTF-8 recovery ---------------------
+
+#[test]
+fn test_invalid_utf8_does_not_swallow_following_text() {
+    // A lone invalid lead byte must not swallow the ASCII that follows it.
+    let mut p = setup(80, 24);
+    p.parse(&[0xFF, b'a', b'b', b'c']);
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, '\u{FFFD}');
+    assert_eq!(screen.cell(0, 1).unwrap().ch, 'a');
+    assert_eq!(screen.cell(0, 2).unwrap().ch, 'b');
+    assert_eq!(screen.cell(0, 3).unwrap().ch, 'c');
+}
+
+#[test]
+fn test_invalid_continuation_resyncs() {
+    // 0xC3 starts a 2-byte char; a second 0xC3 is an invalid continuation.
+    // Both are consumed as one replacement char, then text continues cleanly.
+    let mut p = setup(80, 24);
+    p.parse(&[0xC3, 0xC3, b'x']);
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, '\u{FFFD}');
+    assert_eq!(screen.cell(0, 1).unwrap().ch, 'x');
+}
+
+#[test]
+fn test_ascii_after_partial_utf8_drops_partial_only() {
+    // 0xC3 is an incomplete 2-byte lead; the following ASCII '(' is handled as
+    // text and the orphaned lead is dropped (pre-existing, standard behavior).
+    let mut p = setup(80, 24);
+    p.parse(&[0xC3, b'(', b'x']);
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, '(');
+    assert_eq!(screen.cell(0, 1).unwrap().ch, 'x');
+}
+
+#[test]
+fn test_multi_char_utf8_burst_emits_all() {
+    // Continuation bytes piling up behind a completed code point must all emit.
+    let mut p = setup(80, 24);
+    p.parse(&[0xC3, 0xA9]);
+    p.parse(&[0xE2, 0x82, 0xAC]); // 'é' then '€' across chunks
+    let screen = p.screen();
+    assert_eq!(screen.cell(0, 0).unwrap().ch, '\u{e9}');
+    assert_eq!(screen.cell(0, 1).unwrap().ch, '\u{20ac}');
 }

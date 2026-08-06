@@ -136,28 +136,70 @@ impl Screen {
         if cols == self.size.cols && rows == self.size.rows {
             return;
         }
+        let old_rows = self.size.rows;
+        let old_cols = self.size.cols;
 
-        let mut new_buffer = vec![vec![Cell::default(); cols]; rows];
-
-        let row_start = self.size.rows.saturating_sub(rows);
-        let col_end = cols.min(self.size.cols);
-
-        for (r, row) in self.buffer.iter().skip(row_start).enumerate() {
-            for (c, cell) in row.iter().take(col_end).enumerate() {
-                new_buffer[r][c] = *cell;
+        // Shrinking the viewport: the lines that fall off the top are pushed
+        // into scrollback instead of being dropped, so history survives a
+        // window shrink. Newest-at-front matches the scroll_up invariant.
+        // Alt-screen rows never enter scrollback (real terminals replace
+        // history wholesale while the alt screen is up).
+        if rows < old_rows && !self.use_alt_screen {
+            let dropped = old_rows - rows;
+            for _ in 0..dropped {
+                let line = self.current_buffer_mut().first().cloned();
+                if let Some(line) = line {
+                    self.current_buffer_mut().remove(0);
+                    self.scrollback.push_front(line);
+                    if self.scrollback.len() > self.scrollback_limit {
+                        self.scrollback.pop_back();
+                    }
+                }
             }
         }
 
+        // Growing the viewport: pull the newest scrollback lines back into the
+        // top of the view so the cursor stays at the bottom and history is
+        // revealed, exactly like scrolling up a real terminal.
+        let pull = rows.saturating_sub(old_rows).min(self.scrollback.len());
+
+        let mut new_buffer = vec![vec![Cell::default(); cols]; rows];
+        let mut pulled: Vec<Vec<Cell>> = (0..pull)
+            .filter_map(|_| self.scrollback.pop_front())
+            .collect();
+        // pop_front yields newest-first; reverse so older lines sit above.
+        pulled.reverse();
+        for (i, mut line) in pulled.into_iter().enumerate() {
+            line.resize(cols, Cell::default());
+            new_buffer[i] = line;
+        }
+
+        let col_end = cols.min(old_cols);
+        for (r, row) in self
+            .buffer
+            .iter()
+            .take(rows.saturating_sub(pull))
+            .enumerate()
+        {
+            for (c, cell) in row.iter().take(col_end).enumerate() {
+                new_buffer[r + pull][c] = *cell;
+            }
+        }
         self.buffer = new_buffer;
 
-        if let Some(ref mut alt) = self.alt_buffer {
+        // Alt buffer: same top-anchored copy, but alt screens have no
+        // scrollback to pull from or push into.
+        if let Some(alt) = self.alt_buffer.as_mut() {
             let mut new_alt = vec![vec![Cell::default(); cols]; rows];
-            let row_start = self.size.rows.saturating_sub(rows);
-            let col_end = cols.min(self.size.cols);
-
+            let row_start = old_rows.saturating_sub(rows);
+            let col_end = cols.min(old_cols);
             for (r, row) in alt.iter().skip(row_start).enumerate() {
                 for (c, cell) in row.iter().take(col_end).enumerate() {
-                    new_alt[r][c] = *cell;
+                    if let Some(dst) = new_alt.get_mut(r) {
+                        if let Some(cell_ref) = dst.get_mut(c) {
+                            *cell_ref = *cell;
+                        }
+                    }
                 }
             }
             *alt = new_alt;
@@ -470,7 +512,7 @@ impl Screen {
                     }
                 }
             }
-            2 | 3 => {
+            2 => {
                 for r in top..=bottom {
                     if let Some(row_buf) = self.current_buffer_mut().get_mut(r) {
                         for cell in row_buf.iter_mut().take(cols) {
@@ -478,6 +520,11 @@ impl Screen {
                         }
                     }
                 }
+            }
+            3 => {
+                // xterm semantics: ED 3 erases saved lines (scrollback) only.
+                // The visible display is untouched. Only this mode may clear
+                // history — ED 2 (`clear`) must not destroy scrollback.
                 self.scrollback.clear();
             }
             _ => {}
@@ -510,34 +557,40 @@ impl Screen {
         }
     }
 
+    /// Insert `n` blank lines at the cursor row, scrolling the region between
+    /// the cursor and `scroll_bottom` down (xterm IL semantics). The cursor
+    /// moves to column 0. Cursor rows above the scroll region clamp to its top.
     pub fn insert_lines(&mut self, n: usize) {
-        let top = self.scroll_top();
         let bottom = self.scroll_bottom();
+        let top = self.scroll_top();
+        let cursor_row = self.cursor.row.clamp(top, bottom);
         let cols = self.size.cols;
         // More iterations than the region holds are no-ops; clamp so a hostile
         // "ESC [ 999999999999 L" cannot spin forever.
-        let n = n.min(bottom - top + 1);
+        let n = n.min(bottom.saturating_sub(cursor_row) + 1);
         for _ in 0..n {
-            if top < bottom {
-                self.current_buffer_mut().remove(bottom);
-                self.current_buffer_mut()
-                    .insert(top, vec![Cell::default(); cols]);
-            }
+            self.current_buffer_mut().remove(bottom);
+            self.current_buffer_mut()
+                .insert(cursor_row, vec![Cell::default(); cols]);
         }
+        self.cursor.col = 0;
     }
 
+    /// Delete `n` lines at the cursor row, scrolling the region up (xterm DL
+    /// semantics). The cursor moves to column 0. Cursor rows above the scroll
+    /// region clamp to its top.
     pub fn delete_lines(&mut self, n: usize) {
-        let top = self.scroll_top();
         let bottom = self.scroll_bottom();
+        let top = self.scroll_top();
+        let cursor_row = self.cursor.row.clamp(top, bottom);
         let cols = self.size.cols;
-        let n = n.min(bottom - top + 1);
+        let n = n.min(bottom.saturating_sub(cursor_row) + 1);
         for _ in 0..n {
-            if top < bottom {
-                self.current_buffer_mut().remove(top);
-                self.current_buffer_mut()
-                    .insert(bottom, vec![Cell::default(); cols]);
-            }
+            self.current_buffer_mut().remove(cursor_row);
+            self.current_buffer_mut()
+                .insert(bottom, vec![Cell::default(); cols]);
         }
+        self.cursor.col = 0;
     }
 
     pub fn insert_chars(&mut self, n: usize) {
