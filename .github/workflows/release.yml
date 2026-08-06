@@ -35,10 +35,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos-latest'
-        run: brew install cmake pkg-config
+        run: brew install cmake pkg-config lua
       - name: Build release
         run: |
           # crates.io downloads on runners can be transiently flaky; retry the
@@ -167,6 +167,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
       - name: Build .deb package
         run: |
           set +e
@@ -198,10 +202,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install rpm tools
+      - name: Install rpm tools and build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm
+          sudo apt-get install -y rpm libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
       - name: Build .rpm package
         run: |
           set +e

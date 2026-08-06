@@ -56,8 +56,18 @@ cd ZeroTerm
 cargo run --release
 ```
 
-Requires a stable Rust toolchain (via [rustup](https://rustup.rs)) and the
-platform prerequisites for wgpu (e.g. Vulkan drivers on Linux).
+Requires a stable Rust toolchain (via [rustup](https://rustup.rs)), the
+platform prerequisites for wgpu (e.g. Vulkan drivers on Linux), and Lua 5.4
+dev headers for the mlua-backed config loader:
+
+```bash
+# Debian/Ubuntu
+sudo apt install liblua5.4-dev libxkbcommon-dev libwayland-dev libx11-dev \
+     libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
+
+# macOS (Homebrew)
+brew install lua cmake pkg-config
+```
 
 ## Configuration
 

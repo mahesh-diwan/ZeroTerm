@@ -38,10 +38,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake pkg-config
+        run: brew install cmake pkg-config lua
       - name: Build
         run: |
           # Retry the network-heavy fetch (crates.io is occasionally flaky from
