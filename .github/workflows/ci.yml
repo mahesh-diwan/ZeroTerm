@@ -33,10 +33,22 @@ jobs:
           components: [fmt, clippy]
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --locked --workspace ${{ matrix.cargo_exclude }}
+        run: |
+          # Retry the network-heavy fetch (crates.io is occasionally flaky from
+          # runners); build offline so later steps never touch the network.
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            if [ "$i" = "3" ]; then
+              echo "::error::cargo fetch failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          cargo build --locked --offline --workspace ${{ matrix.cargo_exclude }}
       - name: Test
-        run: cargo test --locked --workspace ${{ matrix.cargo_exclude }}
+        run: cargo test --locked --offline --workspace ${{ matrix.cargo_exclude }}
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets ${{ matrix.cargo_exclude }} -- -D warnings
+        run: cargo clippy --locked --offline --workspace --all-targets ${{ matrix.cargo_exclude }} -- -D warnings

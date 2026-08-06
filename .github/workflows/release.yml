@@ -32,7 +32,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release --locked -p zeroterm
+        run: |
+          # crates.io downloads on runners can be transiently flaky; retry the
+          # network-heavy fetch, then build offline so the build itself never
+          # depends on the network.
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            if [ "$i" = "3" ]; then
+              echo "::error::cargo fetch failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          cargo build --release --locked --offline -p zeroterm
       - name: Check binary size (50MB gate)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -76,7 +89,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --release --locked -p zeroterm
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            if [ "$i" = "3" ]; then
+              echo "::error::cargo fetch failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          cargo build --release --locked --offline -p zeroterm
       - name: Package for Windows (zip)
         run: scripts\package_windows.bat
         shell: cmd
@@ -125,7 +148,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build .deb package
-        run: bash scripts/build-deb.sh
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            if [ "$i" = "3" ]; then
+              echo "::error::cargo fetch failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          cargo build --release --locked --offline
+          bash scripts/build-deb.sh
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
@@ -145,7 +179,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm
       - name: Build .rpm package
-        run: bash scripts/build-rpm.sh
+        run: |
+          for i in 1 2 3; do
+            cargo fetch --locked && break
+            if [ "$i" = "3" ]; then
+              echo "::error::cargo fetch failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            sleep 10
+          done
+          cargo build --release --locked --offline
+          bash scripts/build-rpm.sh
       - name: Upload .rpm
         uses: actions/upload-artifact@v4
         with:
@@ -170,9 +215,10 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [build, windows, deb, rpm, flatpak, systemd-unit]
-    # always(): publish even if an optional job (windows/flatpak) failed —
-    # download-artifact simply won't find their artifacts.
-    if: always() && startsWith(github.ref, 'refs/tags/')
+    # Only publish when the primary Linux/macOS build succeeded; optional jobs
+    # (windows/flatpak) failing must not block the release, and a failed main
+    # build must not publish an empty release.
+    if: always() && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
@@ -181,6 +227,10 @@ jobs:
           path: release-assets
       - name: Show collected assets
         run: find release-assets -type f | sort
+      - name: Remove stale release for this tag
+        run: gh release delete "${GITHUB_REF_NAME}" --yes 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
