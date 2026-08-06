@@ -28,11 +28,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # components must be a string, not a YAML list — a sequence here makes
-      # GitHub reject the whole workflow silently (runs created with 0 jobs).
+      # components must be a single comma-separated string (a YAML list or
+      # space-separated value makes the step fail on every platform).
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: fmt clippy
+          components: fmt,clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         if: runner.os == 'Linux'
