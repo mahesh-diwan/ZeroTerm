@@ -1,8 +1,8 @@
 name: CI
 
-on:
-  push:
-  pull_request:
+# List form (proven to work) — the block form with null values below `on:`
+# made GitHub reject the workflow silently (runs created with 0 jobs).
+on: [push, pull_request]
 
 jobs:
   build:
@@ -32,6 +32,14 @@ jobs:
         with:
           components: [fmt, clippy]
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake pkg-config
       - name: Build
         run: |
           # Retry the network-heavy fetch (crates.io is occasionally flaky from
