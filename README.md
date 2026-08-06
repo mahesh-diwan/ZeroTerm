@@ -40,7 +40,7 @@ Linux), and the project is organized as a Cargo workspace of nine crates.
 ### Install script (Linux / macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash
 ```
 
 The installer resolves the latest tagged release from the GitHub API, downloads

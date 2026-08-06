@@ -7,7 +7,7 @@
 #   2. falls back to building from source at that tag.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash
 #   ./install.sh upgrade                  # (re)install the latest release
 #   ZEROTERM_VERSION=v0.3.0 ./install.sh  # pin a specific release tag
 #
@@ -15,6 +15,15 @@
 #   ZEROTERM_VERSION      release tag to install (default: latest published)
 #   ZEROTERM_INSTALL_DIR  install destination (default: ~/.local/bin for
 #                         binaries, ~/Applications for the macOS app)
+# The script uses bash features (`[[ ]]`, `pipefail`, `local`); detect a POSIX
+# sh early so `curl ... | sh` on dash gives a clear message instead of a
+# cryptic failure.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "This installer requires bash (bash-specific features are used)." >&2
+    echo "Run it with: curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 REPO="mahesh-diwan/ZeroTerm"
@@ -39,7 +48,7 @@ resolve_version() {
     fi
     local json v=""
     # Prefer the latest *published* release; its tag is what we install.
-    json="$(curl -fsSL --max-time 20 "${API_URL}/releases/latest" 2>/dev/null || true)"
+    json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/releases/latest" 2>/dev/null || true)"
     if [[ -n "$json" ]]; then
         v="$(printf '%s' "$json" \
             | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
@@ -47,7 +56,7 @@ resolve_version() {
     fi
     if [[ -z "$v" ]]; then
         # No published release yet: use the newest tag, else main.
-        json="$(curl -fsSL --max-time 20 "${API_URL}/tags?per_page=100" 2>/dev/null || true)"
+        json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/tags?per_page=100" 2>/dev/null || true)"
         if [[ -n "$json" ]]; then
             v="$(printf '%s' "$json" \
                 | grep -o '"name"[[:space:]]*:[[:space:]]*"v[^"]*"' | head -1 \
@@ -97,9 +106,9 @@ detect_platform() {
 
 fetch_release_json() {
     local version="$1" json
-    json="$(curl -fsSL --max-time 20 "${API_URL}/releases/tags/${version}" 2>/dev/null || true)"
+    json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/releases/tags/${version}" 2>/dev/null || true)"
     if [[ -z "$json" ]]; then
-        json="$(curl -fsSL --max-time 20 "${API_URL}/releases/latest" 2>/dev/null || true)"
+        json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/releases/latest" 2>/dev/null || true)"
     fi
     printf '%s' "$json"
 }
@@ -280,7 +289,24 @@ main() {
     case "$mode" in
         install|upgrade) ;;
         -h|--help|help)
-            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+            cat <<'HELP'
+ZeroTerm installer
+
+Resolves the latest tagged release of ZeroTerm, then installs it:
+  1. downloads the prebuilt package for your OS/architecture when the
+     release has one, or
+  2. falls back to building from source at that tag.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash
+  bash scripts/install.sh upgrade          # (re)install the latest release
+  ZEROTERM_VERSION=v0.3.0 bash scripts/install.sh   # pin a specific tag
+
+Overrides:
+  ZEROTERM_VERSION      release tag to install (default: latest published)
+  ZEROTERM_INSTALL_DIR  install destination (default: ~/.local/bin for
+                        binaries, ~/Applications for the macOS app)
+HELP
             exit 0
             ;;
         *) err "unknown argument: ${mode} (expected 'install' or 'upgrade')" ;;
@@ -313,6 +339,8 @@ main() {
     verify_install "$bin"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# BASH_SOURCE[0] is unset when the script is piped to bash (curl ... | bash);
+# run main in that case or when executed as a file, but not when `source`d.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi

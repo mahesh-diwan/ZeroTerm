@@ -30,7 +30,7 @@ const platforms = [
 ];
 
 const installers = [
-  { id: 'script', label: 'Script', cmd: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh' },
+  { id: 'script', label: 'Script', cmd: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash' },
   { id: 'source', label: 'Source', cmd: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release' },
 ];
 

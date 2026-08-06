@@ -17,7 +17,7 @@ usage; see [CONFIG_REFERENCE.md](CONFIG_REFERENCE.md) for settings and
 ```bash
 # Linux/macOS one-liner (resolves the latest release, downloads a prebuilt
 # binary when available, otherwise builds from source)
-curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash
 
 # From source
 git clone https://github.com/mahesh-diwan/ZeroTerm.git

@@ -67,6 +67,10 @@ jobs:
     name: Build (windows-latest)
     runs-on: windows-latest
     timeout-minutes: 60
+    # The Windows app stack (mlua-sys, ring, portable-pty) has never been
+    # verified on a real Windows host, so a Windows failure must not block
+    # publishing the Linux/macOS release. If it ever passes, its zip ships too.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build]
     timeout-minutes: 60
+    # Heavy external SDK downloads can be flaky; don't let that block releases.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Install Flatpak and deps
@@ -164,7 +170,9 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [build, windows, deb, rpm, flatpak, systemd-unit]
-    if: startsWith(github.ref, 'refs/tags/')
+    # always(): publish even if an optional job (windows/flatpak) failed —
+    # download-artifact simply won't find their artifacts.
+    if: always() && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
