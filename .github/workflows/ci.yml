@@ -46,15 +46,21 @@ jobs:
         run: |
           # Retry the network-heavy fetch (crates.io is occasionally flaky from
           # runners); build offline so later steps never touch the network.
+          # Note: run: steps execute with set -e, so the retry loop must turn
+          # it off or the first failed fetch would abort the whole step.
+          set +e
           for i in 1 2 3; do
-            cargo fetch --locked && break
-            if [ "$i" = "3" ]; then
-              echo "::error::cargo fetch failed after 3 attempts"
-              exit 1
-            fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            cargo fetch --locked
+            status=$?
+            if [ "$status" -eq 0 ]; then break; fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo fetch failed after 3 attempts"
+            exit 1
+          fi
           cargo build --locked --offline --workspace ${{ matrix.cargo_exclude }}
       - name: Test
         run: cargo test --locked --offline --workspace ${{ matrix.cargo_exclude }}

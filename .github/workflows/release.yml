@@ -43,16 +43,21 @@ jobs:
         run: |
           # crates.io downloads on runners can be transiently flaky; retry the
           # network-heavy fetch, then build offline so the build itself never
-          # depends on the network.
+          # depends on the network. (run: steps use set -e, so the loop must
+          # turn it off or the first failed fetch aborts the step.)
+          set +e
           for i in 1 2 3; do
-            cargo fetch --locked && break
-            if [ "$i" = "3" ]; then
-              echo "::error::cargo fetch failed after 3 attempts"
-              exit 1
-            fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            cargo fetch --locked
+            status=$?
+            if [ "$status" -eq 0 ]; then break; fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo fetch failed after 3 attempts"
+            exit 1
+          fi
           cargo build --release --locked --offline -p zeroterm
       - name: Check binary size (50MB gate)
         if: matrix.os == 'ubuntu-latest'
@@ -157,15 +162,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build .deb package
         run: |
+          set +e
           for i in 1 2 3; do
-            cargo fetch --locked && break
-            if [ "$i" = "3" ]; then
-              echo "::error::cargo fetch failed after 3 attempts"
-              exit 1
-            fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            cargo fetch --locked
+            status=$?
+            if [ "$status" -eq 0 ]; then break; fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo fetch failed after 3 attempts"
+            exit 1
+          fi
           cargo build --release --locked --offline
           bash scripts/build-deb.sh
       - name: Upload .deb
@@ -188,15 +197,19 @@ jobs:
           sudo apt-get install -y rpm
       - name: Build .rpm package
         run: |
+          set +e
           for i in 1 2 3; do
-            cargo fetch --locked && break
-            if [ "$i" = "3" ]; then
-              echo "::error::cargo fetch failed after 3 attempts"
-              exit 1
-            fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed; retrying in 10s"
+            cargo fetch --locked
+            status=$?
+            if [ "$status" -eq 0 ]; then break; fi
+            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo fetch failed after 3 attempts"
+            exit 1
+          fi
           cargo build --release --locked --offline
           bash scripts/build-rpm.sh
       - name: Upload .rpm

@@ -1,0 +1,8 @@
+# CI robustness. crates.io downloads from GitHub runners can fail spuriously
+# (notably with HTTP/2 multiplexing); disable multiplexing and allow more
+# download retries so transient failures don't fail the pipeline.
+[http]
+multiplexing = false
+
+[net]
+retry = 5
