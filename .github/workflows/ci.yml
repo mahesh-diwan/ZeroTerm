@@ -16,13 +16,13 @@ jobs:
           - os: macos-latest
             cargo_exclude: ""
           - os: windows-latest
-            # zeroterm-ssh is now Windows-portable (cfg(not(unix)) stub since
+            # zeroterm-ssh is Windows-portable (cfg(not(unix)) stub since
             # 13ea948; ssh2 is cfg(unix)-gated), so it stays in the workspace.
-            # The zeroterm app binary still excludes itself here: main.rs is
-            # cfg(unix)-gated but its native deps (mlua-sys, ring) can't be
-            # verified from a non-Windows host, and the release pipeline must
-            # prove `cargo build -p zeroterm` on a real runner first. Drop this
-            # once the Windows app build is green.
+            # The zeroterm app is excluded here for speed only: the release
+            # pipeline proves `cargo build -p zeroterm` on a real Windows
+            # runner (green since mlua became vendored, 2026-08-07). Keeping
+            # the workspace leg lean avoids re-compiling the app (wgpu/winit)
+            # twice on Windows.
             cargo_exclude: "--exclude zeroterm"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
