@@ -75,11 +75,6 @@ const ATTR_DIM: u32 = 0x10;
 
 const COPY_MARKER: &str = "[copy]";
 
-/// Supported Gaussian kernel sizes (odd). `blur_radius` is quantized to the
-/// nearest one; each entry is the tap count along one axis.
-const BLUR_TAPS: [usize; 5] = [3, 5, 7, 9, 11];
-const MAX_BLUR_TAPS: usize = 16;
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Uniforms {
@@ -88,6 +83,13 @@ struct Uniforms {
     viewport_origin: [f32; 2],
     cols: u32,
     rows: u32,
+    /// 1 when the surface alpha mode is PreMultiplied: the fragment shader
+    /// then premultiplies its output so translucent regions composite
+    /// correctly instead of glowing too bright.
+    premultiply: u32,
+    /// Trailing pad: keeps the byte size at 40 so it matches the WGSL
+    /// uniform struct's layout (align 8 → struct size rounded to 40).
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -96,7 +98,9 @@ struct CellData {
     glyph_uv_min: [f32; 2],
     glyph_uv_max: [f32; 2],
     glyph_size: [f32; 2],
-    _pad0: [f32; 2],
+    /// Top-left of the glyph bitmap inside the cell, in cell pixels
+    /// (placement.left, baseline + placement.top).
+    glyph_offset: [f32; 2],
     fg: [f32; 4],
     bg: [f32; 4],
     attrs: u32,
@@ -107,17 +111,6 @@ struct CellData {
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct QuadVertex {
     position: [f32; 2],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct BlurParams {
-    // header.x = tap count. vec4 (not u32 + pads) keeps the struct 16-aligned
-    // for the uniform address space; kernel entries are vec4 for the same
-    // reason (array element stride must be a multiple of 16).
-    header: [u32; 4],
-    // Each entry: [weight, x_offset_norm, y_offset_norm, unused].
-    kernel: [[f32; 4]; MAX_BLUR_TAPS],
 }
 
 const QUAD_VERTS: [QuadVertex; 6] = [
@@ -147,6 +140,9 @@ struct GlyphInfo {
     y: u32,
     width: u32,
     height: u32,
+    /// Bitmap top-left within its cell, in pixels (raster-space offsets).
+    offset_x: f32,
+    offset_y: f32,
 }
 
 struct GlyphAtlas {
@@ -160,6 +156,9 @@ struct GlyphAtlas {
     cursor_y: u32,
     row_height: u32,
     font_size: f32,
+    /// Baseline position within a cell (ascent, in px) — glyph bitmaps are
+    /// anchored to it via `baseline + placement.top`.
+    baseline: f32,
     cell_width: f32,
     cell_height: f32,
     font_path: Option<String>,
@@ -215,6 +214,7 @@ impl GlyphAtlas {
             cursor_y: 0,
             row_height: 0,
             font_size,
+            baseline: 0.0,
             cell_width: font_size * 0.5,
             cell_height: font_size * 1.2,
         };
@@ -227,6 +227,7 @@ impl GlyphAtlas {
             let descent = metrics.descent * scale;
             let leading = metrics.leading * scale;
             atlas.cell_height = (ascent + descent + leading).ceil();
+            atlas.baseline = ascent;
             let mut scaler = atlas
                 .scale_context
                 .builder(font)
@@ -239,6 +240,16 @@ impl GlyphAtlas {
             {
                 atlas.cell_width = img.placement.width as f32;
             }
+            log::info!(
+                "Cell metrics: {:.2}x{:.2} (ascent {:.2}, descent {:.2}, leading {:.2}, 'W' ink {}x{})",
+                atlas.cell_width,
+                atlas.cell_height,
+                ascent,
+                descent,
+                leading,
+                atlas.cell_width as u32,
+                atlas.cell_height as u32
+            );
         }
 
         // Pre-pack ASCII printable characters
@@ -255,7 +266,9 @@ impl GlyphAtlas {
         }
         let paths = [
             "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
             "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/MesloLGMNerdFontMono-Regular.ttf",
             "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/GeistMonoVF.ttf",
@@ -271,12 +284,13 @@ impl GlyphAtlas {
         Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
     }
 
+    /// (u0, v0, u1, v1, width_px, height_px, offset_x_px, offset_y_px)
     fn get_or_insert_glyph(
         &mut self,
         ch: char,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> (f32, f32, f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
         let key = ch as u32;
         if let Some(info) = self.glyph_cache.get(&key) {
             let uv = self.info_to_uv(info);
@@ -287,6 +301,8 @@ impl GlyphAtlas {
                 uv.3,
                 info.width as f32,
                 info.height as f32,
+                info.offset_x,
+                info.offset_y,
             );
         }
 
@@ -320,6 +336,8 @@ impl GlyphAtlas {
                     uv.3,
                     info.width as f32,
                     info.height as f32,
+                    info.offset_x,
+                    info.offset_y,
                 )
             }
             _ => self.fallback_uv(),
@@ -334,6 +352,11 @@ impl GlyphAtlas {
     ) -> GlyphInfo {
         let w = image.placement.width;
         let h = image.placement.height;
+        // placement.left/top position the bitmap relative to the pen origin
+        // (cell left edge at the baseline, y-down): the ink of a normal glyph
+        // starts a hair left of the cell and its top sits above the baseline.
+        let offset_x = image.placement.left as f32;
+        let offset_y = self.baseline + image.placement.top as f32;
 
         // Advance to next row if needed
         if self.cursor_x + w > ATLAS_SIZE {
@@ -353,6 +376,8 @@ impl GlyphAtlas {
             y: self.cursor_y,
             width: w,
             height: h,
+            offset_x,
+            offset_y,
         };
 
         // Convert alpha mask to RGBA (white RGB, alpha from mask)
@@ -406,16 +431,10 @@ impl GlyphAtlas {
         (self.cell_width, self.cell_height)
     }
 
-    fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32) {
-        // 1x1 transparent pixel — alpha=0, bg shows through
-        (
-            0.0,
-            0.0,
-            1.0 / ATLAS_SIZE as f32,
-            1.0 / ATLAS_SIZE as f32,
-            0.0,
-            0.0,
-        )
+    fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+        // Zero-size glyph: no ink, bg shows through (the coverage test in the
+        // shader rejects everything outside a glyph's bitmap rect).
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     }
 
     fn clear_atlas(&mut self, queue: &wgpu::Queue) {
@@ -461,6 +480,13 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    /// Surface alpha modes for the two states of window.opacity. The surface
+    /// must be reconfigured with a compositor-capable mode when the window is
+    /// translucent (Opaque discards alpha entirely).
+    opaque_alpha_mode: wgpu::CompositeAlphaMode,
+    transparent_alpha_mode: wgpu::CompositeAlphaMode,
+    /// 1 while the surface uses PreMultiplied alpha (see Uniforms.premultiply).
+    premultiply_output: u32,
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     cell_buffer: wgpu::Buffer,
@@ -491,15 +517,6 @@ pub struct Renderer {
     needs_clear: bool,
     clear_color: [f64; 3],
     opacity: f64,
-    blur: bool,
-    blur_radius: f32,
-    offscreen_texture: Option<wgpu::Texture>,
-    offscreen_view: Option<wgpu::TextureView>,
-    blur_bind_group: Option<wgpu::BindGroup>,
-    blur_params_buffer: wgpu::Buffer,
-    blur_pipeline: wgpu::RenderPipeline,
-    blur_bind_group_layout: wgpu::BindGroupLayout,
-    scene_sampler: wgpu::Sampler,
     theme: crate::theme::Theme,
     atlas_bind_group_layout: wgpu::BindGroupLayout,
     image_texture: Option<wgpu::Texture>,
@@ -524,6 +541,10 @@ impl Renderer {
         font_path: Option<String>,
     ) -> Result<Self> {
         let size = window.inner_size();
+        // Rasterize glyphs at the physical (device) pixel size. window.inner_size()
+        // is in physical px, so cells must be too — otherwise text on a scale-2
+        // display renders half the intended size (or gets upscaled into blocks).
+        let font_size = font_size * window.scale_factor().max(0.5) as f32;
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             // Native backend only: enumerating every backend (GL/D3D/Metal)
@@ -602,7 +623,7 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        let alpha_mode = if surface_caps
+        let opaque_alpha_mode = if surface_caps
             .alpha_modes
             .contains(&wgpu::CompositeAlphaMode::Auto)
         {
@@ -615,6 +636,34 @@ impl Renderer {
         } else {
             surface_caps.alpha_modes[0]
         };
+        // An Opaque surface makes the compositor ignore every alpha byte we
+        // write, so window.opacity could never show the desktop through the
+        // terminal. Pick a compositor-capable mode for the translucent case.
+        let transparent_alpha_mode = [
+            wgpu::CompositeAlphaMode::PostMultiplied,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::Auto,
+        ]
+        .iter()
+        .find(|m| surface_caps.alpha_modes.contains(m))
+        .copied()
+        .unwrap_or(opaque_alpha_mode);
+        let alpha_mode = if opacity < 1.0 {
+            transparent_alpha_mode
+        } else {
+            opaque_alpha_mode
+        };
+        if opacity < 1.0 && transparent_alpha_mode == opaque_alpha_mode {
+            log::warn!(
+                "this surface exposes no compositor-capable alpha mode; window.opacity < 1.0 \
+                 will be ignored and the window stays opaque"
+            );
+        }
+        // PreMultiplied surfaces expect the framebuffer's RGB to already be
+        // scaled by alpha; we write straight colors, so the shader must do the
+        // multiplication (Opaque/PostMultiplied never need it: a=1 or the
+        // compositor multiplies).
+        let premultiply_output = u32::from(alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied);
 
         let present_mode = if surface_caps
             .present_modes
@@ -651,6 +700,13 @@ impl Renderer {
 
         // Create glyph atlas first to get actual cell metrics from font
         let glyph_atlas = GlyphAtlas::new(&device, &queue, font_size, font_path)?;
+        log::info!(
+            "Alpha mode: {:?} (opaque surface: {:?}, translucent surface: {:?}), glyph raster {:.1}px",
+            alpha_mode,
+            opaque_alpha_mode,
+            transparent_alpha_mode,
+            font_size
+        );
         let (cell_width, cell_height) = glyph_atlas.cell_metrics();
 
         // Uniform buffer
@@ -662,6 +718,8 @@ impl Renderer {
             viewport_origin: [0.0, 0.0],
             cols,
             rows,
+            premultiply: premultiply_output,
+            _pad: 0,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
@@ -891,98 +949,6 @@ impl Renderer {
             cell_buffer_capacity
         );
 
-        // Blur composite pipeline: full-screen triangle post-process that blurs
-        // the offscreen scene texture onto the surface. Created unconditionally
-        // (cheap); the offscreen target itself is only allocated when the blur
-        // path is actually requested.
-        let blur_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Blur Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Blur Pipeline Layout"),
-            bind_group_layouts: &[&blur_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let blur_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Blur Params Buffer"),
-            contents: bytemuck::cast_slice(&[BlurParams {
-                header: [BLUR_TAPS[0] as u32, 0, 0, 0],
-                kernel: [[0.0; 4]; MAX_BLUR_TAPS],
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let scene_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Blur Scene Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blur Composite Pipeline"),
-            layout: Some(&blur_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_blur"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_blur"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: pipeline_cache.as_ref().map(|(cache, _)| cache),
-        });
-
         let tab_bar_buffer = {
             let cells = vec![CellData::zeroed(); cols as usize];
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1086,6 +1052,9 @@ impl Renderer {
             device,
             queue,
             config,
+            opaque_alpha_mode,
+            transparent_alpha_mode,
+            premultiply_output,
             size,
             render_pipeline,
             cell_buffer,
@@ -1117,15 +1086,6 @@ impl Renderer {
             needs_clear: false,
             clear_color: [0.102, 0.106, 0.149],
             opacity,
-            blur: false,
-            blur_radius: 8.0,
-            offscreen_texture: None,
-            offscreen_view: None,
-            blur_bind_group: None,
-            blur_params_buffer,
-            blur_pipeline,
-            blur_bind_group_layout,
-            scene_sampler,
             theme: crate::theme::Theme::tokyo_night(),
             image_texture: Some(placeholder_tex),
             image_view: Some(placeholder_view),
@@ -1279,10 +1239,11 @@ impl Renderer {
             viewport_origin: [0.0, 0.0],
             cols: new_cols as u32,
             rows: new_rows as u32,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-        self.recreate_offscreen();
     }
 
     /// Offset added to every cell position in the shader (pixels).
@@ -1344,9 +1305,11 @@ impl Renderer {
             glyph_uv_min: [0.0, 0.0],
             glyph_uv_max: [0.0, 0.0],
             glyph_size: [0.0, 0.0],
-            _pad0: [0.0, 0.0],
+            glyph_offset: [0.0, 0.0],
             fg: color,
-            bg: color,
+            // Translucent when window.opacity < 1.0 so the desktop (or whatever
+            // the compositor puts behind the window) shows through.
+            bg: [color[0], color[1], color[2], self.opacity as f32],
             attrs: 0,
             _pad1: [0; 3],
         };
@@ -1359,6 +1322,8 @@ impl Renderer {
             viewport_origin: [0.0, 0.0],
             cols: 1,
             rows: 1,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue.write_buffer(
             &self.tab_bar_uniform_buffer,
@@ -1366,11 +1331,7 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = if self.blur_active() {
-            self.offscreen_view.as_ref()
-        } else {
-            self.current_view.as_ref()
-        };
+        let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
@@ -1453,15 +1414,13 @@ impl Renderer {
             ],
             cols: cols as u32,
             rows: visible_rows as u32,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let view = if self.blur_active() {
-            self.offscreen_view.as_ref()
-        } else {
-            self.current_view.as_ref()
-        };
+        let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
@@ -1505,8 +1464,6 @@ impl Renderer {
     }
 
     pub fn end_frame(&mut self) -> Result<()> {
-        // Blur composite must join the frame's encoder before it is submitted.
-        self.run_blur_composite();
         if let Some(encoder) = self.current_encoder.take() {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -1583,6 +1540,7 @@ impl Renderer {
             cell.glyph_uv_min = [space.0, space.1];
             cell.glyph_uv_max = [space.2, space.3];
             cell.glyph_size = [space.4, space.5];
+            cell.glyph_offset = [space.6, space.7];
         }
 
         let mut col = 1usize;
@@ -1613,23 +1571,25 @@ impl Renderer {
                 if c >= cols {
                     break;
                 }
-                let (u0, v0, u1, v1, gw, gh) =
+                let (u0, v0, u1, v1, gw, gh, ox, oy) =
                     self.glyph_atlas
                         .get_or_insert_glyph(ch, &self.device, &self.queue);
                 batch[c].glyph_uv_min = [u0, v0];
                 batch[c].glyph_uv_max = [u1, v1];
                 batch[c].glyph_size = [gw, gh];
+                batch[c].glyph_offset = [ox, oy];
             }
             // Close button occupies the right padding cell; only drawn while hovered.
             if tab.hovered {
                 let close_c = col + span - 1;
                 if close_c < cols {
-                    let (u0, v0, u1, v1, gw, gh) =
+                    let (u0, v0, u1, v1, gw, gh, ox, oy) =
                         self.glyph_atlas
                             .get_or_insert_glyph('×', &self.device, &self.queue);
                     batch[close_c].glyph_uv_min = [u0, v0];
                     batch[close_c].glyph_uv_max = [u1, v1];
                     batch[close_c].glyph_size = [gw, gh];
+                    batch[close_c].glyph_offset = [ox, oy];
                     batch[close_c].fg = if tab.close_hovered {
                         close_red
                     } else {
@@ -1649,6 +1609,8 @@ impl Renderer {
             viewport_origin: [0.0, 0.0],
             cols: cols as u32,
             rows: 1,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue.write_buffer(
             &self.tab_bar_uniform_buffer,
@@ -1656,11 +1618,7 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = if self.blur_active() {
-            self.offscreen_view.as_ref()
-        } else {
-            self.current_view.as_ref()
-        };
+        let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
@@ -1725,6 +1683,7 @@ impl Renderer {
             cell.glyph_uv_min = [space.0, space.1];
             cell.glyph_uv_max = [space.2, space.3];
             cell.glyph_size = [space.4, space.5];
+            cell.glyph_offset = [space.6, space.7];
         }
 
         let title = truncate_title(left, cols.saturating_sub(2));
@@ -1733,21 +1692,23 @@ impl Renderer {
             if c >= cols {
                 break;
             }
-            let (u0, v0, u1, v1, gw, gh) =
+            let (u0, v0, u1, v1, gw, gh, ox, oy) =
                 self.glyph_atlas
                     .get_or_insert_glyph(ch, &self.device, &self.queue);
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
             batch[c].glyph_size = [gw, gh];
+            batch[c].glyph_offset = [ox, oy];
         }
         let mut c = cols.saturating_sub(1);
         for ch in right.chars().rev() {
-            let (u0, v0, u1, v1, gw, gh) =
+            let (u0, v0, u1, v1, gw, gh, ox, oy) =
                 self.glyph_atlas
                     .get_or_insert_glyph(ch, &self.device, &self.queue);
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
             batch[c].glyph_size = [gw, gh];
+            batch[c].glyph_offset = [ox, oy];
             if c == 0 {
                 break;
             }
@@ -1762,6 +1723,8 @@ impl Renderer {
             viewport_origin: [0.0, self.size.height as f32 - self.cell_height],
             cols: cols as u32,
             rows: 1,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue.write_buffer(
             &self.status_bar_uniform_buffer,
@@ -1769,11 +1732,7 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = if self.blur_active() {
-            self.offscreen_view.as_ref()
-        } else {
-            self.current_view.as_ref()
-        };
+        let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
@@ -1875,6 +1834,8 @@ impl Renderer {
             viewport_origin: [bar_x, bar_y],
             cols: 2,
             rows: rows as u32,
+            premultiply: self.premultiply_output,
+            _pad: 0,
         };
         self.queue.write_buffer(
             &self.scrollbar_uniform_buffer,
@@ -1882,11 +1843,7 @@ impl Renderer {
             bytemuck::cast_slice(&[uniforms]),
         );
 
-        let view = if self.blur_active() {
-            self.offscreen_view.as_ref()
-        } else {
-            self.current_view.as_ref()
-        };
+        let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
@@ -2045,7 +2002,11 @@ impl Renderer {
                 bg.r as f32 / 255.0,
                 bg.g as f32 / 255.0,
                 bg.b as f32 / 255.0,
-                1.0,
+                // Background carries the window opacity: the shader mixes
+                // glyph alpha between bg (a=opacity) and fg (a=1), so text
+                // stays opaque while the terminal background shows the
+                // desktop through at (1-opacity).
+                self.opacity as f32,
             ];
 
             let mut ch = cell.ch;
@@ -2074,7 +2035,7 @@ impl Renderer {
                 }
             }
 
-            let (u0, v0, u1, v1, gw, gh) =
+            let (u0, v0, u1, v1, gw, gh, ox, oy) =
                 self.glyph_atlas
                     .get_or_insert_glyph(ch, &self.device, &self.queue);
 
@@ -2082,7 +2043,7 @@ impl Renderer {
                 glyph_uv_min: [u0, v0],
                 glyph_uv_max: [u1, v1],
                 glyph_size: [gw, gh],
-                _pad0: [0.0, 0.0],
+                glyph_offset: [ox, oy],
                 fg: fg_color,
                 bg: bg_color,
                 attrs,
@@ -2104,8 +2065,21 @@ impl Renderer {
             self.theme.bg.b as f64 / 255.0,
         );
         self.clear_color = [r, g, b];
-        self.opacity = config.window.opacity;
-        self.set_blur(config.window.blur, config.window.blur_radius);
+        // Go through set_opacity (not a field write): crossing the 1.0 boundary
+        // must reconfigure the surface alpha mode, or window.opacity < 1.0
+        // keeps rendering on an Opaque surface and never shows the desktop.
+        self.set_opacity(config.window.opacity);
+        if config.window.blur {
+            static BLUR_NOTE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !BLUR_NOTE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "background blur is a compositor-side feature (KDE 'Blur' effect, Hyprland \
+                     'windowrule=blur,class:.*'); ZeroTerm renders a transparent window and \
+                     lets the compositor blur whatever is actually behind it"
+                );
+            }
+        }
         self.set_cursor_blink(config.cursor.blink, config.cursor.blink_interval_ms);
     }
 
@@ -2129,142 +2103,20 @@ impl Renderer {
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {
+        let prev = self.opacity;
         self.opacity = opacity;
-        self.recreate_offscreen();
-    }
-
-    /// Enable/disable the blur composite path and its kernel radius (px).
-    /// The path only activates when blur, radius, AND opacity<1.0 all hold.
-    pub fn set_blur(&mut self, blur: bool, radius: f64) {
-        self.blur = blur;
-        self.blur_radius = radius.clamp(0.0, 32.0) as f32;
-        self.recreate_offscreen();
-    }
-
-    fn blur_requested(&self) -> bool {
-        blur_path_requested(self.blur, self.opacity, self.blur_radius)
-    }
-
-    fn blur_active(&self) -> bool {
-        self.blur_requested() && self.offscreen_view.is_some()
-    }
-
-    /// (Re)allocate the offscreen scene texture + its blur bind group when the
-    /// blur path is requested, or drop them when it is not. Resource creation
-    /// in wgpu is infallible, but the Option fields + `blur_active` guard keep
-    /// the composite step defensive: any missing resource degrades to the
-    /// non-blur fast path instead of panicking.
-    fn recreate_offscreen(&mut self) {
-        if !self.blur_requested() {
-            self.offscreen_texture = None;
-            self.offscreen_view = None;
-            self.blur_bind_group = None;
-            return;
+        // Crossing the fully-opaque boundary requires reconfiguring the
+        // surface: an Opaque alpha mode silently drops alpha bytes.
+        if (prev < 1.0) != (opacity < 1.0) {
+            self.config.alpha_mode = if opacity < 1.0 {
+                self.transparent_alpha_mode
+            } else {
+                self.opaque_alpha_mode
+            };
+            self.premultiply_output =
+                u32::from(self.config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied);
+            self.surface.configure(&self.device, &self.config);
         }
-        let width = self.size.width.max(1);
-        let height = self.size.height.max(1);
-        let same_size = self
-            .offscreen_texture
-            .as_ref()
-            .is_some_and(|t| t.width() == width && t.height() == height);
-        if same_size {
-            return;
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Blur Offscreen Texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Blur Scene Bind Group"),
-            layout: &self.blur_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(
-                        self.blur_params_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.scene_sampler),
-                },
-            ],
-        });
-        log::debug!("Blur offscreen target created: {}x{}", width, height);
-        self.offscreen_texture = Some(texture);
-        self.offscreen_view = Some(view);
-        self.blur_bind_group = Some(bind_group);
-    }
-
-    /// Blur the offscreen scene onto the surface. Runs at the start of
-    /// `end_frame` so it shares the frame's encoder; a no-op unless the blur
-    /// path is active.
-    fn run_blur_composite(&mut self) {
-        if !self.blur_active() {
-            return;
-        }
-        let (Some(encoder), Some(surface_view), Some(bind_group)) = (
-            self.current_encoder.as_mut(),
-            self.current_view.as_ref(),
-            self.blur_bind_group.as_ref(),
-        ) else {
-            log::warn!("Blur requested but composite resources unavailable; skipping blur");
-            return;
-        };
-        let width = self.size.width.max(1) as f32;
-        let height = self.size.height.max(1) as f32;
-        let taps = blur_taps(self.blur_radius);
-        let weights = blur_weights(taps);
-        let center = ((taps - 1) / 2) as i32;
-        let mut params = BlurParams {
-            header: [taps as u32, 0, 0, 0],
-            kernel: [[0.0; 4]; MAX_BLUR_TAPS],
-        };
-        for (i, &w) in weights.iter().enumerate() {
-            let offset = (i as i32 - center) as f32;
-            params.kernel[i] = [w, offset / width, offset / height, 0.0];
-        }
-        self.queue
-            .write_buffer(&self.blur_params_buffer, 0, bytemuck::cast_slice(&[params]));
-
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Blur Composite Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: surface_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: self.clear_color[0],
-                        g: self.clear_color[1],
-                        b: self.clear_color[2],
-                        a: self.opacity,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render_pass.set_pipeline(&self.blur_pipeline);
-        render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
-        log::debug!("Blur composite applied: {}x{} taps", taps, taps);
     }
 
     fn update_image_from_screen(&mut self, screen: &CoreScreen) {
@@ -2465,42 +2317,7 @@ fn latest_new_image(
     }
 }
 
-/// Whether the blur composite path should be requested at all: it is only
-/// meaningful when blur is enabled, the radius is positive, AND the window is
-/// actually translucent — blurring an opaque scene is pure cost.
-fn blur_path_requested(blur: bool, opacity: f64, radius: f32) -> bool {
-    blur && opacity < 1.0 && radius > 0.0
-}
 
-/// Quantize a blur radius (px) to the nearest supported kernel tap count.
-/// Rounding is half-up so the default radius (8.0) lands on the 9-tap kernel.
-fn blur_taps(radius: f32) -> usize {
-    let nearest = (2.0 * ((radius - 1.0) / 2.0).round() + 1.0).clamp(3.0, 11.0) as usize;
-    BLUR_TAPS
-        .iter()
-        .copied()
-        .find(|&t| t == nearest)
-        .expect("quantized tap count is always one of the supported kernels")
-}
-
-/// 1D Gaussian weights for `taps` taps, normalized to sum to 1. `taps` must be
-/// odd and in `BLUR_TAPS`. The shader outer-products this with itself for the
-/// 2D kernel.
-fn blur_weights(taps: usize) -> Vec<f32> {
-    let sigma = (taps as f32) / 4.0;
-    let center = ((taps - 1) / 2) as i32;
-    let mut weights: Vec<f32> = (0..taps as i32)
-        .map(|i| {
-            let d = (i - center) as f32;
-            (-d * d / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let sum: f32 = weights.iter().sum();
-    for w in &mut weights {
-        *w /= sum;
-    }
-    weights
-}
 
 #[cfg(test)]
 mod tests {
@@ -2549,58 +2366,5 @@ mod tests {
         assert_eq!(tab_span(&"x".repeat(30), 20), 23);
         // Empty title: 2 padding cells only.
         assert_eq!(tab_span("", 20), 2);
-    }
-
-    #[test]
-    fn blur_taps_quantizes_to_supported_kernel() {
-        assert_eq!(blur_taps(0.0), 3);
-        assert_eq!(blur_taps(2.0), 3);
-        assert_eq!(blur_taps(4.9), 5);
-        assert_eq!(blur_taps(6.1), 7);
-        assert_eq!(blur_taps(8.0), 9); // default radius -> 9-tap kernel
-        assert_eq!(blur_taps(10.1), 11);
-        assert_eq!(blur_taps(100.0), 11); // clamped
-        for &t in &BLUR_TAPS {
-            assert_eq!(blur_taps(t as f32), t); // exact radii stay put
-        }
-    }
-
-    #[test]
-    fn blur_weights_are_positive_symmetric_and_normalized() {
-        for &taps in &BLUR_TAPS {
-            let w = blur_weights(taps);
-            assert_eq!(w.len(), taps);
-            let sum: f32 = w.iter().sum();
-            assert!(
-                (sum - 1.0).abs() < 1e-5,
-                "weights must sum to 1 (taps={}, sum={})",
-                taps,
-                sum
-            );
-            let center = (taps - 1) / 2;
-            for i in 0..taps {
-                assert!(w[i] > 0.0, "weight {} must be positive", i);
-                assert!(
-                    (w[i] - w[taps - 1 - i]).abs() < 1e-6,
-                    "weights must be symmetric at tap {}",
-                    i
-                );
-            }
-            assert!(
-                w[center] >= w[center - 1] && w[center] >= w[center + 1],
-                "center tap must be the peak"
-            );
-        }
-    }
-
-    #[test]
-    fn blur_path_is_gated_on_flag_opacity_and_radius() {
-        assert!(blur_path_requested(true, 0.5, 8.0));
-        assert!(!blur_path_requested(false, 0.5, 8.0));
-        assert!(!blur_path_requested(true, 1.0, 8.0));
-        assert!(!blur_path_requested(true, 0.5, 0.0));
-        assert!(!blur_path_requested(true, 1.0, 0.0));
-        // Default config (blur=false, opacity=1.0) must never take the path.
-        assert!(!blur_path_requested(false, 1.0, 8.0));
     }
 }

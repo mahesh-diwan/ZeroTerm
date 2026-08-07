@@ -233,7 +233,11 @@ impl App {
                 config.window.width,
                 config.window.height,
             ))
-            .with_resizable(true);
+            .with_resizable(true)
+            // ARGB visual (X11) / alpha-capable surface (Wayland): required for
+            // window.opacity < 1.0 to actually show the desktop through the
+            // terminal instead of a black void.
+            .with_transparent(true);
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         zt("window created");
@@ -253,7 +257,14 @@ impl App {
         let font_path = config.font.path.clone();
         std::thread::spawn(move || {
             zt("renderer thread start");
-            match pollster::block_on(Renderer::new(window_clone, font_size, opacity, font_path)) {
+            // scale_factor is read on the background thread (window is Arc)
+            // so glyphs rasterize at physical px on HiDPI displays too.
+            match pollster::block_on(Renderer::new(
+                window_clone.clone(),
+                font_size,
+                opacity,
+                font_path,
+            )) {
                 Ok(renderer) => {
                     let _ = render_tx.send(renderer);
                 }
@@ -265,9 +276,12 @@ impl App {
 
         let size = window.inner_size();
         // Estimate cells until the renderer is ready; check_renderer_ready()
-        // resizes the parser + PTY to the measured glyph metrics.
-        let cols = (((size.width as f32) / 8.4).max(20.0)) as usize;
-        let rows = (((size.height as f32) / 15.0).max(10.0)) as usize;
+        // resizes the parser + PTY to the measured glyph metrics. The rough
+        // 8.4x15px cells scale with the device pixel ratio so the pre-renderer
+        // PTY size is in the right ballpark on HiDPI displays.
+        let dpr = window.scale_factor().max(1.0) as f32;
+        let cols = (((size.width as f32) / (8.4 * dpr)).max(20.0)) as usize;
+        let rows = (((size.height as f32) / (15.0 * dpr)).max(10.0)) as usize;
 
         let shell = config.shell.program.clone();
         let shell_args = config.shell.args.clone();

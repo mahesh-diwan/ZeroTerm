@@ -4,6 +4,9 @@ struct Uniforms {
     viewport_origin: vec2<f32>,
     cols: u32,
     rows: u32,
+    // 1 when the surface alpha mode is PreMultiplied: premultiply output RGB
+    // by alpha so translucent pixels composite correctly (no glow).
+    premultiply: u32,
 }
 
 @group(0) @binding(0)
@@ -24,7 +27,9 @@ struct CellData {
     glyph_uv_min: vec2<f32>,
     glyph_uv_max: vec2<f32>,
     glyph_size: vec2<f32>,
-    _pad0: vec2<f32>,
+    // Top-left of the glyph bitmap inside the cell, in cell pixels
+    // (placement.left, baseline + placement.top).
+    glyph_offset: vec2<f32>,
     fg: vec4<f32>,
     bg: vec4<f32>,
     attrs: u32,
@@ -39,9 +44,22 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) color: vec4<f32>,
     @location(1) bg_color: vec4<f32>,
-    @location(2) tex_coord: vec2<f32>,
-    @location(3) cell_size: vec2<f32>,
+    @location(2) glyph_uv_min: vec2<f32>,
+    // Local position within the cell quad (0..1); the cell is drawn
+    // inflated by half a device pixel, so this spans cell +/- 0.5px.
+    @location(3) cell_local: vec2<f32>,
     @location(4) attrs: u32,
+    @location(5) glyph_uv_per_px: vec2<f32>,
+    @location(6) glyph_size: vec2<f32>,
+    @location(7) glyph_offset: vec2<f32>,
+}
+
+// uv delta per bitmap pixel, guarding against a zero-sized glyph.
+fn safe_uv_per_px(delta: vec2<f32>, size: vec2<f32>) -> vec2<f32> {
+    var r = vec2<f32>(0.0);
+    if size.x != 0.0 { r.x = delta.x / size.x; }
+    if size.y != 0.0 { r.y = delta.y / size.y; }
+    return r;
 }
 
 @vertex
@@ -67,8 +85,11 @@ fn vs_main(input: VertexInput, @builtin(instance_index) ii: u32) -> VertexOutput
     output.clip_position = vec4<f32>(clip_xy, 0.0, 1.0);
     output.color = data.fg;
     output.bg_color = data.bg;
-    output.tex_coord = mix(data.glyph_uv_min, data.glyph_uv_max, clamp(local, vec2<f32>(0.0), vec2<f32>(1.0)));
-    output.cell_size = local;
+    output.glyph_uv_min = data.glyph_uv_min;
+    output.glyph_uv_per_px = safe_uv_per_px(data.glyph_uv_max - data.glyph_uv_min, data.glyph_size);
+    output.glyph_size = data.glyph_size;
+    output.glyph_offset = data.glyph_offset;
+    output.cell_local = local;
     output.attrs = data.attrs;
     return output;
 }
@@ -80,70 +101,10 @@ fn srgb_to_linear(c: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(select(high, low, cond), c.a);
 }
 
-// --- Blur / transparency composite (optional post-process path) ---
-// Only used when window.blur=true AND window.opacity<1.0. The scene is
-// rendered into an offscreen texture; this pass blurs it and blits to the
-// surface. Blurring what is BEHIND the window is a compositor feature, not
-// something a wgpu renderer can do portably — this blurs the terminal's own
-// framebuffer and preserves its alpha so a compositor that honors surface
-// alpha can show the desktop through the translucent background.
-
-struct BlurParams {
-    header: vec4<u32>,
-    kernel: array<vec4<f32>, 16>,
-}
-
-@group(0) @binding(0)
-var<uniform> blur_params: BlurParams;
-
-@group(0) @binding(1)
-var scene_texture: texture_2d<f32>;
-
-@group(0) @binding(2)
-var scene_sampler: sampler;
-
-struct BlurVertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-}
-
-// Full-screen triangle from vertex_index; no vertex buffer needed.
-@vertex
-fn vs_blur(@builtin(vertex_index) vi: u32) -> BlurVertexOutput {
-    var out: BlurVertexOutput;
-    if vi == 0u {
-        out.clip_position = vec4<f32>(-1.0, -1.0, 0.0, 1.0);
-    } else if vi == 1u {
-        out.clip_position = vec4<f32>(3.0, -1.0, 0.0, 1.0);
-    } else {
-        out.clip_position = vec4<f32>(-1.0, 3.0, 0.0, 1.0);
-    }
-    // Texture origin is top-left (v=0 at top) while NDC +y is up: flip v.
-    out.uv = vec2<f32>((out.clip_position.x + 1.0) * 0.5, (1.0 - out.clip_position.y) * 0.5);
-    return out;
-}
-
-// Single-pass separable Gaussian: taps x taps samples, outer-product weights.
-// Each kernel vec4 packs (weight, x_off_norm, y_off_norm, unused); x uses the
-// i-th row offset, y the j-th column offset.
-// ponytail: kernel size quantized to {3,5,7,9,11}; no ping-pong passes, no
-// mipmap pyramid, no compute shader. Upgrade to two-pass separable only if
-// the 11-tap (121 samples) case ever shows up in a profiler.
-@fragment
-fn fs_blur(input: BlurVertexOutput) -> @location(0) vec4<f32> {
-    var color = vec3<f32>(0.0);
-    var alpha = 0.0f;
-    for (var i = 0u; i < blur_params.header.x; i = i + 1u) {
-        for (var j = 0u; j < blur_params.header.x; j = j + 1u) {
-            let w = blur_params.kernel[i].x * blur_params.kernel[j].x;
-            let uv = input.uv + vec2<f32>(blur_params.kernel[i].y, blur_params.kernel[j].z);
-            let c = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0);
-            color += c.rgb * w;
-            alpha += c.a * w;
-        }
-    }
-    return vec4<f32>(color, alpha);
-}
+// NOTE: real background blur (the desktop behind the window) is a compositor
+// feature (KDE 'Blur', Hyprland 'windowrule=blur') and can't be done from a
+// wgpu renderer. The old self-blur composite was removed; window.opacity < 1.0
+// renders straight to a translucent surface and the compositor blurs behind it.
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
@@ -178,26 +139,37 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         bg = mix(bg, vec4<f32>(1.0, 1.0, 1.0, 1.0), 0.07);
     }
 
-    let glyph_alpha = textureSample(atlas_texture, atlas_sampler, input.tex_coord).a;
+    // Glyphs are rasterized at their natural size (no stretching to the cell,
+    // which used to make narrow glyphs like 'i' and '.' fat and blocky). The
+    // bitmap rect sits at `glyph_offset` within the cell; pixels outside it
+    // contribute zero alpha so the background (and window transparency) shows.
+    let cell_px = input.cell_local * uniforms.cell_size;
+    let glyph_px = cell_px - input.glyph_offset;
+    var glyph_alpha = 0.0;
+    if (glyph_px.x >= 0.0 && glyph_px.y >= 0.0
+        && glyph_px.x < input.glyph_size.x && glyph_px.y < input.glyph_size.y) {
+        let uv = input.glyph_uv_min + glyph_px * input.glyph_uv_per_px;
+        glyph_alpha = textureSample(atlas_texture, atlas_sampler, uv).a;
+    }
 
     color = mix(color, fg, glyph_alpha);
 
     if (input.attrs & 0x4u) != 0u {
-        let local_y = input.cell_size.y;
+        let local_y = input.cell_local.y;
         if local_y >= 0.85 && local_y <= 0.90 {
             color = fg;
         }
     }
 
     if (input.attrs & 0x8u) != 0u {
-        let local_y = input.cell_size.y;
+        let local_y = input.cell_local.y;
         if local_y >= 0.48 && local_y <= 0.52 {
             color = fg;
         }
     }
 
     if (input.attrs & 0x100u) != 0u {
-        let local_x = input.cell_size.x;
+        let local_x = input.cell_local.x;
         if local_x >= 0.0 && local_x <= 0.15 {
             color = fg;
         }
@@ -208,11 +180,14 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if (input.attrs & 0x400u) != 0u {
-        let img_sample = textureSample(image_texture, atlas_sampler, input.cell_size);
+        let img_sample = textureSample(image_texture, atlas_sampler, input.cell_local);
         if img_sample.a > 0.0 {
             color = img_sample;
         }
     }
 
+    if uniforms.premultiply != 0u {
+        return vec4<f32>(color.rgb * color.a, color.a);
+    }
     return color;
 }
