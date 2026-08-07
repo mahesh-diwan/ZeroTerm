@@ -809,9 +809,9 @@ fn large_osc_apc_and_sixel_payloads_no_panic() {
 fn giant_payload_chunked_across_parse_calls() {
     let mut input = Vec::with_capacity(3 << 20);
     input.extend_from_slice(b"\x1b[38;2;1;2;3m");
-    input.extend(std::iter::repeat(b'x').take(1 << 20));
+    input.extend(std::iter::repeat_n(b'x', 1 << 20));
     input.extend_from_slice(b"\x1b]1337;File=name=A;size=2048;inline=1:");
-    input.extend(std::iter::repeat(b'Q').take(1 << 20));
+    input.extend(std::iter::repeat_n(b'Q', 1 << 20));
     input.extend_from_slice(b"\x07hello");
     // Stream in tiny 31-byte chunks so every escape is split mid-sequence
     let mut p = Parser::new(80, 24);
@@ -834,7 +834,7 @@ fn huge_csi_param_and_intermediate_sequences() {
 
     // Long intermediate run before the final byte
     let mut inter = Vec::from(b"\x1b[");
-    inter.extend(std::iter::repeat(b' ').take(1 << 16));
+    inter.extend(std::iter::repeat_n(b' ', 1 << 16));
     inter.push(b'A');
     parse_and_check(&inter);
 }

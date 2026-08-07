@@ -13,7 +13,7 @@ REM Used only to print a cross-compile hint; packaging works either way.
 set "HAVE_UNAME=0"
 where uname >nul 2>nul && set "HAVE_UNAME=1"
 if "%HAVE_UNAME%"=="1" (
-  echo [INFO] Detected unix-like shell (Git Bash/MSYS).
+  echo [INFO] Detected unix-like shell ^(Git Bash/MSYS^).
 )
 
 where cargo >nul 2>nul || (

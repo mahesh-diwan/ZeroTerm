@@ -20,7 +20,7 @@ const platforms = [
     install: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash',
     alt: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release',
     pkg: 'not on Homebrew yet — build from source',
-    assets: ['zeroterm-v0.3.0-macos-arm64.zip', 'zeroterm-v0.3.0-macos-x86_64.zip'],
+    assets: ['zeroterm-v0.3.0-macos-arm64.zip'],
   },
   {
     name: 'Windows',
