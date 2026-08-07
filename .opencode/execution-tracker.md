@@ -92,6 +92,8 @@ Target: `crates/zeroterm/src/app/{mod,session,chrome,input,extensions}.rs` (note
 
 - [~] Cold <200ms / warm <50ms / RSS <50MB — MEASURED FAIL, HONESTLY DOCUMENTED. Release bench: cold 217-327ms (run-to-run jitter), warm 218ms, RSS 63.7MB. Root cause (ZTIME profile): 100% of cold-start is Renderer::new = request_adapter (107-182ms Vulkan init) + request_device + first shader/pipeline compile + glyph atlas — a hard GPU/driver floor. 50MB RSS = wgpu/Vulkan baseline; 50ms warm = unattainable with GPU re-init. Two honest wins applied: `wgpu::Backends::PRIMARY` (enumerating all backends cost ~170ms probe; now 107ms) and removed the full 4MB atlas clear from GlyphAtlas::new (29.8→0.9ms). DECIDED NOT to add pre-parse/deferred-init complexity for demo numbers. All temp ZTIME instrumentation stripped; tree green (240 tests/clippy/fmt). Revisit only if a real user reports slow startup.
 
+- [~] Re-measure 2026-08-07 (bench-v10.sh, 3 runs on the shipped release binary): median cold 276 ms / warm 271 ms / RSS 64.8 MB — within the documented jitter band (cold 217-327 ms), no regression. One 491 ms outlier run coincided with the machine running CI rebuilds; cold-start cost remains Renderer::new (Vulkan adapter probe ~100-180 ms) + first pipeline compile, a hard driver floor. Conclusion unchanged: gates aspirational; 50 ms warm start is unattainable with GPU re-init.
+
 ## Execution order chosen
 
 1. Track D1 themes — DONE

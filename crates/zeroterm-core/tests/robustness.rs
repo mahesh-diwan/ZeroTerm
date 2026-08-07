@@ -772,3 +772,69 @@ fn iterm1337_animated_gif_places_frames() {
     let stored = reg.get(&imgs[0].id).unwrap();
     assert_eq!(stored.frames.len(), 2, "registry stores all frames");
 }
+
+#[test]
+fn large_osc_apc_and_sixel_payloads_no_panic() {
+    // 1 MiB OSC title (far past any practical title, still under limits)
+    let mut osc = Vec::with_capacity(1 << 20);
+    osc.extend_from_slice(b"\x1b]0;");
+    osc.resize(osc.len() + (1 << 20), b'a');
+    osc.push(0x07);
+    parse_and_check(&osc);
+
+    // 2 MiB APC payload (under MAX_APC_BUFFER = 4 MiB)
+    let mut apc = Vec::with_capacity(2 << 20);
+    apc.extend_from_slice(b"\x1b_Gf=1,f=100,a=T;");
+    apc.resize(apc.len() + (2 << 20), b'Q');
+    apc.extend_from_slice(b"\x1b\\");
+    parse_and_check(&apc);
+
+    // 2 MiB of sixel raster data
+    let mut sixel = Vec::with_capacity(2 << 20);
+    sixel.extend_from_slice(b"\x1bPq");
+    sixel.resize(sixel.len() + (2 << 20), b'#');
+    sixel.extend_from_slice(b"\x1b\\");
+    parse_and_check(&sixel);
+
+    // Huge declared size on an iTerm2 inline image must not blow up
+    let seq = format!(
+        "\x1b]1337;File=name=x;size={};inline=1:{}\x07",
+        10_000_000,
+        b64(&[0x89, 0x50, 0x4E, 0x47])
+    );
+    parse_and_check(seq.as_bytes());
+}
+
+#[test]
+fn giant_payload_chunked_across_parse_calls() {
+    let mut input = Vec::with_capacity(3 << 20);
+    input.extend_from_slice(b"\x1b[38;2;1;2;3m");
+    input.extend(std::iter::repeat(b'x').take(1 << 20));
+    input.extend_from_slice(b"\x1b]1337;File=name=A;size=2048;inline=1:");
+    input.extend(std::iter::repeat(b'Q').take(1 << 20));
+    input.extend_from_slice(b"\x07hello");
+    // Stream in tiny 31-byte chunks so every escape is split mid-sequence
+    let mut p = Parser::new(80, 24);
+    for chunk in input.chunks(31) {
+        p.parse(chunk);
+        assert_screen_ok(&p);
+    }
+    assert_screen_ok(&p);
+}
+
+#[test]
+fn huge_csi_param_and_intermediate_sequences() {
+    // 100k semicolon-separated parameters
+    let mut csi = Vec::from(b"\x1b[1");
+    for _ in 0..100_000 {
+        csi.extend_from_slice(b";2");
+    }
+    csi.push(b'm');
+    parse_and_check(&csi);
+
+    // Long intermediate run before the final byte
+    let mut inter = Vec::from(b"\x1b[");
+    inter.extend(std::iter::repeat(b' ').take(1 << 16));
+    inter.push(b'A');
+    parse_and_check(&inter);
+}

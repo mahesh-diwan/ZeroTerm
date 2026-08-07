@@ -246,7 +246,7 @@ build_from_source() {
     tar -xzf "${src}/src.tar.gz" -C "$src" --strip-components=1
     log "building the release binary (this may take a few minutes) ..."
     if ! (cd "$src" && cargo build --release -p zeroterm); then
-        err "source build failed. ZeroTerm links against Lua 5.4 (via mlua) and the wgpu system libraries; on Debian/Ubuntu install: sudo apt install liblua5.4-dev libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config (macOS: brew install lua cmake pkg-config)"
+        err "source build failed. ZeroTerm needs the wgpu system libraries (Lua 5.4 is bundled via mlua's vendored build, no system Lua required). On Debian/Ubuntu install: sudo apt install libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config (macOS: brew install cmake pkg-config)"
     fi
     bin="${src}/target/release/zeroterm"
     [[ -x "$bin" ]] || err "the source build did not produce target/release/zeroterm"

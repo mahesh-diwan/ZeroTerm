@@ -35,10 +35,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos-latest'
-        run: brew install cmake pkg-config lua
+        run: brew install cmake pkg-config
       - name: Build release
         run: |
           # crates.io downloads on runners can be transiently flaky; retry the
@@ -102,6 +102,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
+        shell: bash
         run: |
           # run: steps execute with set -e, so a plain `cargo fetch && break`
           # would abort the step on the first failed fetch. Turn set -e off
@@ -170,7 +171,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
       - name: Build .deb package
         run: |
           set +e
@@ -205,7 +206,7 @@ jobs:
       - name: Install rpm tools and build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config liblua5.4-dev
+          sudo apt-get install -y rpm libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
       - name: Build .rpm package
         run: |
           set +e

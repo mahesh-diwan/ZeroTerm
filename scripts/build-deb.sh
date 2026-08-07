@@ -2,7 +2,16 @@
 set -euo pipefail
 
 APP=zeroterm
-PKG_DIR="${APP}_$(git describe --tags --always 2>/dev/null || echo "0.3.0")_amd64"
+
+# Debian version strings must start with a digit: strip the leading 'v' from
+# git tags (v0.3.0 -> 0.3.0) and fall back to a valid version on bare hashes.
+VERSION="$(git describe --tags --always 2>/dev/null || true)"
+VERSION="${VERSION#v}"
+case "$VERSION" in
+	[0-9]*) ;;
+	*) VERSION="0.3.0" ;;
+esac
+PKG_DIR="${APP}_${VERSION}_amd64"
 
 if ! command -v cargo &>/dev/null; then
 	echo "Rust not installed. Install from: https://rustup.rs"
@@ -23,7 +32,7 @@ cp target/release/"${APP}" "${PKG_DIR}/usr/bin/"
 
 cat >"${PKG_DIR}/DEBIAN/control" <<EOF
 Package: ${APP}
-Version: $(git describe --tags --always 2>/dev/null || echo "0.3.0")
+Version: ${VERSION}
 Section: x11
 Priority: optional
 Architecture: amd64

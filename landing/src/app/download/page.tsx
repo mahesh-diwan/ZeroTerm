@@ -11,7 +11,7 @@ const platforms = [
     install: 'curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash',
     alt: 'git clone https://github.com/mahesh-diwan/ZeroTerm.git && cd ZeroTerm && cargo run --release',
     pkg: 'not on crates.io yet — build from source',
-    assets: ['ZeroTerm-x86_64.AppImage', 'zeroterm_v0.3.0_amd64.deb', 'zeroterm-0.3.0-1.x86_64.rpm'],
+    assets: ['ZeroTerm-x86_64.AppImage', 'zeroterm_0.3.0_amd64.deb', 'zeroterm-0.3.0-1.x86_64.rpm'],
   },
   {
     name: 'macOS',
