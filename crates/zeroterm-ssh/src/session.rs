@@ -59,10 +59,17 @@ impl SessionRegistry {
     pub fn create(&mut self, id: String, host: String, command: String) -> &DetachedSession {
         let start_ts = unix_now();
         if !self.map.contains_key(&id) && self.map.len() >= MAX_SESSIONS {
+            // Tie-break on id so eviction is deterministic even when several
+            // sessions share a start_ts (coarse clocks on macOS make rapid
+            // create() calls tie).
             if let Some(oldest) = self
                 .map
                 .iter()
-                .min_by_key(|(_, s)| s.start_ts)
+                .min_by(|(ka, a), (kb, b)| {
+                    a.start_ts
+                        .cmp(&b.start_ts)
+                        .then_with(|| ka.cmp(kb))
+                })
                 .map(|(k, _)| k.clone())
             {
                 self.map.remove(&oldest);
@@ -93,7 +100,14 @@ impl SessionRegistry {
     /// All sessions, oldest first.
     pub fn list(&self) -> Vec<DetachedSession> {
         let mut v: Vec<DetachedSession> = self.map.values().cloned().collect();
-        v.sort_by_key(|s| s.start_ts);
+        // Deterministic: oldest first, id as tie-breaker (stable sort would
+        // otherwise leak HashMap iteration order when start_ts ties, which
+        // happens on coarse clocks like macOS).
+        v.sort_by(|a, b| {
+            a.start_ts
+                .cmp(&b.start_ts)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         v
     }
 }
