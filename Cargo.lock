@@ -6124,7 +6124,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zeroterm"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -6151,7 +6151,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-ai"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "criterion",
  "reqwest",
@@ -6161,7 +6161,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-config"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -6176,7 +6176,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -6189,7 +6189,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-mux"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "criterion",
  "serde",
@@ -6199,7 +6199,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-plugin"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -6213,7 +6213,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-render"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -6229,7 +6229,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-ssh"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "log",
@@ -6240,7 +6240,7 @@ dependencies = [
 
 [[package]]
 name = "zeroterm-sync"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "axum",
