@@ -15,6 +15,8 @@
 #   ZEROTERM_VERSION      release tag to install (default: latest published)
 #   ZEROTERM_INSTALL_DIR  install destination (default: ~/.local/bin for
 #                         binaries, ~/Applications for the macOS app)
+#   ZEROTERM_SOURCE=1     skip the prebuilt package and build from source
+#                         (use when the latest published binary is stale)
 # The script uses bash features (`[[ ]]`, `pipefail`, `local`); detect a POSIX
 # sh early so `curl ... | sh` on dash gives a clear message instead of a
 # cryptic failure.
@@ -311,6 +313,7 @@ Overrides:
   ZEROTERM_VERSION      release tag to install (default: latest published)
   ZEROTERM_INSTALL_DIR  install destination (default: ~/.local/bin for
                         binaries, ~/Applications for the macOS app)
+  ZEROTERM_SOURCE=1     build from source instead of the prebuilt package
 HELP
             exit 0
             ;;
@@ -322,6 +325,13 @@ HELP
     fi
     version="$(resolve_version)"
     platform="$(detect_platform)"
+
+    if [[ -n "${ZEROTERM_SOURCE:-}" ]]; then
+        log "ZEROTERM_SOURCE is set; building from source at ${version} (skipping prebuilt packages)"
+        bin="$(build_from_source "$version")"
+        verify_install "$bin"
+        return 0
+    fi
 
     if [[ "${version}" != "main" ]]; then
         json="$(fetch_release_json "$version")"
