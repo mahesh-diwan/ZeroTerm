@@ -8,10 +8,12 @@ use winit::window::Window;
 
 use std::collections::HashMap;
 
-use zeroterm_core::cell::Color;
 use zeroterm_core::screen::Screen as CoreScreen;
 
 use crate::atlas::GlyphAtlas;
+use crate::cell_batch::{CellBatch, GlyphQuad, ATTR_DIM};
+use crate::diag::Diag;
+use crate::pass::Pass;
 
 pub type Result<T> = std::result::Result<T, RendererError>;
 
@@ -75,20 +77,14 @@ pub struct TabInfo {
     pub close_hovered: bool,
 }
 
-const ATTR_HAS_IMAGE: u32 = 0x400;
-const ATTR_BLOCK_DIVIDER: u32 = 0x800;
-const ATTR_DIM: u32 = 0x10;
-
 /// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
 /// this; the content viewport offset in main.rs derives from tab_bar_height(),
 /// so a mismatch would draw the bar taller than the layout reserves.
 const TAB_BAR_ROWS: usize = 2;
 
-const COPY_MARKER: &str = "[copy]";
-
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct Uniforms {
+pub(crate) struct Uniforms {
     screen_size: [f32; 2],
     cell_size: [f32; 2],
     viewport_origin: [f32; 2],
@@ -105,17 +101,17 @@ struct Uniforms {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
-struct CellData {
-    glyph_uv_min: [f32; 2],
-    glyph_uv_max: [f32; 2],
-    glyph_size: [f32; 2],
-    /// Top-left of the glyph bitmap inside the cell, in cell pixels
-    /// (placement.left, baseline + placement.top).
-    glyph_offset: [f32; 2],
-    fg: [f32; 4],
-    bg: [f32; 4],
-    attrs: u32,
-    _pad1: [u32; 3],
+pub(crate) struct CellData {
+    pub(crate) glyph_uv_min: [f32; 2],
+    pub(crate) glyph_uv_max: [f32; 2],
+    pub(crate) glyph_size: [f32; 2],
+    /// Top-left of the glyph bitmap inside the cell, in cell pixels, y-down
+    /// (placement.left, baseline - placement.top). See atlas::cell_offset.
+    pub(crate) glyph_offset: [f32; 2],
+    pub(crate) fg: [f32; 4],
+    pub(crate) bg: [f32; 4],
+    pub(crate) attrs: u32,
+    pub(crate) _pad1: [u32; 3],
 }
 
 #[repr(C)]
@@ -163,25 +159,16 @@ pub struct Renderer {
     premultiply_output: u32,
     size: PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    cell_buffer: wgpu::Buffer,
+    content_pass: Pass,
     quad_vertex_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: wgpu::BindGroup,
-    tab_bar_buffer: wgpu::Buffer,
-    tab_bar_uniform_buffer: wgpu::Buffer,
-    tab_bar_bind_group: wgpu::BindGroup,
-    status_bar_buffer: wgpu::Buffer,
-    status_bar_uniform_buffer: wgpu::Buffer,
-    status_bar_bind_group: wgpu::BindGroup,
-    scrollbar_buffer: wgpu::Buffer,
-    scrollbar_uniform_buffer: wgpu::Buffer,
-    scrollbar_bind_group: wgpu::BindGroup,
+    tab_bar_pass: Pass,
+    status_bar_pass: Pass,
+    scrollbar_pass: Pass,
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
     cell_width: f32,
     cell_height: f32,
-    cell_buffer_capacity: usize,
     dirty_cells: Vec<(usize, usize)>,
     viewport_origin: [f32; 2],
     padding: [f32; 4],
@@ -209,11 +196,9 @@ pub struct Renderer {
     /// every successful acquire; used to rate-limit error logs and to emit a
     /// recovery notice so a blank-window bug is attributable from the log.
     surface_failures: u32,
-    /// ZTDIAG=1 gate: dump every 30th presented frame to /tmp/zt-frame.ppm so
-    /// a "blank window" report can be attributed to the app's own framebuffer
-    /// vs the compositor (the window can be transparent even when the GPU
-    /// output is correct, e.g. an alpha-mode mismatch).
-    ztdiag_frames: u32,
+    /// Env-gated diagnostics (ZTDIAG=1): frame dumps + probes for attributing
+    /// blank-window reports to the framebuffer vs the compositor.
+    diag: Diag,
 }
 
 impl Renderer {
@@ -362,16 +347,13 @@ impl Renderer {
             alpha_mode,
             surface_format
         );
-        if std::env::var("ZTDIAG").is_ok() {
-            eprintln!(
-                "[ZTDIAG] surface format={:?} alpha={:?} present={:?}",
-                surface_format, alpha_mode, present_mode
-            );
-            let _ = std::fs::write(
-                "/tmp/zt-frame-format.txt",
-                format!("{:?}", surface_format),
-            );
-        }
+        let diag = Diag::new();
+        diag.probe(
+            "surface",
+            &format!(
+                "format={surface_format:?} alpha={alpha_mode:?} present={present_mode:?}"
+            ),
+        );
 
         let config = wgpu::SurfaceConfiguration {
             // COPY_SRC lets ZTDIAG=1 read the presented frame back to disk so
@@ -417,21 +399,7 @@ impl Renderer {
             premultiply: premultiply_output,
             _pad: 0,
         };
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
         let cell_buffer_capacity = (cols as usize) * (rows as usize);
-        let cell_buffer = {
-            let cell_data = vec![CellData::zeroed(); cell_buffer_capacity];
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Cell Data Buffer"),
-                contents: bytemuck::cast_slice(&cell_data),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
 
         let quad_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Quad Vertex Buffer"),
@@ -466,22 +434,13 @@ impl Renderer {
                 ],
             });
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Uniform + Storage Bind Group"),
-            layout: &uniform_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(
-                        uniform_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(cell_buffer.as_entire_buffer_binding()),
-                },
-            ],
-        });
+        let content_pass = Pass::new(
+            &device,
+            &uniform_bind_group_layout,
+            "Content",
+            cell_buffer_capacity,
+            uniforms,
+        );
 
         // Atlas bind group layout with image texture binding
         let atlas_bind_group_layout =
@@ -645,103 +604,29 @@ impl Renderer {
             cell_buffer_capacity
         );
 
-        let tab_bar_buffer = {
-            let cells = vec![CellData::zeroed(); (cols as usize) * 2];
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Tab Bar Cell Buffer"),
-                contents: bytemuck::cast_slice(&cells),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let tab_bar_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Tab Bar Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let tab_bar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Tab Bar Bind Group"),
-            layout: &render_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(
-                        tab_bar_uniform_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(
-                        tab_bar_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-            ],
-        });
+        let tab_bar_pass = Pass::new(
+            &device,
+            &uniform_bind_group_layout,
+            "Tab Bar",
+            (cols as usize) * 2,
+            uniforms,
+        );
 
-        let status_bar_buffer = {
-            let cells = vec![CellData::zeroed(); 512];
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Status Bar Cell Buffer"),
-                contents: bytemuck::cast_slice(&cells),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let status_bar_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Status Bar Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let status_bar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Status Bar Bind Group"),
-            layout: &render_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(
-                        status_bar_uniform_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(
-                        status_bar_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-            ],
-        });
+        let status_bar_pass = Pass::new(
+            &device,
+            &uniform_bind_group_layout,
+            "Status Bar",
+            512,
+            uniforms,
+        );
 
-        let scrollbar_buffer = {
-            let cells = vec![CellData::zeroed(); SCROLLBAR_MAX_ROWS * 2];
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Scrollbar Cell Buffer"),
-                contents: bytemuck::cast_slice(&cells),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            })
-        };
-        let scrollbar_uniform_buffer =
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Scrollbar Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let scrollbar_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Scrollbar Bind Group"),
-            layout: &render_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(
-                        scrollbar_uniform_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(
-                        scrollbar_buffer.as_entire_buffer_binding(),
-                    ),
-                },
-            ],
-        });
+        let scrollbar_pass = Pass::new(
+            &device,
+            &uniform_bind_group_layout,
+            "Scrollbar",
+            SCROLLBAR_MAX_ROWS * 2,
+            uniforms,
+        );
 
         Ok(Self {
             surface,
@@ -753,26 +638,17 @@ impl Renderer {
             premultiply_output,
             size,
             render_pipeline,
-            cell_buffer,
+            content_pass,
             quad_vertex_buffer,
-            uniform_buffer,
-            uniform_bind_group,
-            tab_bar_buffer,
-            tab_bar_uniform_buffer,
-            tab_bar_bind_group,
-            status_bar_buffer,
-            status_bar_uniform_buffer,
-            status_bar_bind_group,
-            scrollbar_buffer,
-            scrollbar_uniform_buffer,
-            scrollbar_bind_group,
+            tab_bar_pass,
+            status_bar_pass,
+            scrollbar_pass,
             atlas_bind_group_layout,
             atlas_bind_group,
             glyph_atlas,
             cell_size: [cell_width, cell_height],
             cell_width,
             cell_height,
-            cell_buffer_capacity,
             dirty_cells: Vec::new(),
             viewport_origin: [0.0, 0.0],
             padding: [16.0, 16.0, 16.0, 16.0],
@@ -796,7 +672,7 @@ impl Renderer {
             blink_interval: std::time::Duration::from_millis(530),
             cursor_blink_enabled: true,
             surface_failures: 0,
-            ztdiag_frames: 0,
+            diag,
         })
     }
 
@@ -811,7 +687,7 @@ impl Renderer {
         let new_cols = (width as f32 / self.cell_size[0]).ceil() as usize;
         let new_rows = (height as f32 / self.cell_size[1]).ceil() as usize;
 
-        let needs_resize = new_cols * new_rows != self.cell_buffer_capacity;
+        let needs_resize = new_cols * new_rows != self.content_pass.capacity();
 
         self.size = PhysicalSize::new(width, height);
         self.config.width = width;
@@ -819,116 +695,15 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
 
         if needs_resize {
-            self.cell_buffer_capacity = new_cols * new_rows;
-            self.cell_buffer = {
-                let cell_data = vec![CellData::zeroed(); self.cell_buffer_capacity];
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Cell Data Buffer"),
-                        contents: bytemuck::cast_slice(&cell_data),
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    })
-            };
-            self.uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Uniform + Storage Bind Group"),
-                layout: &self.render_pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.uniform_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.cell_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                ],
-            });
-            self.tab_bar_buffer = {
-                let cells = vec![CellData::zeroed(); new_cols * 2];
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Tab Bar Cell Buffer"),
-                        contents: bytemuck::cast_slice(&cells),
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    })
-            };
-            self.tab_bar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Tab Bar Bind Group"),
-                layout: &self.render_pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.tab_bar_uniform_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.tab_bar_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                ],
-            });
-            self.status_bar_buffer = {
-                let cells = vec![CellData::zeroed(); new_cols];
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Status Bar Cell Buffer"),
-                        contents: bytemuck::cast_slice(&cells),
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    })
-            };
-            self.status_bar_bind_group =
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Status Bar Bind Group"),
-                    layout: &self.render_pipeline.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(
-                                self.status_bar_uniform_buffer.as_entire_buffer_binding(),
-                            ),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(
-                                self.status_bar_buffer.as_entire_buffer_binding(),
-                            ),
-                        },
-                    ],
-                });
-            self.scrollbar_buffer = {
-                let cells = vec![CellData::zeroed(); SCROLLBAR_MAX_ROWS * 2];
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Scrollbar Cell Buffer"),
-                        contents: bytemuck::cast_slice(&cells),
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    })
-            };
-            self.scrollbar_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Scrollbar Bind Group"),
-                layout: &self.render_pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.scrollbar_uniform_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(
-                            self.scrollbar_buffer.as_entire_buffer_binding(),
-                        ),
-                    },
-                ],
-            });
+            let layout = self.render_pipeline.get_bind_group_layout(0);
+            self.content_pass
+                .resize(&self.device, &layout, "Content", new_cols * new_rows);
+            self.tab_bar_pass
+                .resize(&self.device, &layout, "Tab Bar", new_cols * 2);
+            self.status_bar_pass
+                .resize(&self.device, &layout, "Status Bar", new_cols.max(512));
+            self.scrollbar_pass
+                .resize(&self.device, &layout, "Scrollbar", SCROLLBAR_MAX_ROWS * 2);
         }
 
         let uniforms = Uniforms {
@@ -940,8 +715,7 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.content_pass.write_uniforms(&self.queue, &uniforms);
     }
 
     /// Offset added to every cell position in the shader (pixels).
@@ -1034,8 +808,7 @@ impl Renderer {
             attrs: 0,
             _pad1: [0; 3],
         };
-        self.queue
-            .write_buffer(&self.tab_bar_buffer, 0, bytemuck::cast_slice(&[bg]));
+        self.tab_bar_pass.write_cells(&self.queue, std::slice::from_ref(&bg));
 
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
@@ -1046,42 +819,28 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue.write_buffer(
-            &self.tab_bar_uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[uniforms]),
-        );
+        self.tab_bar_pass.write_uniforms(&self.queue, &uniforms);
 
         let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
         let encoder = self.current_encoder.as_mut().unwrap();
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Background Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: self.clear_color[0],
-                        g: self.clear_color[1],
-                        b: self.clear_color[2],
-                        a: self.opacity,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.tab_bar_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..1);
+        self.tab_bar_pass.draw(
+            encoder,
+            &self.render_pipeline,
+            &self.atlas_bind_group,
+            &self.quad_vertex_buffer,
+            view,
+            "Background Pass",
+            1,
+            Some(wgpu::Color {
+                r: self.clear_color[0],
+                g: self.clear_color[1],
+                b: self.clear_color[2],
+                a: self.opacity,
+            }),
+        );
 
         self.needs_clear = false;
         Ok(())
@@ -1098,23 +857,18 @@ impl Renderer {
         }
 
         let buffer = screen.buffer();
-        let mut visible_rows = buffer.len();
-        let mut cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
-
         // GPU cell buffer is sized from the window (resize()). A resize race
         // or split-pane math can hand us a screen larger than that capacity —
         // clamp so the batch write and instance count never overrun the
-        // storage buffer.
-        let capacity = self.cell_buffer_capacity.max(1);
-        if visible_rows.saturating_mul(cols) > capacity {
-            visible_rows = (capacity / cols.max(1)).min(visible_rows);
-            cols = (capacity / visible_rows.max(1)).min(cols);
-        }
+        // storage buffer. Same rule as CellBatch::build (one source of truth).
+        let capacity = self.content_pass.capacity();
+        let (visible_rows, cols) =
+            CellBatch::clamp_dims(buffer.len(), buffer.first().map_or(0, Vec::len), capacity);
 
-        // [ZTDIAG] Ground-truth probe: how many ink cells the screen actually
-        // holds and what the last row says. Gates the parser screen vs. GPU
-        // presentation question for a blank-window report. Gated on ZTDIAG=1.
-        if std::env::var("ZTDIAG").is_ok() {
+        // Ground-truth probe (ZTDIAG=1): how many ink cells the screen holds
+        // and what the last row says — distinguishes a parser/screen problem
+        // from a GPU presentation problem.
+        if self.diag.enabled() {
             let ink: usize = buffer
                 .iter()
                 .take(visible_rows)
@@ -1124,18 +878,17 @@ impl Renderer {
                 .get(visible_rows.saturating_sub(1))
                 .map(|row| row.iter().take(70).map(|c| c.ch).collect())
                 .unwrap_or_default();
-            eprintln!(
-                "[ZTDIAG] render_screen {}x{} ink={} cap={} size={}x{} cell={}x{} viewport={:?} last='{}'",
-                visible_rows,
-                cols,
-                ink,
-                capacity,
-                self.size.width,
-                self.size.height,
-                self.cell_width,
-                self.cell_height,
-                self.viewport_origin,
-                last_text
+            self.diag.probe(
+                "render_screen",
+                &format!(
+                    "{visible_rows}x{cols} ink={ink} cap={capacity} size={}x{} cell={}x{} \
+                     viewport={:?} last='{last_text}'",
+                    self.size.width,
+                    self.size.height,
+                    self.cell_width,
+                    self.cell_height,
+                    self.viewport_origin,
+                ),
             );
         }
 
@@ -1166,144 +919,66 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.content_pass.write_uniforms(&self.queue, &uniforms);
 
         let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
         let encoder = self.current_encoder.as_mut().unwrap();
-        let load = if self.needs_clear {
+        let clear = if self.needs_clear {
             self.needs_clear = false;
-            wgpu::LoadOp::Clear(wgpu::Color {
+            Some(wgpu::Color {
                 r: self.clear_color[0],
                 g: self.clear_color[1],
                 b: self.clear_color[2],
                 a: self.opacity,
             })
         } else {
-            wgpu::LoadOp::Load
+            None
         };
 
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-
         let instance_count = (visible_rows * cols) as u32;
-        render_pass.draw(0..6, 0..instance_count);
+        self.content_pass.draw(
+            encoder,
+            &self.render_pipeline,
+            &self.atlas_bind_group,
+            &self.quad_vertex_buffer,
+            view,
+            "Render Pass",
+            instance_count,
+            clear,
+        );
 
         Ok(())
     }
 
     pub fn end_frame(&mut self) -> Result<()> {
-        // [ZTDIAG] Read the just-rendered frame back to CPU and dump it once
-        // to /tmp/zt-frame.ppm. Lets a blank-window report be attributed to
-        // the app's framebuffer (correct here => compositor/surface problem)
-        // or the renderer itself (garbage pixels => pipeline bug).
-        let mut diag: Option<(wgpu::Buffer, usize, u32, u32)> = None;
-        self.ztdiag_frames = self.ztdiag_frames.wrapping_add(1);
-        if std::env::var("ZTDIAG").is_ok() && self.ztdiag_frames % 30 == 0 {
+        // ZTDIAG=1: queue a readback of this presented frame (inside the
+        // encoder) so the dump is attributable to the framebuffer vs the
+        // compositor. Finalized after submit.
+        let mut readback: Option<crate::diag::DiagReadback> = None;
+        if self.diag.should_dump_frame() {
             if let (Some(enc), Some(frame)) = (
                 self.current_encoder.as_mut(),
                 self.current_frame.as_ref(),
             ) {
-                let _ = std::fs::write(
-                    "/tmp/zt-frame-format.txt",
-                    format!("{:?}\n{}x{}", self.config.format, self.config.width, self.config.height),
+                readback = Diag::queue_readback(
+                    &self.device,
+                    enc,
+                    frame,
+                    self.config.format,
+                    self.config.width,
+                    self.config.height,
                 );
-                let w = self.config.width;
-                let h = self.config.height;
-                if w > 0 && h > 0 {
-                    let bpr = (w as usize * 4 + 255) & !255;
-                    let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("zt-diag-readback"),
-                        size: (bpr as u64) * (h as u64),
-                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                        mapped_at_creation: false,
-                    });
-                    enc.copy_texture_to_buffer(
-                        wgpu::ImageCopyTexture {
-                            texture: &frame.texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::ImageCopyBuffer {
-                            buffer: &rb,
-                            layout: wgpu::ImageDataLayout {
-                                offset: 0,
-                                bytes_per_row: Some(bpr as u32),
-                                rows_per_image: Some(h),
-                            },
-                        },
-                        wgpu::Extent3d {
-                            width: w,
-                            height: h,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                    diag = Some((rb, bpr, w, h));
-                }
             }
         }
         if let Some(encoder) = self.current_encoder.take() {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
         self.current_view = None;
-        if let Some((rb, bpr, w, h)) = diag {
-            let slice = rb.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            self.device.poll(wgpu::Maintain::Wait);
-            if rx.recv().is_ok() {
-                let data = slice.get_mapped_range();
-                let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
-                for row in 0..h as usize {
-                    let base = row * bpr;
-                    for col in 0..w as usize {
-                        let i = base + col * 4;
-                        ppm.push(data[i]);
-                        ppm.push(data[i + 1]);
-                        ppm.push(data[i + 2]);
-                    }
-                }
-                let _ = std::fs::write("/tmp/zt-frame.ppm", &ppm);
-                // Alpha histogram: a translucent surface (window.opacity < 1)
-                // composites the desktop through the terminal — the classic
-                // "stripes through the window" report. 255 everywhere means
-                // the translucency is compositor-side, not our framebuffer.
-                let mut alpha_counts: std::collections::HashMap<u8, u32> =
-                    std::collections::HashMap::new();
-                for i in (0..data.len()).step_by(4) {
-                    *alpha_counts.entry(data[i + 3]).or_insert(0) += 1;
-                }
-                let mut alphas: Vec<_> = alpha_counts.into_iter().collect();
-                alphas.sort_by(|a, b| b.1.cmp(&a.1));
-                let mut alpha_txt = String::new();
-                for (a, n) in alphas.into_iter().take(6) {
-                    alpha_txt += &format!("alpha={} count={}\n", a, n);
-                }
-                let _ = std::fs::write("/tmp/zt-frame-alpha.txt", &alpha_txt);
-            }
+        if let Some(rb) = readback {
+            Diag::finalize_readback(&self.device, rb);
         }
         if let Some(frame) = self.current_frame.take() {
             frame.present();
@@ -1373,10 +1048,11 @@ impl Renderer {
         for cell in &mut batch {
             cell.bg = bar_bg;
             cell.fg = fg;
-            cell.glyph_uv_min = [space.0, space.1];
-            cell.glyph_uv_max = [space.2, space.3];
-            cell.glyph_size = [space.4, space.5];
-            cell.glyph_offset = [space.6, space.7];
+            let (u0, v0, u1, v1) = space.uv();
+            cell.glyph_uv_min = [u0, v0];
+            cell.glyph_uv_max = [u1, v1];
+            cell.glyph_size = [space.width as f32, space.height as f32];
+            cell.glyph_offset = [space.offset_x, space.offset_y];
         }
 
         // Same col layout as tab_at_point: starts at col 1, span = chars + 2,
@@ -1415,14 +1091,13 @@ impl Renderer {
                 if c >= cols {
                     break;
                 }
-                let (u0, v0, u1, v1, gw, gh, ox, oy) =
-                    self.glyph_atlas
-                        .get_or_insert_glyph(ch, &self.device, &self.queue);
+                let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+                let (u0, v0, u1, v1) = g.uv();
                 let cell = &mut batch[c];
                 cell.glyph_uv_min = [u0, v0];
                 cell.glyph_uv_max = [u1, v1];
-                cell.glyph_size = [gw, gh];
-                cell.glyph_offset = [ox, oy];
+                cell.glyph_size = [g.width as f32, g.height as f32];
+                cell.glyph_offset = [g.offset_x, g.offset_y];
                 cell.fg = title_fg;
                 cell.attrs = title_attrs;
             }
@@ -1432,14 +1107,13 @@ impl Renderer {
             if tab.active || tab.hovered {
                 let close_c = col + span - 1;
                 if close_c < cols {
-                    let (u0, v0, u1, v1, gw, gh, ox, oy) =
-                        self.glyph_atlas
-                            .get_or_insert_glyph('×', &self.device, &self.queue);
+                    let g = self.glyph_atlas.get_or_insert_glyph('×', &self.device, &self.queue);
+                    let (u0, v0, u1, v1) = g.uv();
                     let cell = &mut batch[close_c];
                     cell.glyph_uv_min = [u0, v0];
                     cell.glyph_uv_max = [u1, v1];
-                    cell.glyph_size = [gw, gh];
-                    cell.glyph_offset = [ox, oy];
+                    cell.glyph_size = [g.width as f32, g.height as f32];
+                    cell.glyph_offset = [g.offset_x, g.offset_y];
                     cell.fg = if tab.close_hovered { close_red } else { accent_fg };
                     cell.attrs = 0;
                 }
@@ -1447,8 +1121,7 @@ impl Renderer {
             col += span + 1;
         }
 
-        self.queue
-            .write_buffer(&self.tab_bar_buffer, 0, bytemuck::cast_slice(&batch));
+        self.tab_bar_pass.write_cells(&self.queue, &batch);
 
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
@@ -1459,37 +1132,23 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue.write_buffer(
-            &self.tab_bar_uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[uniforms]),
-        );
+        self.tab_bar_pass.write_uniforms(&self.queue, &uniforms);
 
         let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
         let encoder = self.current_encoder.as_mut().unwrap();
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Tab Bar Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.tab_bar_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..(TAB_BAR_ROWS * cols) as u32);
+        self.tab_bar_pass.draw(
+            encoder,
+            &self.render_pipeline,
+            &self.atlas_bind_group,
+            &self.quad_vertex_buffer,
+            view,
+            "Tab Bar Render Pass",
+            (TAB_BAR_ROWS * cols) as u32,
+            None,
+        );
 
         Ok(())
     }
@@ -1533,10 +1192,11 @@ impl Renderer {
         for cell in &mut batch {
             cell.bg = bg;
             cell.fg = fg;
-            cell.glyph_uv_min = [space.0, space.1];
-            cell.glyph_uv_max = [space.2, space.3];
-            cell.glyph_size = [space.4, space.5];
-            cell.glyph_offset = [space.6, space.7];
+            let (u0, v0, u1, v1) = space.uv();
+            cell.glyph_uv_min = [u0, v0];
+            cell.glyph_uv_max = [u1, v1];
+            cell.glyph_size = [space.width as f32, space.height as f32];
+            cell.glyph_offset = [space.offset_x, space.offset_y];
         }
 
         let title = truncate_title(left, cols.saturating_sub(2));
@@ -1545,31 +1205,28 @@ impl Renderer {
             if c >= cols {
                 break;
             }
-            let (u0, v0, u1, v1, gw, gh, ox, oy) =
-                self.glyph_atlas
-                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+            let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+            let (u0, v0, u1, v1) = g.uv();
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
-            batch[c].glyph_size = [gw, gh];
-            batch[c].glyph_offset = [ox, oy];
+            batch[c].glyph_size = [g.width as f32, g.height as f32];
+            batch[c].glyph_offset = [g.offset_x, g.offset_y];
         }
         let mut c = cols.saturating_sub(1);
         for ch in right.chars().rev() {
-            let (u0, v0, u1, v1, gw, gh, ox, oy) =
-                self.glyph_atlas
-                    .get_or_insert_glyph(ch, &self.device, &self.queue);
+            let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+            let (u0, v0, u1, v1) = g.uv();
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
-            batch[c].glyph_size = [gw, gh];
-            batch[c].glyph_offset = [ox, oy];
+            batch[c].glyph_size = [g.width as f32, g.height as f32];
+            batch[c].glyph_offset = [g.offset_x, g.offset_y];
             if c == 0 {
                 break;
             }
             c -= 1;
         }
 
-        self.queue
-            .write_buffer(&self.status_bar_buffer, 0, bytemuck::cast_slice(&batch));
+        self.status_bar_pass.write_cells(&self.queue, &batch);
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
             cell_size: [self.cell_width, self.cell_height],
@@ -1579,36 +1236,23 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue.write_buffer(
-            &self.status_bar_uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[uniforms]),
-        );
+        self.status_bar_pass.write_uniforms(&self.queue, &uniforms);
 
         let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
         let encoder = self.current_encoder.as_mut().unwrap();
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Status Bar Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.status_bar_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..cols as u32);
+        self.status_bar_pass.draw(
+            encoder,
+            &self.render_pipeline,
+            &self.atlas_bind_group,
+            &self.quad_vertex_buffer,
+            view,
+            "Status Bar Render Pass",
+            cols as u32,
+            None,
+        );
         Ok(())
     }
 
@@ -1661,9 +1305,10 @@ impl Renderer {
         let mut batch = vec![CellData::zeroed(); rows];
         for cell in &mut batch {
             cell.bg = track;
-            cell.glyph_uv_min = [space.0, space.1];
-            cell.glyph_uv_max = [space.2, space.3];
-            cell.glyph_size = [space.4, space.5];
+            let (u0, v0, u1, v1) = space.uv();
+            cell.glyph_uv_min = [u0, v0];
+            cell.glyph_uv_max = [u1, v1];
+            cell.glyph_size = [space.width as f32, space.height as f32];
         }
 
         // Thumb height follows the viewport's share of total content, and its
@@ -1675,8 +1320,7 @@ impl Renderer {
             row.bg = thumb;
         }
 
-        self.queue
-            .write_buffer(&self.scrollbar_buffer, 0, bytemuck::cast_slice(&batch));
+        self.scrollbar_pass.write_cells(&self.queue, &batch);
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
             cell_size: [self.cell_width, self.cell_height],
@@ -1686,36 +1330,23 @@ impl Renderer {
             premultiply: self.premultiply_output,
             _pad: 0,
         };
-        self.queue.write_buffer(
-            &self.scrollbar_uniform_buffer,
-            0,
-            bytemuck::cast_slice(&[uniforms]),
-        );
+        self.scrollbar_pass.write_uniforms(&self.queue, &uniforms);
 
         let view = self.current_view.as_ref();
         let Some(view) = view else {
             return Ok(());
         };
         let encoder = self.current_encoder.as_mut().unwrap();
-        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Scrollbar Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render_pass.set_pipeline(&self.render_pipeline);
-        render_pass.set_bind_group(0, &self.scrollbar_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..rows as u32);
+        self.scrollbar_pass.draw(
+            encoder,
+            &self.render_pipeline,
+            &self.atlas_bind_group,
+            &self.quad_vertex_buffer,
+            view,
+            "Scrollbar Render Pass",
+            rows as u32,
+            None,
+        );
         Ok(())
     }
 
@@ -1725,180 +1356,34 @@ impl Renderer {
         scroll_offset: usize,
         selection: Option<Selection>,
     ) -> Result<()> {
-        let buffer = screen.buffer();
-        let mut visible_rows = buffer.len();
-        let mut cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
-
-        // Same clamp as render_screen: the GPU cell buffer is window-sized;
-        // never build a batch that overruns it.
-        let capacity = self.cell_buffer_capacity.max(1);
-        if visible_rows.saturating_mul(cols) > capacity {
-            visible_rows = (capacity / cols.max(1)).min(visible_rows);
-            cols = (capacity / visible_rows.max(1)).min(cols);
-        }
-
-        let cursor = screen.cursor();
-        let cursor_col = cursor.col;
-        let cursor_visible = cursor.visible;
-        let cursor_shape = cursor.shape;
-
-        let scrollback = screen.scrollback();
-        let total_scrollback = scrollback.len();
-        let total_rows = total_scrollback + visible_rows;
-
-        let end = total_rows.saturating_sub(scroll_offset);
-        let start = end.saturating_sub(visible_rows);
-
-        // ponytail: block start_line is buffer-local; divider rows only line up
-        // with view rows while scroll_offset == 0. Scrolled dividers are skipped.
-        let mut divider_rows = std::collections::HashSet::new();
-        let mut divider_meta: std::collections::HashMap<usize, Vec<char>> =
-            std::collections::HashMap::new();
-        for block in screen.blocks() {
-            divider_rows.insert(block.start_line);
-            divider_meta.insert(
-                block.start_line,
-                screen.block_metadata(block).chars().collect(),
-            );
-        }
-
-        let mut batch = vec![CellData::zeroed(); visible_rows * cols];
-        for &(dirty_row, dirty_col) in &self.dirty_cells {
-            if dirty_row >= visible_rows || dirty_col >= cols {
-                continue;
-            }
-
-            let combined_idx = start + dirty_row;
-            let line = if combined_idx < total_scrollback {
-                &scrollback[total_scrollback - 1 - combined_idx]
-            } else {
-                &buffer[combined_idx - total_scrollback]
-            };
-
-            if dirty_col >= line.len() {
-                continue;
-            }
-
-            let cell = &line[dirty_col];
-
-            let mut fg = self.theme.map_cell_color(cell.fg);
-            let bg = self.theme.map_cell_color(cell.bg);
-
-            // Syntax classes are tagged into cells at write time (see Screen),
-            // so scrollback rows carry their colors too — no scroll_offset gate.
-            let mut cell_attrs = cell.attrs;
-            if cell.syntax_color != 0 {
-                if let Some(c) = Self::highlight_color(cell.syntax_color, &self.theme) {
-                    fg = c;
+        // The screen -> CellData mapping (scrollback math, capacity clamp,
+        // cursor/selection, syntax colors, block overlays) lives in the pure
+        // CellBatch module so it's unit-testable without a GPU. Here we only
+        // supply the glyph provider (the one GPU-touching dependency) and
+        // upload the result.
+        let device = &self.device;
+        let queue = &self.queue;
+        let atlas = &mut self.glyph_atlas;
+        let mut batch = CellBatch::build(
+            screen,
+            scroll_offset,
+            selection,
+            self.content_pass.capacity(),
+            &self.dirty_cells,
+            self.blink_visible,
+            self.opacity as f32,
+            &self.theme,
+            |ch| {
+                let g = atlas.get_or_insert_glyph(ch, device, queue);
+                let (u0, v0, u1, v1) = g.uv();
+                GlyphQuad {
+                    uv_min: [u0, v0],
+                    uv_max: [u1, v1],
+                    size: [g.width as f32, g.height as f32],
+                    offset: [g.offset_x, g.offset_y],
                 }
-                if cell.syntax_color == zeroterm_core::highlight::HL_URL {
-                    cell_attrs.underline = zeroterm_core::cell::UnderlineStyle::Single;
-                }
-            }
-
-            let is_cursor_cell = cursor_visible
-                && self.blink_visible
-                && scroll_offset == 0
-                && dirty_row == cursor.row
-                && dirty_col == cursor_col;
-            let (fg, bg, cell_attrs) = if is_cursor_cell {
-                match cursor_shape {
-                    zeroterm_core::cell::CursorShape::Block => (bg, fg, cell_attrs),
-                    zeroterm_core::cell::CursorShape::Underline => {
-                        let mut a = cell_attrs;
-                        a.underline = zeroterm_core::cell::UnderlineStyle::Single;
-                        (fg, bg, a)
-                    }
-                    zeroterm_core::cell::CursorShape::Bar => (fg, bg, cell_attrs),
-                }
-            } else {
-                (fg, bg, cell_attrs)
-            };
-
-            let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
-
-            let mut attrs = (cell_attrs.bold as u32)
-                | ((cell_attrs.italic as u32) << 1)
-                | (((cell_attrs.underline != zeroterm_core::cell::UnderlineStyle::None) as u32)
-                    << 2)
-                | ((cell_attrs.strikethrough as u32) << 3)
-                | ((cell_attrs.dim as u32) << 4)
-                | ((cell_attrs.blink as u32) << 5)
-                | ((cell_attrs.reverse as u32) << 6)
-                | ((cell_attrs.invisible as u32) << 7)
-                | (if is_cursor_cell
-                    && matches!(cursor_shape, zeroterm_core::cell::CursorShape::Bar)
-                {
-                    0x100u32
-                } else {
-                    0
-                })
-                | (if is_selected { 0x200u32 } else { 0 });
-            if screen
-                .image_cells()
-                .contains_key(&(combined_idx, dirty_col))
-            {
-                attrs |= ATTR_HAS_IMAGE;
-            }
-
-            let fg_color = [
-                fg.r as f32 / 255.0,
-                fg.g as f32 / 255.0,
-                fg.b as f32 / 255.0,
-                1.0,
-            ];
-            let bg_color = [
-                bg.r as f32 / 255.0,
-                bg.g as f32 / 255.0,
-                bg.b as f32 / 255.0,
-                // Background carries the window opacity: the shader mixes
-                // glyph alpha between bg (a=opacity) and fg (a=1), so text
-                // stays opaque while the terminal background shows the
-                // desktop through at (1-opacity).
-                self.opacity as f32,
-            ];
-
-            let mut ch = cell.ch;
-            // block.start_line is buffer-local; view row == buffer row only at
-            // scroll_offset 0, so scrolled dividers are skipped entirely (the
-            // [copy]/metadata overlay would land on the wrong row otherwise).
-            if scroll_offset == 0 && divider_rows.contains(&dirty_row) {
-                attrs |= ATTR_BLOCK_DIVIDER;
-                let meta = divider_meta.get(&dirty_row);
-                let meta_len = meta.map_or(0, Vec::len);
-                let copy_start = cols.saturating_sub(COPY_MARKER.len());
-                let meta_start = copy_start.saturating_sub(meta_len);
-                let overlay = if dirty_col >= copy_start {
-                    COPY_MARKER
-                        .as_bytes()
-                        .get(dirty_col - copy_start)
-                        .map(|&b| b as char)
-                } else if dirty_col >= meta_start {
-                    meta.and_then(|m| m.get(dirty_col - meta_start)).copied()
-                } else {
-                    None
-                };
-                if let Some(c) = overlay {
-                    ch = c;
-                    attrs |= ATTR_DIM;
-                }
-            }
-
-            let (u0, v0, u1, v1, gw, gh, ox, oy) =
-                self.glyph_atlas
-                    .get_or_insert_glyph(ch, &self.device, &self.queue);
-
-            batch[dirty_row * cols + dirty_col] = CellData {
-                glyph_uv_min: [u0, v0],
-                glyph_uv_max: [u1, v1],
-                glyph_size: [gw, gh],
-                glyph_offset: [ox, oy],
-                fg: fg_color,
-                bg: bg_color,
-                attrs,
-                _pad1: [0; 3],
-            };
-        }
+            },
+        );
 
         // [ZTDIAG] Content-pass red-cell test: paint every cell bright red so a
         // framebuffer dump can tell whether the content pass draws at all.
@@ -1913,6 +1398,8 @@ impl Renderer {
         if std::env::var("ZTDIAG_CELLDUMP").is_ok() {
             // Find batch rows that carry actual glyph ink (scrollback offset can
             // shift the prompt away from its screen row) and dump the first one.
+            let cols = screen.buffer().first().map_or(0, Vec::len);
+            let visible_rows = batch.len().checked_div(cols).unwrap_or(0);
             let mut rows_with_ink = Vec::new();
             for r in 0..visible_rows {
                 let base = r * cols;
@@ -1938,11 +1425,11 @@ impl Renderer {
             }
         }
 
-        self.queue
-            .write_buffer(&self.cell_buffer, 0, bytemuck::cast_slice(&batch));
+        self.content_pass.write_cells(&self.queue, &batch);
 
         Ok(())
     }
+
 
 /// Theme background in LINEAR color space, for wgpu `LoadOp::Clear`.
 /// Theme colors are sRGB byte values (`0..255`) and the Bgra8UnormSrgb
@@ -2172,17 +1659,6 @@ fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
         }
     }
 
-    /// Palette for `highlight` classes, mapped through the active theme's ANSI colors.
-    fn highlight_color(idx: u8, theme: &crate::theme::Theme) -> Option<Color> {
-        match idx {
-            zeroterm_core::highlight::HL_KEYWORD => Some(theme.ansi[6]),
-            zeroterm_core::highlight::HL_STRING => Some(theme.ansi[3]),
-            zeroterm_core::highlight::HL_NUMBER => Some(theme.ansi[5]),
-            zeroterm_core::highlight::HL_COMMENT => Some(theme.ansi[8]),
-            zeroterm_core::highlight::HL_URL => Some(theme.accent),
-            _ => None,
-        }
-    }
 }
 
 /// Compute the scrollbar thumb geometry: returns `(start_row, row_count)`

@@ -11,15 +11,47 @@ use crate::renderer::{Result, RendererError};
 
 const ATLAS_SIZE: u32 = 1024;
 
+/// A rasterized glyph plus everything the shader needs to place it. Returned
+/// (not a raw tuple) so the placement contract travels with the type: `offset`
+/// is the bitmap's top-left within its cell, in **cell pixels, y-down** — the
+/// shader samples `cell_px - offset` and rejects anything outside the bitmap
+/// rect, so a wrong offset silently makes text invisible.
 #[derive(Clone, Copy)]
-struct GlyphInfo {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    /// Bitmap top-left within its cell, in pixels (raster-space offsets).
-    offset_x: f32,
-    offset_y: f32,
+pub(crate) struct GlyphInfo {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    /// Bitmap top-left within its cell, in cell pixels (y-down). swash
+    /// rasterizes y-up (Origin::BottomLeft), so this is computed once here as
+    /// `(placement.left, baseline - placement.top)`.
+    pub(crate) offset_x: f32,
+    pub(crate) offset_y: f32,
+}
+
+impl GlyphInfo {
+    /// Normalized atlas rect for this glyph (u0, v0, u1, v1).
+    pub(crate) fn uv(&self) -> (f32, f32, f32, f32) {
+        info_to_uv(self)
+    }
+}
+
+/// Pure placement math shared by the atlas and its tests: swash measures from
+/// the pen origin with y-up (Origin::BottomLeft), where `top` is the ink's top
+/// edge ABOVE the baseline. The cell is y-down, so the bitmap's top sits
+/// `baseline - top` pixels below the cell top. The old `baseline + top` put
+/// every bitmap below the cell bottom — invisible text.
+fn cell_offset(baseline: f32, left: f32, top: f32) -> (f32, f32) {
+    (left, baseline - top)
+}
+
+/// Normalized atlas rect for a packed glyph.
+fn info_to_uv(info: &GlyphInfo) -> (f32, f32, f32, f32) {
+    let u0 = info.x as f32 / ATLAS_SIZE as f32;
+    let v0 = info.y as f32 / ATLAS_SIZE as f32;
+    let u1 = (info.x + info.width) as f32 / ATLAS_SIZE as f32;
+    let v1 = (info.y + info.height) as f32 / ATLAS_SIZE as f32;
+    (u0, v0, u1, v1)
 }
 
 pub(crate) struct GlyphAtlas {
@@ -163,31 +195,31 @@ impl GlyphAtlas {
         Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
     }
 
-    /// (u0, v0, u1, v1, width_px, height_px, offset_x_px, offset_y_px)
     pub(crate) fn get_or_insert_glyph(
         &mut self,
         ch: char,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+    ) -> GlyphInfo {
         let key = ch as u32;
         if let Some(info) = self.glyph_cache.get(&key) {
-            let uv = self.info_to_uv(info);
-            return (
-                uv.0,
-                uv.1,
-                uv.2,
-                uv.3,
-                info.width as f32,
-                info.height as f32,
-                info.offset_x,
-                info.offset_y,
-            );
+            return *info;
         }
 
         let font = match FontRef::from_index(&self.font_data, 0) {
             Some(f) => f,
-            None => return self.fallback_uv(),
+            None => {
+                // Zero-size glyph: no ink, bg shows through (the shader's
+                // coverage test rejects everything outside the bitmap rect).
+                return GlyphInfo {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    offset_x: 0.0,
+                    offset_y: 0.0,
+                };
+            }
         };
 
         let charmap = font.charmap();
@@ -207,19 +239,16 @@ impl GlyphAtlas {
             Some(img) if img.placement.width > 0 && img.placement.height > 0 => {
                 let info = self.pack_glyph(&img, device, queue);
                 self.glyph_cache.insert(key, info);
-                let uv = self.info_to_uv(&info);
-                (
-                    uv.0,
-                    uv.1,
-                    uv.2,
-                    uv.3,
-                    info.width as f32,
-                    info.height as f32,
-                    info.offset_x,
-                    info.offset_y,
-                )
+                info
             }
-            _ => self.fallback_uv(),
+            _ => GlyphInfo {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                offset_x: 0.0,
+                offset_y: 0.0,
+            },
         }
     }
 
@@ -231,14 +260,12 @@ impl GlyphAtlas {
     ) -> GlyphInfo {
         let w = image.placement.width;
         let h = image.placement.height;
-        // swash renders with Origin::BottomLeft (y-up, baseline at 0):
-        // placement.top is the ink's TOP edge ABOVE the baseline, so in the
-        // cell's y-down space the ink top sits `baseline - placement.top` px
-        // below the cell top. The old `baseline + top` pushed every bitmap
-        // below the cell bottom, so the shader coverage test always failed
-        // and all text was invisible.
-        let offset_x = image.placement.left as f32;
-        let offset_y = self.baseline - image.placement.top as f32;
+        // Cell-space offsets, y-down (see `cell_offset`).
+        let (offset_x, offset_y) = cell_offset(
+            self.baseline,
+            image.placement.left as f32,
+            image.placement.top as f32,
+        );
 
         // Advance to next row if needed
         if self.cursor_x + w > ATLAS_SIZE {
@@ -301,22 +328,8 @@ impl GlyphAtlas {
         info
     }
 
-    fn info_to_uv(&self, info: &GlyphInfo) -> (f32, f32, f32, f32) {
-        let u0 = info.x as f32 / ATLAS_SIZE as f32;
-        let v0 = info.y as f32 / ATLAS_SIZE as f32;
-        let u1 = (info.x + info.width) as f32 / ATLAS_SIZE as f32;
-        let v1 = (info.y + info.height) as f32 / ATLAS_SIZE as f32;
-        (u0, v0, u1, v1)
-    }
-
     pub(crate) fn cell_metrics(&self) -> (f32, f32) {
         (self.cell_width, self.cell_height)
-    }
-
-    fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
-        // Zero-size glyph: no ink, bg shows through (the coverage test in the
-        // shader rejects everything outside a glyph's bitmap rect).
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     }
 
     fn clear_atlas(&mut self, queue: &wgpu::Queue) {
@@ -366,5 +379,73 @@ impl GlyphAtlas {
         self.font_data = data;
         self.repack_ascii(device, queue);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swash::scale::{Render, ScaleContext, Source};
+    use swash::FontRef;
+
+    const FONT: &[u8] = include_bytes!("../DejaVuSansMono.ttf");
+
+    /// Recomputes the atlas's cell metrics exactly like `GlyphAtlas::new` does
+    /// (ascent + descent + leading, rounded up) so the test shares the atlas's
+    /// ground truth without needing a GPU.
+    fn cell_metrics(font_size: f32) -> (f32, f32) {
+        let font = FontRef::from_index(FONT, 0).unwrap();
+        let metrics = font.metrics(&[]);
+        let scale = font_size / metrics.units_per_em as f32;
+        let ascent = metrics.ascent * scale;
+        let descent = metrics.descent * scale;
+        let leading = metrics.leading * scale;
+        ((ascent + descent + leading).ceil(), ascent)
+    }
+
+    #[test]
+    fn glyph_bitmaps_fit_inside_their_cell() {
+        // Regression for the invisible-text bug: pack_glyph computed
+        // offset_y = baseline + placement.top, which put every bitmap below
+        // the cell bottom (baseline 14.5 + top 11.8 = 26.3px in a 19px cell);
+        // the shader coverage test then rejected all ink and text vanished.
+        let font_size = 14.0;
+        let (cell_height, baseline) = cell_metrics(font_size);
+        let font = FontRef::from_index(FONT, 0).unwrap();
+        let charmap = font.charmap();
+        let mut ctx = ScaleContext::new();
+        let mut scaler = ctx.builder(font).size(font_size).build();
+        for ch in ['[', 'g', '.', 'i', 'W', 'A', 'j', '×'] {
+            let img = Render::new(&[Source::Outline])
+                .format(swash::zeno::Format::Alpha)
+                .render(&mut scaler, charmap.map(ch as u32))
+                .unwrap_or_else(|| panic!("'{ch}' rasterizes"));
+            let (_, off_y) =
+                cell_offset(baseline, img.placement.left as f32, img.placement.top as f32);
+            let bottom = off_y + img.placement.height as f32;
+            assert!(
+                off_y >= 0.0,
+                "'{ch}' ink top {off_y:.1} is above the cell (baseline {baseline:.1}, top {})",
+                img.placement.top
+            );
+            assert!(
+                bottom <= cell_height,
+                "'{ch}' ink bottom {bottom:.1} exceeds cell {cell_height:.1} \
+                 (baseline {baseline:.1}, top {}, height {})",
+                img.placement.top,
+                img.placement.height
+            );
+        }
+    }
+
+    #[test]
+    fn cell_offset_flips_swash_y_up_to_cell_y_down() {
+        // swash Origin::BottomLeft: a glyph whose ink top sits above the
+        // baseline (placement.top > 0) must land BELOW the cell top in the
+        // y-down cell space.
+        let (_, baseline) = cell_metrics(14.0);
+        let (ox, oy) = cell_offset(baseline, -1.0, 11.8);
+        assert_eq!(ox, -1.0);
+        assert!((oy - (baseline - 11.8)).abs() < 1e-4);
     }
 }

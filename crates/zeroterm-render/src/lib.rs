@@ -1,5 +1,8 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
+mod cell_batch;
+mod diag;
+mod pass;
 pub mod atlas;
 pub mod renderer;
 pub mod theme;

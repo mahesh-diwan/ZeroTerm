@@ -24,7 +24,9 @@ use zeroterm_mux::split::SplitDir;
 use zeroterm_mux::tab::Tab;
 #[cfg(feature = "plugins")]
 use zeroterm_plugin::Plugin;
-use zeroterm_render::{tab_span, Renderer, Selection};
+use zeroterm_render::{Renderer, Selection};
+
+use crate::app::layout::Layout;
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
@@ -335,7 +337,7 @@ impl App {
                                 "Renderer init gave up after {} attempts; window stays dark",
                                 attempts
                             );
-                            let _ = window_clone.set_title("ZeroTerm — GPU init failed (restart)");
+                            window_clone.set_title("ZeroTerm — GPU init failed (restart)");
                             break;
                         }
                         attempts += 1;
@@ -1588,11 +1590,14 @@ impl App {
             return rects.keys().next().copied();
         }
         let window = self.window.as_ref()?;
-        let win_w = window.inner_size().width as f32;
-        let tab_h = self.tab_bar_height();
-        let content_h =
-            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        self.session.pane_at(x / win_w, (y - tab_h) / content_h)
+        let layout = self.layout()?;
+        let (nx, ny) = layout.content_normalized(
+            x,
+            y,
+            window.inner_size().width as f32,
+            window.inner_size().height as f32,
+        )?;
+        self.session.pane_at(nx, ny)
     }
 
     /// Focus-follow-on-hover: if enabled and the pointer has drifted into a
@@ -1617,141 +1622,86 @@ impl App {
         }
     }
 
-    /// Pane id of the tab under a window-space x,y (must match draw_tab_bar's
-    /// layout: sorted pane ids, starts at col 1, span = chars+2, col += span+1).
+    /// Pane id of the tab under a window-space x,y. Layout owns the strip
+    /// contract (must match draw_tab_bar: sorted ids, col 1, span = chars+2,
+    /// col += span+1) and the geometry.
     fn tab_at_point(&self, x: f32, y: f32) -> Option<usize> {
-        let tab_h = self.tab_bar_height();
-        if y < 0.0 || y >= tab_h || self.session.panes.is_empty() {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        let cell_w = renderer.cell_size()[0];
-        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
-        ids.sort();
-        let mut col = 1usize;
-        for id in ids {
-            let title = self
-                .session
-                .panes
-                .get(&id)
-                .map_or_else(String::new, |p| p.title.clone());
-            // Must match draw_tab_bar: truncated title + 2 padding cells.
-            let span = tab_span(&title, 20);
-            let start_px = col as f32 * cell_w;
-            let end_px = (col + span) as f32 * cell_w;
-            if x >= start_px && x < end_px {
-                return Some(id);
-            }
-            col += span + 1;
-        }
-        None
+        self.layout()?.tab_at(x, y, &self.sorted_tab_titles())
     }
 
     /// Tab under a window-space x,y plus whether the point is over its close
     /// button (the right padding cell of the tab span). Layout mirrors
     /// tab_at_point / draw_tab_bar so hover and click land on the same cells.
     fn tab_bar_hover(&self, x: f32, y: f32) -> Option<(usize, bool)> {
-        let tab_h = self.tab_bar_height();
-        if y < 0.0 || y >= tab_h || self.session.panes.is_empty() {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        let cell_w = renderer.cell_size()[0];
-        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
-        ids.sort();
-        let mut col = 1usize;
-        for id in ids {
-            let title = self
-                .session
-                .panes
-                .get(&id)
-                .map_or_else(String::new, |p| p.title.clone());
-            let span = tab_span(&title, 20);
-            let start_px = col as f32 * cell_w;
-            let end_px = (col + span) as f32 * cell_w;
-            if x >= start_px && x < end_px {
-                let close_start = (col + span - 1) as f32 * cell_w;
-                return Some((id, x >= close_start));
-            }
-            col += span + 1;
-        }
-        None
+        self.layout()?
+            .tab_bar_hover(x, y, &self.sorted_tab_titles())
     }
     fn divider_at_point(&self, x: f32, y: f32, tolerance: f32) -> Option<(usize, SplitDir)> {
-        if self.session.leaves().len() <= 1 || y < self.tab_bar_height() {
-            return None;
-        }
         let window = self.window.as_ref()?;
-        let win_w = window.inner_size().width as f32;
-        let tab_h = self.tab_bar_height();
-        let content_h =
-            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        for (dir, boundary, target) in self.session.dividers() {
-            let (px, py) = match dir {
-                SplitDir::Vertical => (boundary * win_w, y),
-                SplitDir::Horizontal => (x, tab_h + boundary * content_h),
-            };
-            let dx = (px - x).abs();
-            let dy = (py - y).abs();
-            let hit = match dir {
-                SplitDir::Vertical => dx <= tolerance && y >= tab_h,
-                SplitDir::Horizontal => dy <= tolerance,
-            };
-            if hit {
-                return Some((target, dir));
-            }
-        }
-        None
+        self.layout()?.divider_at(
+            x,
+            y,
+            tolerance,
+            window.inner_size().width as f32,
+            window.inner_size().height as f32,
+            self.session.leaves().len() > 1,
+            &self.session.dividers(),
+        )
     }
 
     fn screen_to_cell(&self, pane_id: usize, x: f32, y: f32) -> Option<(usize, usize)> {
-        let (Some(renderer), Some(pane)) = (&self.renderer, self.session.panes.get(&pane_id))
-        else {
+        let (Some(pane), Some(layout)) = (
+            self.session.panes.get(&pane_id),
+            self.layout(),
+        ) else {
             return None;
         };
         let rect = self.session.rects().get(&pane_id).copied()?;
         let window = self.window.as_ref()?;
         let win_w = window.inner_size().width as f32;
-        let tab_h = self.tab_bar_height();
-        let content_h =
-            (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        let (px, py, pw, ph) = (
+        let tab_h = layout.tab_h();
+        let content_h = layout.content_h(window.inner_size().height as f32);
+        let rect_px = (
             rect.0 * win_w,
             rect.1 * content_h + tab_h,
             rect.2 * win_w,
             rect.3 * content_h,
         );
-        let (lx, ly) = (x - px, y - py);
-        if lx < 0.0 || ly < 0.0 || lx >= pw || ly >= ph {
-            return None;
-        }
-        let cell_size = renderer.cell_size();
-        let cell_w = cell_size[0];
-        let cell_h = cell_size[1];
-        let screen = pane.parser.screen();
-        let buffer = screen.buffer();
-        let visible_rows = buffer.len();
-        let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
-
-        let col = (lx / cell_w).floor() as usize;
-        let row = (ly / cell_h).floor() as usize;
-
-        if row < visible_rows && col < cols {
-            let scrollback = screen.scrollback().len();
-            let total_rows = scrollback + visible_rows;
-            // scroll_offset is a single field owned by the active pane; inactive panes render at 0
-            let offset = if pane_id == self.session.active_pane {
-                self.session.scroll_offset
-            } else {
-                0
-            };
-            let end = total_rows.saturating_sub(offset);
-            let start = end.saturating_sub(visible_rows);
-            let global_row = start + row;
-            Some((global_row, col))
+        // scroll_offset is a single field owned by the active pane; inactive
+        // panes render at 0.
+        let offset = if pane_id == self.session.active_pane {
+            self.session.scroll_offset
         } else {
-            None
-        }
+            0
+        };
+        layout.screen_to_cell(x, y, rect_px, pane.parser.screen(), offset)
+    }
+
+    /// Geometry for the current window: cell size + chrome bar heights. All
+    /// hit-testing derives from this so tab/status geometry lives in one place.
+    fn layout(&self) -> Option<Layout> {
+        let renderer = self.renderer.as_ref()?;
+        Some(Layout::new(
+            renderer.cell_size(),
+            self.tab_bar_height(),
+            self.status_bar_height(),
+        ))
+    }
+
+    /// Sorted (pane id, title) pairs for tab hit-testing (mirrors draw_tab_bar).
+    fn sorted_tab_titles(&self) -> Vec<(usize, String)> {
+        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
+        ids.sort();
+        ids.into_iter()
+            .map(|id| {
+                let title = self
+                    .session
+                    .panes
+                    .get(&id)
+                    .map_or_else(String::new, |p| p.title.clone());
+                (id, title)
+            })
+            .collect()
     }
 
     fn keybindings(&self) -> KeybindingsConfig {

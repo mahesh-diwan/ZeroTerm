@@ -2,6 +2,7 @@ pub mod chrome;
 pub mod editor;
 pub mod extensions;
 pub mod input;
+pub mod layout;
 pub mod session;
 
 pub use chrome::HostPicker;
