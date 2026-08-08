@@ -1,5 +1,6 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
+pub mod atlas;
 pub mod renderer;
 pub mod theme;
 

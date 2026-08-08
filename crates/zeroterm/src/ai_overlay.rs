@@ -8,11 +8,12 @@
 #[cfg(feature = "ai")]
 use std::sync::Arc;
 
-use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
 
 #[cfg(feature = "ai")]
 use zeroterm_ai::client::{AiClient, AiError};
+
+use crate::overlay::ScreenScratch;
 
 use crate::app::block_output_text;
 
@@ -48,9 +49,8 @@ pub struct AiOverlay {
     pub state: AiState,
     /// Receiver for the in-flight request. `None` once the result is consumed.
     pub pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
-    saved_cells: Option<Vec<Vec<Cell>>>,
-    saved_top: Option<usize>,
-    saved_cursor: Option<Cursor>,
+    /// Snapshot of the covered screen region, restored on close.
+    scratch: ScreenScratch,
 }
 
 impl AiOverlay {
@@ -86,9 +86,7 @@ impl AiOverlay {
     pub fn close(&mut self) {
         self.open = false;
         self.pending = None;
-        self.saved_cells = None;
-        self.saved_top = None;
-        self.saved_cursor = None;
+        self.scratch.clear();
     }
 
     fn panel_lines(&self, rows: usize) -> Vec<String> {
@@ -157,29 +155,11 @@ impl AiOverlay {
     #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     pub fn save_screen(&mut self, screen: &Screen) {
         let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
-        let buf = screen.buffer();
-        self.saved_cells = Some(
-            (0..height)
-                .map(|i| buf.get(top + i).cloned().unwrap_or_default())
-                .collect(),
-        );
-        self.saved_top = Some(top);
-        self.saved_cursor = Some(screen.cursor());
+        self.scratch.save_region(screen, top, height);
     }
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
-        if let (Some(cells), Some(top), Some(cursor)) =
-            (&self.saved_cells, self.saved_top, &self.saved_cursor)
-        {
-            for (i, row_cells) in cells.iter().enumerate() {
-                screen.set_cells(top + i, row_cells);
-            }
-            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
-            screen.set_cursor_visible(cursor.visible);
-        }
-        self.saved_cells = None;
-        self.saved_top = None;
-        self.saved_cursor = None;
+        self.scratch.restore(screen);
     }
 }
 

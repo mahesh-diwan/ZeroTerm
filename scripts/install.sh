@@ -55,12 +55,15 @@ resolve_version() {
             | sed 's/.*"\([^"]*\)"$/\1/')"
     fi
     if [[ -z "$v" ]]; then
-        # No published release yet: use the newest tag, else main.
+        # No published release yet: pick the newest tag, comparing versions
+        # numerically so v0.10.0 beats v0.9.x regardless of GitHub's ordering.
         json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/tags?per_page=100" 2>/dev/null || true)"
         if [[ -n "$json" ]]; then
             v="$(printf '%s' "$json" \
-                | grep -o '"name"[[:space:]]*:[[:space:]]*"v[^"]*"' | head -1 \
-                | sed 's/.*"v/v/; s/"$//')"
+                | grep -o '"name"[[:space:]]*:[[:space:]]*"v[^\"]*"' \
+                | sed 's/.*"\([^"]*\)"$/\1/' \
+                | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n \
+                | tail -1)"
         fi
     fi
     if [[ -z "$v" ]]; then
@@ -333,7 +336,7 @@ HELP
                 verify_install "$bin"
                 return 0
             fi
-            warn "no release asset matches ${platform} in ${version}; building from source"
+            log "no prebuilt package for ${platform} in ${version}; building from source"
         fi
     fi
 

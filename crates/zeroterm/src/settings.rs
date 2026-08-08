@@ -4,8 +4,9 @@
 //! CSI sequences (CUP + SGR + text). Because that is destructive to the cells it
 //! overwrites, the covered region is snapshotted on open and restored on close.
 
-use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
+
+use crate::overlay::ScreenScratch;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -66,9 +67,8 @@ pub struct SettingsMenu {
     pub cursor: usize,
     /// One-shot status line shown at the bottom (e.g. export/import result).
     pub notice: Option<String>,
-    saved_cells: Option<Vec<Vec<Cell>>>,
-    saved_top: Option<usize>,
-    saved_cursor: Option<Cursor>,
+    /// Snapshot of the covered screen region, restored on close.
+    scratch: ScreenScratch,
 }
 
 impl SettingsMenu {
@@ -249,28 +249,10 @@ impl SettingsMenu {
 
     pub fn save_screen(&mut self, screen: &Screen) {
         let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
-        let buf = screen.buffer();
-        self.saved_cells = Some(
-            (0..height)
-                .map(|i| buf.get(top + i).cloned().unwrap_or_default())
-                .collect(),
-        );
-        self.saved_top = Some(top);
-        self.saved_cursor = Some(screen.cursor());
+        self.scratch.save_region(screen, top, height);
     }
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
-        if let (Some(cells), Some(top), Some(cursor)) =
-            (&self.saved_cells, self.saved_top, &self.saved_cursor)
-        {
-            for (i, row_cells) in cells.iter().enumerate() {
-                screen.set_cells(top + i, row_cells);
-            }
-            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
-            screen.set_cursor_visible(cursor.visible);
-        }
-        self.saved_cells = None;
-        self.saved_top = None;
-        self.saved_cursor = None;
+        self.scratch.restore(screen);
     }
 }

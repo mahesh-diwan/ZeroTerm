@@ -18,9 +18,8 @@ Linux), and the project is organized as a Cargo workspace of nine crates.
   experimental.
 - There is **no crates.io package, Homebrew formula, or Flathub listing yet** —
   `cargo install zeroterm`, `brew install zeroterm`, and `flatpak install …`
-  will not work today. Use the install script or build from source below.
-  Prebuilt binaries are attached to each
-  [GitHub Release](https://github.com/mahesh-diwan/ZeroTerm/releases).
+  will not work today. The one supported installation path is the install
+  script below — no AppImage/DEB/RPM/brew artifacts are published separately.
 
 ## Features
 
@@ -37,16 +36,20 @@ Linux), and the project is organized as a Cargo workspace of nine crates.
 
 ## Install
 
-### Install script (Linux / macOS)
+### Install script (Linux / macOS) — the one supported way
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mahesh-diwan/ZeroTerm/main/scripts/install.sh | bash
 ```
 
-The installer resolves the latest tagged release from the GitHub API, downloads
-the prebuilt package for your OS/architecture when one is published, and
-otherwise builds from source at that tag. Run `zeroterm upgrade` (or re-run the
-script) to update to the latest release.
+The installer resolves the **latest tagged release**, downloads a prebuilt
+package for your OS/architecture when one is published, and otherwise builds
+from source at that exact tag — so what you run always matches the tagged
+source. Re-run the same command (or `zeroterm upgrade`) to update to the latest
+release. Windows is experimental through the same script.
+
+This single curl command is the only supported installation channel: no
+AppImage/DEB/RPM/brew taps are published separately.
 
 ### Build from source
 

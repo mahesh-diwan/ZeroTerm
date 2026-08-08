@@ -6,8 +6,9 @@
 //! covered region is snapshotted on open and restored on close (same pattern
 //! as the settings overlay).
 
-use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
+
+use crate::overlay::ScreenScratch;
 
 #[derive(Default)]
 pub struct SearchState {
@@ -17,8 +18,8 @@ pub struct SearchState {
     pub matches: Vec<usize>,
     /// Index into `matches` of the currently highlighted match.
     pub current: usize,
-    saved_cells: Option<Vec<Cell>>,
-    saved_cursor: Option<Cursor>,
+    /// Snapshot of the covered (bottom) screen row, restored on close.
+    scratch: ScreenScratch,
 }
 
 impl SearchState {
@@ -119,26 +120,18 @@ impl SearchState {
 
     pub fn save_screen(&mut self, screen: &Screen) {
         let rows = screen.size().rows;
-        let buf = screen.buffer();
-        self.saved_cells = Some(buf.get(rows - 1).cloned().unwrap_or_else(Vec::new));
-        self.saved_cursor = Some(screen.cursor());
+        self.scratch.save_region(screen, rows.saturating_sub(1), 1);
     }
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
-        if let (Some(cells), Some(cursor)) = (&self.saved_cells, &self.saved_cursor) {
-            let rows = screen.size().rows;
-            screen.set_cells(rows - 1, cells);
-            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
-            screen.set_cursor_visible(cursor.visible);
-        }
-        self.saved_cells = None;
-        self.saved_cursor = None;
+        self.scratch.restore(screen);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroterm_core::cell::Cell;
     use zeroterm_core::screen::Screen;
 
     fn screen_with(lines: &[&str]) -> Screen {

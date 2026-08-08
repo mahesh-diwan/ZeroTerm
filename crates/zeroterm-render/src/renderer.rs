@@ -1,16 +1,17 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
 use bytemuck::{Pod, Zeroable};
-use std::collections::HashMap;
 use std::sync::Arc;
-use swash::scale::{Render, ScaleContext, Source};
-use swash::FontRef;
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use std::collections::HashMap;
+
 use zeroterm_core::cell::Color;
 use zeroterm_core::screen::Screen as CoreScreen;
+
+use crate::atlas::GlyphAtlas;
 
 pub type Result<T> = std::result::Result<T, RendererError>;
 
@@ -24,6 +25,13 @@ pub enum RendererError {
     NoAdapter,
     #[error("font not found: {0}")]
     FontNotFound(String),
+    /// The surface could not present a frame (occluded, timed out, OOM). The
+    /// caller must NOT treat this as success: no frame was acquired, so the
+    /// redraw loop must stay alive and retry once the surface is presentable
+    /// again. Previously this was swallowed (returning Ok), which froze the
+    /// window on whatever it last presented — often a blank frame at startup.
+    #[error("surface not presentable: {0}")]
+    Surface(wgpu::SurfaceError),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,8 +74,6 @@ pub struct TabInfo {
     pub hovered: bool,
     pub close_hovered: bool,
 }
-
-const ATLAS_SIZE: u32 = 1024;
 
 const ATTR_HAS_IMAGE: u32 = 0x400;
 const ATTR_BLOCK_DIVIDER: u32 = 0x800;
@@ -134,343 +140,6 @@ const QUAD_VERTS: [QuadVertex; 6] = [
     },
 ];
 
-#[derive(Clone, Copy)]
-struct GlyphInfo {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    /// Bitmap top-left within its cell, in pixels (raster-space offsets).
-    offset_x: f32,
-    offset_y: f32,
-}
-
-struct GlyphAtlas {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
-    glyph_cache: HashMap<u32, GlyphInfo>,
-    font_data: Vec<u8>,
-    scale_context: ScaleContext,
-    cursor_x: u32,
-    cursor_y: u32,
-    row_height: u32,
-    font_size: f32,
-    /// Baseline position within a cell (ascent, in px) — glyph bitmaps are
-    /// anchored to it via `baseline + placement.top`.
-    baseline: f32,
-    cell_width: f32,
-    cell_height: f32,
-    font_path: Option<String>,
-}
-
-impl GlyphAtlas {
-    fn new(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        font_size: f32,
-        font_path: Option<String>,
-    ) -> Result<Self> {
-        let font_data = Self::load_font(font_path.clone())?;
-
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Glyph Atlas"),
-            size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        // ponytail: no full-atlas clear. Uninitialized texels are only sampled
-        // at 0.5-texel Linear bleed into *written* glyph neighbors, never far
-        // from a glyph, so skipping the 4MB write_texture saves ~30ms of boot.
-        let mut atlas = Self {
-            texture,
-            view,
-            sampler,
-            glyph_cache: HashMap::new(),
-            font_data,
-            font_path,
-            scale_context: ScaleContext::new(),
-            cursor_x: 0,
-            cursor_y: 0,
-            row_height: 0,
-            font_size,
-            baseline: 0.0,
-            cell_width: font_size * 0.5,
-            cell_height: font_size * 1.2,
-        };
-
-        // Compute cell metrics from font
-        if let Some(font) = FontRef::from_index(&atlas.font_data, 0) {
-            let metrics = font.metrics(&[]);
-            let scale = atlas.font_size / metrics.units_per_em as f32;
-            let ascent = metrics.ascent * scale;
-            let descent = metrics.descent * scale;
-            let leading = metrics.leading * scale;
-            atlas.cell_height = (ascent + descent + leading).ceil();
-            atlas.baseline = ascent;
-            let mut scaler = atlas
-                .scale_context
-                .builder(font)
-                .size(atlas.font_size)
-                .build();
-            let charmap = font.charmap();
-            if let Some(img) = Render::new(&[Source::Outline])
-                .format(swash::zeno::Format::Alpha)
-                .render(&mut scaler, charmap.map(0x57u32))
-            {
-                atlas.cell_width = img.placement.width as f32;
-            }
-            log::info!(
-                "Cell metrics: {:.2}x{:.2} (ascent {:.2}, descent {:.2}, leading {:.2}, 'W' ink {}x{})",
-                atlas.cell_width,
-                atlas.cell_height,
-                ascent,
-                descent,
-                leading,
-                atlas.cell_width as u32,
-                atlas.cell_height as u32
-            );
-        }
-
-        // Pre-pack ASCII printable characters
-        for ch in 32u8..=126 {
-            atlas.get_or_insert_glyph(ch as char, device, queue);
-        }
-
-        Ok(atlas)
-    }
-
-    fn load_font(font_path: Option<String>) -> Result<Vec<u8>> {
-        if let Some(path) = font_path {
-            return std::fs::read(&path).map_err(|_| RendererError::FontNotFound(path));
-        }
-        let paths = [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
-            "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/MesloLGMNerdFontMono-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/GeistMonoVF.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ];
-        for path in &paths {
-            if let Ok(data) = std::fs::read(path) {
-                log::info!("Loaded font: {}", path);
-                return Ok(data);
-            }
-        }
-        log::info!("No system font found, using embedded DejaVu Sans Mono fallback");
-        Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
-    }
-
-    /// (u0, v0, u1, v1, width_px, height_px, offset_x_px, offset_y_px)
-    fn get_or_insert_glyph(
-        &mut self,
-        ch: char,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
-        let key = ch as u32;
-        if let Some(info) = self.glyph_cache.get(&key) {
-            let uv = self.info_to_uv(info);
-            return (
-                uv.0,
-                uv.1,
-                uv.2,
-                uv.3,
-                info.width as f32,
-                info.height as f32,
-                info.offset_x,
-                info.offset_y,
-            );
-        }
-
-        let font = match FontRef::from_index(&self.font_data, 0) {
-            Some(f) => f,
-            None => return self.fallback_uv(),
-        };
-
-        let charmap = font.charmap();
-        let glyph_id = charmap.map(key);
-
-        let mut scaler = self
-            .scale_context
-            .builder(font)
-            .size(self.font_size)
-            .build();
-
-        let image = Render::new(&[Source::Outline])
-            .format(swash::zeno::Format::Alpha)
-            .render(&mut scaler, glyph_id);
-
-        match image {
-            Some(img) if img.placement.width > 0 && img.placement.height > 0 => {
-                let info = self.pack_glyph(&img, device, queue);
-                self.glyph_cache.insert(key, info);
-                let uv = self.info_to_uv(&info);
-                (
-                    uv.0,
-                    uv.1,
-                    uv.2,
-                    uv.3,
-                    info.width as f32,
-                    info.height as f32,
-                    info.offset_x,
-                    info.offset_y,
-                )
-            }
-            _ => self.fallback_uv(),
-        }
-    }
-
-    fn pack_glyph(
-        &mut self,
-        image: &swash::scale::image::Image,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> GlyphInfo {
-        let w = image.placement.width;
-        let h = image.placement.height;
-        // placement.left/top position the bitmap relative to the pen origin
-        // (cell left edge at the baseline, y-down): the ink of a normal glyph
-        // starts a hair left of the cell and its top sits above the baseline.
-        let offset_x = image.placement.left as f32;
-        let offset_y = self.baseline + image.placement.top as f32;
-
-        // Advance to next row if needed
-        if self.cursor_x + w > ATLAS_SIZE {
-            self.cursor_x = 0;
-            self.cursor_y += self.row_height + 1;
-            self.row_height = 0;
-        }
-
-        // Check if we've run out of space
-        if self.cursor_y + h > ATLAS_SIZE {
-            log::warn!("Glyph atlas full, clearing");
-            self.clear_atlas(queue);
-        }
-
-        let info = GlyphInfo {
-            x: self.cursor_x,
-            y: self.cursor_y,
-            width: w,
-            height: h,
-            offset_x,
-            offset_y,
-        };
-
-        // Convert alpha mask to RGBA (white RGB, alpha from mask)
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-        for &alpha in &image.data {
-            rgba.push(255);
-            rgba.push(255);
-            rgba.push(255);
-            rgba.push(alpha);
-        }
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: self.cursor_x,
-                    y: self.cursor_y,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &rgba,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        self.cursor_x += w + 1;
-        self.row_height = self.row_height.max(h);
-
-        info
-    }
-
-    fn info_to_uv(&self, info: &GlyphInfo) -> (f32, f32, f32, f32) {
-        let u0 = info.x as f32 / ATLAS_SIZE as f32;
-        let v0 = info.y as f32 / ATLAS_SIZE as f32;
-        let u1 = (info.x + info.width) as f32 / ATLAS_SIZE as f32;
-        let v1 = (info.y + info.height) as f32 / ATLAS_SIZE as f32;
-        (u0, v0, u1, v1)
-    }
-
-    fn cell_metrics(&self) -> (f32, f32) {
-        (self.cell_width, self.cell_height)
-    }
-
-    fn fallback_uv(&self) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
-        // Zero-size glyph: no ink, bg shows through (the coverage test in the
-        // shader rejects everything outside a glyph's bitmap rect).
-        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    }
-
-    fn clear_atlas(&mut self, queue: &wgpu::Queue) {
-        let clear = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &clear,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(ATLAS_SIZE * 4),
-                rows_per_image: Some(ATLAS_SIZE),
-            },
-            wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.cursor_x = 0;
-        self.cursor_y = 0;
-        self.row_height = 0;
-        self.glyph_cache.clear();
-    }
-
-    fn repack_ascii(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        self.clear_atlas(queue);
-        for ch in 32u8..=126 {
-            self.get_or_insert_glyph(ch as char, device, queue);
-        }
-    }
-}
 
 /// Generous max rows for the scrollbar overlay storage buffer (2 col cells each).
 const SCROLLBAR_MAX_ROWS: usize = 512;
@@ -531,6 +200,15 @@ pub struct Renderer {
     blink_last_toggle: std::time::Instant,
     blink_interval: std::time::Duration,
     cursor_blink_enabled: bool,
+    /// Consecutive surface-acquire failures (see begin_frame). Reset to 0 on
+    /// every successful acquire; used to rate-limit error logs and to emit a
+    /// recovery notice so a blank-window bug is attributable from the log.
+    surface_failures: u32,
+    /// ZTDIAG=1 gate: dump every 30th presented frame to /tmp/zt-frame.ppm so
+    /// a "blank window" report can be attributed to the app's own framebuffer
+    /// vs the compositor (the window can be transparent even when the GPU
+    /// output is correct, e.g. an alpha-mode mismatch).
+    ztdiag_frames: u32,
 }
 
 impl Renderer {
@@ -679,9 +357,22 @@ impl Renderer {
             alpha_mode,
             surface_format
         );
+        if std::env::var("ZTDIAG").is_ok() {
+            eprintln!(
+                "[ZTDIAG] surface format={:?} alpha={:?} present={:?}",
+                surface_format, alpha_mode, present_mode
+            );
+            let _ = std::fs::write(
+                "/tmp/zt-frame-format.txt",
+                format!("{:?}", surface_format),
+            );
+        }
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC lets ZTDIAG=1 read the presented frame back to disk so
+            // a blank-window report is attributable to the app's framebuffer
+            // vs the compositor (see end_frame).
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -1099,6 +790,8 @@ impl Renderer {
             blink_last_toggle: std::time::Instant::now(),
             blink_interval: std::time::Duration::from_millis(530),
             cursor_blink_enabled: true,
+            surface_failures: 0,
+            ztdiag_frames: 0,
         })
     }
 
@@ -1265,7 +958,16 @@ impl Renderer {
     pub fn begin_frame(&mut self) -> Result<()> {
         let frame = loop {
             match self.surface.get_current_texture() {
-                Ok(frame) => break frame,
+                Ok(frame) => {
+                    if self.surface_failures > 0 {
+                        log::info!(
+                            "Surface recovered after {} failed acquire(s)",
+                            self.surface_failures
+                        );
+                        self.surface_failures = 0;
+                    }
+                    break frame;
+                }
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                     self.surface.configure(&self.device, &self.config);
                     // Surface was recreated; retry so a real frame is
@@ -1273,8 +975,22 @@ impl Renderer {
                     continue;
                 }
                 Err(e) => {
-                    log::warn!("Surface error: {}", e);
-                    return Ok(());
+                    self.surface_failures += 1;
+                    // Rate-limit: while the window is on another workspace the
+                    // compositor sends no frame callbacks and every blink
+                    // redraw can time out at ~2fps. Log the first couple, then
+                    // every 60th, so the log stays readable.
+                    if self.surface_failures <= 2 || self.surface_failures.is_multiple_of(60) {
+                        log::warn!(
+                            "Surface error (attempt {}): {}",
+                            self.surface_failures,
+                            e
+                        );
+                    }
+                    // Never swallow: the caller must know no frame was
+                    // acquired so it keeps the redraw loop alive and retries
+                    // once the surface is presentable again.
+                    return Err(RendererError::Surface(e));
                 }
             }
         };
@@ -1390,6 +1106,28 @@ impl Renderer {
             cols = (capacity / visible_rows.max(1)).min(cols);
         }
 
+        // [ZTDIAG] Ground-truth probe: how many ink cells the screen actually
+        // holds and what the last row says. Gates the parser screen vs. GPU
+        // presentation question for a blank-window report. Gated on ZTDIAG=1.
+        if std::env::var("ZTDIAG").is_ok() {
+            let ink: usize = buffer
+                .iter()
+                .take(visible_rows)
+                .map(|row| row.iter().filter(|c| c.ch != ' ').count())
+                .sum();
+            let last_text: String = buffer
+                .get(visible_rows.saturating_sub(1))
+                .map(|row| row.iter().take(70).map(|c| c.ch).collect())
+                .unwrap_or_default();
+            log::info!(
+                "[ZTDIAG] render_screen {}x{} ink={} last='{}'",
+                visible_rows,
+                cols,
+                ink,
+                last_text
+            );
+        }
+
         // All cells dirty every frame — GPU handles <200KB writes trivially
         self.dirty_cells.clear();
         for row in 0..visible_rows {
@@ -1464,10 +1202,98 @@ impl Renderer {
     }
 
     pub fn end_frame(&mut self) -> Result<()> {
+        // [ZTDIAG] Read the just-rendered frame back to CPU and dump it once
+        // to /tmp/zt-frame.ppm. Lets a blank-window report be attributed to
+        // the app's framebuffer (correct here => compositor/surface problem)
+        // or the renderer itself (garbage pixels => pipeline bug).
+        let mut diag: Option<(wgpu::Buffer, usize, u32, u32)> = None;
+        self.ztdiag_frames = self.ztdiag_frames.wrapping_add(1);
+        if std::env::var("ZTDIAG").is_ok() && self.ztdiag_frames % 30 == 0 {
+            if let (Some(enc), Some(frame)) = (
+                self.current_encoder.as_mut(),
+                self.current_frame.as_ref(),
+            ) {
+                let _ = std::fs::write(
+                    "/tmp/zt-frame-format.txt",
+                    format!("{:?}\n{}x{}", self.config.format, self.config.width, self.config.height),
+                );
+                let w = self.config.width;
+                let h = self.config.height;
+                if w > 0 && h > 0 {
+                    let bpr = (w as usize * 4 + 255) & !255;
+                    let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("zt-diag-readback"),
+                        size: (bpr as u64) * (h as u64),
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    enc.copy_texture_to_buffer(
+                        wgpu::ImageCopyTexture {
+                            texture: &frame.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::ImageCopyBuffer {
+                            buffer: &rb,
+                            layout: wgpu::ImageDataLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bpr as u32),
+                                rows_per_image: Some(h),
+                            },
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    diag = Some((rb, bpr, w, h));
+                }
+            }
+        }
         if let Some(encoder) = self.current_encoder.take() {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
         self.current_view = None;
+        if let Some((rb, bpr, w, h)) = diag {
+            let slice = rb.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            if rx.recv().is_ok() {
+                let data = slice.get_mapped_range();
+                let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
+                for row in 0..h as usize {
+                    let base = row * bpr;
+                    for col in 0..w as usize {
+                        let i = base + col * 4;
+                        ppm.push(data[i]);
+                        ppm.push(data[i + 1]);
+                        ppm.push(data[i + 2]);
+                    }
+                }
+                let _ = std::fs::write("/tmp/zt-frame.ppm", &ppm);
+                // Alpha histogram: a translucent surface (window.opacity < 1)
+                // composites the desktop through the terminal — the classic
+                // "stripes through the window" report. 255 everywhere means
+                // the translucency is compositor-side, not our framebuffer.
+                let mut alpha_counts: std::collections::HashMap<u8, u32> =
+                    std::collections::HashMap::new();
+                for i in (0..data.len()).step_by(4) {
+                    *alpha_counts.entry(data[i + 3]).or_insert(0) += 1;
+                }
+                let mut alphas: Vec<_> = alpha_counts.into_iter().collect();
+                alphas.sort_by(|a, b| b.1.cmp(&a.1));
+                let mut alpha_txt = String::new();
+                for (a, n) in alphas.into_iter().take(6) {
+                    alpha_txt += &format!("alpha={} count={}\n", a, n);
+                }
+                let _ = std::fs::write("/tmp/zt-frame-alpha.txt", &alpha_txt);
+            }
+        }
         if let Some(frame) = self.current_frame.take() {
             frame.present();
         }
@@ -1759,9 +1585,11 @@ impl Renderer {
         Ok(())
     }
 
+
     /// Right-edge scrollbar overlay over the active pane. `fraction` is
-    /// scroll_offset/max_scroll_offset, so 0.0 = at the bottom (thumb at the
-    /// bottom). Track fills the pane's 2 rightmost cells, thumb is accent.
+    /// scroll_offset/max_scroll_offset (0.0 = oldest, 1.0 = newest) and
+    /// `thumb_fraction` is visible_rows / total_rows; the thumb height is
+    /// proportional to it so deep scrollback shows a small thumb.
     pub fn draw_scrollbar(
         &mut self,
         vx: f32,
@@ -1769,6 +1597,7 @@ impl Renderer {
         vw: f32,
         vh: f32,
         fraction: f32,
+        thumb_fraction: f32,
     ) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
             return Ok(());
@@ -1780,17 +1609,21 @@ impl Renderer {
             t.surface.b as f32 / 255.0,
             1.0,
         ];
+        // Muted thumb: accent blended toward the surface so the bar reads as
+        // a scrollbar, not a bright accent strip (a full-height bright-blue
+        // bar on the right edge was the top complaint from screenshots).
         let thumb: [f32; 4] = [
-            t.accent.r as f32 / 255.0,
-            t.accent.g as f32 / 255.0,
-            t.accent.b as f32 / 255.0,
+            (t.accent.r as f32 * 0.45 + t.surface.r as f32 * 0.55) / 255.0,
+            (t.accent.g as f32 * 0.45 + t.surface.g as f32 * 0.55) / 255.0,
+            (t.accent.b as f32 * 0.45 + t.surface.b as f32 * 0.55) / 255.0,
             1.0,
         ];
         let space = self
             .glyph_atlas
             .get_or_insert_glyph(' ', &self.device, &self.queue);
 
-        let bar_x = vx + vw - 2.0 * self.cell_width;
+        // 1 cell wide (was 2): reads as a slim scrollbar instead of a block.
+        let bar_x = vx + vw - self.cell_width;
         let bar_y = vy + self.padding[0];
         let bar_h = (vh - self.padding[0] - self.padding[2]).max(0.0);
         // Clamp to the storage buffer's row capacity (never overrun).
@@ -1798,8 +1631,7 @@ impl Renderer {
         if rows == 0 {
             return Ok(());
         }
-        let batch_len = 2 * rows;
-        let mut batch = vec![CellData::zeroed(); batch_len];
+        let mut batch = vec![CellData::zeroed(); rows];
         for cell in &mut batch {
             cell.bg = track;
             cell.glyph_uv_min = [space.0, space.1];
@@ -1807,23 +1639,13 @@ impl Renderer {
             cell.glyph_size = [space.4, space.5];
         }
 
-        let visible_fraction = 1.0 - fraction;
-        let mut thumb_rows = (rows as f32 * visible_fraction)
-            .ceil()
-            .max(2.0)
-            .min(rows as f32) as usize;
-        if thumb_rows < 1 {
-            thumb_rows = 1;
-        }
-        let max_start = rows.saturating_sub(thumb_rows);
-        let tstart =
-            (rows as f32 - thumb_rows as f32 - fraction * (rows as f32 - thumb_rows as f32))
-                .round()
-                .clamp(0.0, max_start as f32) as usize;
-        for r in tstart..(tstart + thumb_rows).min(rows) {
-            let base = 2 * r;
-            batch[base].bg = thumb;
-            batch[base + 1].bg = thumb;
+        // Thumb height follows the viewport's share of total content, and its
+        // position follows the scroll fraction (0 = oldest, 1 = newest). The
+        // old math was inverted: at the top of scrollback it sized the thumb
+        // to the full track, painting a solid accent bar down the right edge.
+        let (tstart, thumb_rows) = scrollbar_thumb(rows, thumb_fraction, fraction);
+        for row in batch.iter_mut().take((tstart + thumb_rows).min(rows)).skip(tstart) {
+            row.bg = thumb;
         }
 
         self.queue
@@ -1832,7 +1654,7 @@ impl Renderer {
             screen_size: [self.size.width as f32, self.size.height as f32],
             cell_size: [self.cell_width, self.cell_height],
             viewport_origin: [bar_x, bar_y],
-            cols: 2,
+            cols: 1,
             rows: rows as u32,
             premultiply: self.premultiply_output,
             _pad: 0,
@@ -1866,7 +1688,7 @@ impl Renderer {
         render_pass.set_bind_group(0, &self.scrollbar_bind_group, &[]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..batch_len as u32);
+        render_pass.draw(0..6, 0..rows as u32);
         Ok(())
     }
 
@@ -2057,14 +1879,31 @@ impl Renderer {
         Ok(())
     }
 
+/// Theme background in LINEAR color space, for wgpu `LoadOp::Clear`.
+/// Theme colors are sRGB byte values (`0..255`) and the Bgra8UnormSrgb
+/// surface re-encodes anything cleared with them, so passing the sRGB
+/// floats straight through yields a lighter shade than the background quad
+/// (faint horizontal bands between cell rows on screen). Clearing with the
+/// true linear value makes every region identical to the painted background.
+fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
+    let srgb = |c: u8| f64::from(c) / 255.0;
+    let to_linear = |c: f64| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    [
+        to_linear(srgb(theme.bg.r)),
+        to_linear(srgb(theme.bg.g)),
+        to_linear(srgb(theme.bg.b)),
+    ]
+}
+
     pub fn reload_config(&mut self, config: &zeroterm_config::Config) {
         self.theme = crate::theme::Theme::by_name(&config.colors.theme);
-        let (r, g, b) = (
-            self.theme.bg.r as f64 / 255.0,
-            self.theme.bg.g as f64 / 255.0,
-            self.theme.bg.b as f64 / 255.0,
-        );
-        self.clear_color = [r, g, b];
+        self.clear_color = Self::theme_linear_bg(&self.theme);
         // Go through set_opacity (not a field write): crossing the 1.0 boundary
         // must reconfigure the surface alpha mode, or window.opacity < 1.0
         // keeps rendering on an Opaque surface and never shows the desktop.
@@ -2094,12 +1933,7 @@ impl Renderer {
 
     pub fn set_theme(&mut self, name: &str) {
         self.theme = crate::theme::Theme::by_name(name);
-        let (r, g, b) = (
-            self.theme.bg.r as f64 / 255.0,
-            self.theme.bg.g as f64 / 255.0,
-            self.theme.bg.b as f64 / 255.0,
-        );
-        self.clear_color = [r, g, b];
+        self.clear_color = Self::theme_linear_bg(&self.theme);
     }
 
     pub fn set_opacity(&mut self, opacity: f64) {
@@ -2241,30 +2075,35 @@ impl Renderer {
     /// Progress the cursor blink phase if its interval has elapsed and return
     /// how long until the next toggle, or `None` when blinking is disabled.
     /// The caller should request a redraw whenever this returns `Some`.
-    pub fn cursor_blink_tick(&mut self) -> Option<std::time::Duration> {
+    /// Returns the instant the cursor should next toggle visibility. Call
+    /// once per frame; when that instant has passed, toggles the blink phase
+    /// and returns now. The caller redraws at that cadence (2/s) and sleeps
+    /// until it — this replaces a busy loop that requested a redraw on every
+    /// vsync (60fps of full-cell GPU writes while idle).
+    pub fn blink_next(&mut self) -> std::time::Instant {
         if !self.cursor_blink_enabled {
-            if self.cursor_blink {
-                self.cursor_blink = false;
-            }
             self.blink_visible = true;
-            return None;
+            self.cursor_blink = false;
+            // Far future: no blink-driven redraws; events alone drive frames.
+            return std::time::Instant::now() + std::time::Duration::from_secs(3600);
         }
         let elapsed = self.blink_last_toggle.elapsed();
         if elapsed >= self.blink_interval {
             self.blink_visible = !self.blink_visible;
             self.cursor_blink = self.blink_visible;
             self.blink_last_toggle = std::time::Instant::now();
-            Some(self.blink_interval)
+            std::time::Instant::now()
         } else {
-            Some(self.blink_interval.saturating_sub(elapsed))
+            self.blink_last_toggle + self.blink_interval
         }
     }
 
     pub fn reload_font(&mut self, font_path: Option<String>) {
-        self.glyph_atlas.font_path = font_path.clone();
-        if let Ok(data) = GlyphAtlas::load_font(font_path) {
-            self.glyph_atlas.font_data = data;
-            self.glyph_atlas.repack_ascii(&self.device, &self.queue);
+        if let Err(e) = self
+            .glyph_atlas
+            .reload_font(&self.device, &self.queue, font_path)
+        {
+            log::warn!("Failed to reload font: {}", e);
         }
     }
 
@@ -2279,6 +2118,25 @@ impl Renderer {
             _ => None,
         }
     }
+}
+
+/// Compute the scrollbar thumb geometry: returns `(start_row, row_count)`
+/// for a track of `rows` rows. `thumb_fraction` is the viewport's share of
+/// the total content (visible_rows / total_rows); the thumb height is
+/// proportional to it, so deep scrollback shows a small thumb. `fraction`
+/// is the scroll position (0 = oldest content, 1 = newest); the thumb
+/// starts at `fraction * (rows - thumb_rows)` so it tracks the scrollbar.
+fn scrollbar_thumb(rows: usize, thumb_fraction: f32, fraction: f32) -> (usize, usize) {
+    if rows == 0 {
+        return (0, 0);
+    }
+    let fraction = fraction.clamp(0.0, 1.0);
+    let min_thumb = rows.min(2);
+    let thumb_rows = ((rows as f32 * thumb_fraction.clamp(0.0, 1.0)).round() as usize)
+        .clamp(min_thumb, rows);
+    let max_start = rows.saturating_sub(thumb_rows);
+    let tstart = ((fraction * max_start as f32).round() as usize).min(max_start);
+    (tstart, thumb_rows)
 }
 
 fn truncate_title(title: &str, max: usize) -> String {
@@ -2366,5 +2224,50 @@ mod tests {
         assert_eq!(tab_span(&"x".repeat(30), 20), 23);
         // Empty title: 2 padding cells only.
         assert_eq!(tab_span("", 20), 2);
+    }
+
+    #[test]
+    fn scrollbar_thumb_never_paints_a_full_height_bar_at_the_top() {
+        // 40-row track, viewport is the whole content (thumb_fraction 1.0).
+        // A full-height thumb is the old inverted-math bug; height must be
+        // viewport-proportional, clamped to the track.
+        let (start, len) = scrollbar_thumb(40, 1.0, 0.0);
+        assert_eq!(start, 0);
+        assert_eq!(len, 40);
+
+        // Deep scrollback: viewport is 1/4 of content -> thumb 1/4 of track,
+        // positioned at the top when at the oldest content (fraction 0.0).
+        let (start, len) = scrollbar_thumb(40, 0.25, 0.0);
+        assert_eq!(len, 10);
+        assert_eq!(start, 0);
+
+        // Same deep scrollback, scrolled to the newest content (fraction 1.0)
+        // -> thumb at the bottom of the track.
+        let (start, len) = scrollbar_thumb(40, 0.25, 1.0);
+        assert_eq!(len, 10);
+        assert_eq!(start, 30);
+
+        // Mid-scroll: thumb starts partway down, never overflowing the track.
+        let (start, len) = scrollbar_thumb(40, 0.25, 0.5);
+        assert_eq!(len, 10);
+        assert_eq!(start, 15);
+
+        // Tiny thumb is clamped to a minimum of 2 rows so it stays visible.
+        let (start, len) = scrollbar_thumb(40, 0.001, 0.0);
+        assert_eq!(len, 2);
+        assert_eq!(start, 0);
+
+        // Track too small to hold a 2-row min: full track is fine.
+        let (start, len) = scrollbar_thumb(1, 0.25, 0.0);
+        assert_eq!(len, 1);
+        assert_eq!(start, 0);
+
+        // Fraction and thumb_fraction are clamped; no panics, no overrun.
+        let (start, len) = scrollbar_thumb(10, 2.0, 2.0);
+        assert_eq!(len, 10);
+        assert_eq!(start, 0);
+        let (start, len) = scrollbar_thumb(10, 0.5, -1.0);
+        assert_eq!(len, 5);
+        assert_eq!(start, 0);
     }
 }

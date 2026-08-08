@@ -24,20 +24,20 @@ use zeroterm_mux::split::SplitDir;
 use zeroterm_mux::tab::Tab;
 #[cfg(feature = "plugins")]
 use zeroterm_plugin::Plugin;
-use zeroterm_render::{tab_span, Renderer, Selection, TabInfo};
+use zeroterm_render::{tab_span, Renderer, Selection};
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
 #[cfg(feature = "ai")]
-use crate::ai_overlay::{completion_tab, explain_prompt, suggest_context, AiKind, AiState};
-use crate::ai_overlay::{AiCompletion, AiOverlay};
+use crate::ai_overlay::{explain_prompt, suggest_context, AiKind, AiState};
+use crate::ai_overlay::AiOverlay;
 #[cfg(feature = "plugins")]
 use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
 use crate::app::{
-    block_output_text, word_left, word_right, EditMode, EditingState, HostPicker, PaneState,
-    PromptHistory, PtyCommand, SessionManager,
+    block_output_text, word_left, word_right, EditAction, HostPicker, LineEditor, PaneState,
+    PtyCommand, SessionManager,
 };
 use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
@@ -45,6 +45,8 @@ use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
 
 mod ai_overlay;
 mod app;
+mod frame;
+mod overlay;
 mod search;
 // Retained for the legacy session.json format + its tests; session layout
 // persistence now lives in zeroterm-mux (SessionLayout) via save_session_layout().
@@ -93,7 +95,6 @@ struct App {
     sync_daemon: Option<SyncDaemon>,
     config_changed: Arc<AtomicBool>,
     config: Option<Config>,
-    config_rx: Option<std::sync::mpsc::Receiver<Config>>,
     opacity: f64,
     sync_tick: u32,
     cursor_visible: bool,
@@ -108,16 +109,19 @@ struct App {
     event_proxy: Option<EventLoopProxy<()>>,
     #[cfg(feature = "plugins")]
     plugins: HashMap<String, Plugin>,
-    // Local line editor for the active pane. Some while editing: printable +
-    // editing keys are intercepted (not forwarded to the shell) and accumulated
-    // into the buffer until Enter submits the line or Esc discards it.
-    editing: Option<EditingState>,
-    // Per-session command history for the line editor (Up/Down recall). Pushed
-    // on Enter-submit; navigation state resets when editing starts.
-    history: PromptHistory,
-    // Pending AI line completion for the active editor (Tab). None when AI is
-    // disabled or no request is in flight / staged.
-    ai_completion: Option<AiCompletion>,
+    // Local line editor for the active pane (Alt+E): owns the editing buffer,
+    // history navigation and AI completion. While active, keys are intercepted
+    // here (not forwarded to the shell) and printable text is absorbed into
+    // the buffer until Enter submits the line or Esc discards it.
+    editor: LineEditor,
+    // When render() failed to present a frame (surface timeout / occluded),
+    // schedules a bounded retry so the window repaints as soon as the surface
+    // is presentable again instead of staying on a blank/stale frame.
+    render_failed_at: Option<std::time::Instant>,
+    /// Last renderer-init poll tick; the renderer=None redraw loop polls at
+    /// ~20 Hz instead of a tight spin (a spin starves the background
+    /// renderer-init thread and delays the first frame by minutes on iGPUs).
+    last_init_poll: std::time::Instant,
 }
 
 // Split an accumulated pixel-wheel scroll into whole lines to apply (up/down)
@@ -170,7 +174,6 @@ impl App {
             sync_daemon: None,
             config_changed: Arc::new(AtomicBool::new(false)),
             config: None,
-            config_rx: None,
             opacity: 1.0,
             sync_tick: 0,
             cursor_visible: true,
@@ -185,9 +188,9 @@ impl App {
             event_proxy: None,
             #[cfg(feature = "plugins")]
             plugins: HashMap::new(),
-            editing: None,
-            history: PromptHistory::new(),
-            ai_completion: None,
+            editor: LineEditor::new(),
+            render_failed_at: None,
+            last_init_poll: std::time::Instant::now(),
         }
     }
 
@@ -223,8 +226,14 @@ impl App {
         zt("init start");
         info!("Initializing ZeroTerm");
 
-        let (config, config_rx) = Config::load_async(None);
-        zt("config load_async returned");
+        // Load config synchronously at boot. The old async seam
+        // (Config::load_async + config_rx + a try_recv in render()) let the
+        // FIRST shell spawn with defaults — the user's [shell] program/args
+        // never reached pane 0 (observed live: `bash -l` ran despite
+        // args=[]). A config read is a fast file parse + lua eval; the
+        // background thread bought nothing but the race.
+        let config = Config::load(None).unwrap_or_default();
+        zt("config loaded");
         info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
         let window_attrs = WindowAttributes::default()
@@ -256,21 +265,97 @@ impl App {
         let opacity = self.opacity;
         let font_path = config.font.path.clone();
         std::thread::spawn(move || {
-            zt("renderer thread start");
-            // scale_factor is read on the background thread (window is Arc)
-            // so glyphs rasterize at physical px on HiDPI displays too.
-            match pollster::block_on(Renderer::new(
+            zt("renderer supervisor start");
+            // Supervisor for the deferred GPU init. Renderer::new can stall for
+            // minutes (observed: adapter/device creation blocking on a loaded
+            // Intel iGPU, blocked on a kernel futex with zero CPU) or panic
+            // (wgpu treats validation errors as fatal). A stuck attempt must
+            // not keep the window dark forever, so after a 10s timeout a
+            // FRESH attempt starts with its own Instance — a new driver
+            // round-trip usually completes even when the previous one
+            // deadlocked (fresh attempts on this machine finish in ~0.4s).
+            // First success wins; late successes pile up in render_rx and are
+            // dropped. Abandoned stuck threads are leaked in that pathological
+            // case only, and a device that never presents is inert.
+            fn spawn_attempt(
+                window: std::sync::Arc<winit::window::Window>,
+                font_size: f32,
+                opacity: f64,
+                font_path: Option<String>,
+                render_tx: mpsc::Sender<zeroterm_render::Renderer>,
+                done_tx: mpsc::Sender<bool>,
+            ) {
+                std::thread::spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pollster::block_on(Renderer::new(window, font_size, opacity, font_path))
+                    }));
+                    match result {
+                        Ok(Ok(r)) => {
+                            let _ = render_tx.send(r);
+                            let _ = done_tx.send(true);
+                        }
+                        Ok(Err(e)) => {
+                            error!("Renderer init failed: {}", e);
+                            let _ = done_tx.send(false);
+                        }
+                        Err(p) => {
+                            let msg = p
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| p.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".into());
+                            error!("Renderer init panicked: {}", msg);
+                            let _ = done_tx.send(false);
+                        }
+                    }
+                });
+            }
+
+            let (done_tx, done_rx) = mpsc::channel::<bool>();
+            let mut attempts = 1u32;
+            let give_up_at = std::time::Instant::now() + std::time::Duration::from_secs(90);
+            spawn_attempt(
                 window_clone.clone(),
                 font_size,
                 opacity,
-                font_path,
-            )) {
-                Ok(renderer) => {
-                    let _ = render_tx.send(renderer);
+                font_path.clone(),
+                render_tx.clone(),
+                done_tx.clone(),
+            );
+            loop {
+                match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(true) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        warn!("Renderer init supervisor channel closed; giving up");
+                        break;
+                    }
+                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if std::time::Instant::now() >= give_up_at || attempts >= 9 {
+                            error!(
+                                "Renderer init gave up after {} attempts; window stays dark",
+                                attempts
+                            );
+                            let _ = window_clone.set_title("ZeroTerm — GPU init failed (restart)");
+                            break;
+                        }
+                        attempts += 1;
+                        warn!(
+                            "Renderer init attempt {}: previous attempt not done in 10s, \
+                             starting a fresh one",
+                            attempts
+                        );
+                        spawn_attempt(
+                            window_clone.clone(),
+                            font_size,
+                            opacity,
+                            font_path.clone(),
+                            render_tx.clone(),
+                            done_tx.clone(),
+                        );
+                    }
                 }
-                Err(e) => error!("Renderer init failed: {}", e),
             }
-            zt("renderer thread done");
+            zt("renderer supervisor done");
         });
         self.renderer_rx = Some(render_rx);
 
@@ -373,7 +458,7 @@ impl App {
             if let Some(split) = saved.split {
                 // Saved leaf ids are positions into `saved.panes`; remap them
                 // onto the freshly assigned ids so the tree survives the id reset.
-                self.session.split_root = SessionLayout::remap_split(&split, &restored_ids);
+                self.session.set_tree(SessionLayout::remap_split(&split, &restored_ids));
                 if saved.active_pane < restored_ids.len() {
                     self.session.active_pane = restored_ids[saved.active_pane];
                     self.session.scroll_offset = 0;
@@ -383,7 +468,8 @@ impl App {
 
         #[cfg(feature = "ai")]
         {
-            self.ai_client = ai_client;
+            self.ai_client = ai_client.clone();
+            self.editor.set_ai_client(ai_client);
         }
         #[cfg(feature = "sync")]
         {
@@ -395,7 +481,6 @@ impl App {
         }
 
         self.config = Some(config);
-        self.config_rx = Some(config_rx);
 
         let ctx = self.settings_ctx();
         self.settings.refresh(&ctx);
@@ -467,7 +552,7 @@ impl App {
                 .position(|&i| i == self.session.active_pane)
                 .unwrap_or(0),
             panes,
-            split: Some(self.session.split_root.clone()),
+            split: Some(self.session.tree().clone()),
         };
         if let Err(e) = Session::new(0, layout).save(&path) {
             error!("Failed to save session layout: {}", e);
@@ -589,10 +674,9 @@ impl App {
         if let Some(pane) = self.session.panes.remove(&id) {
             let _ = pane.pty_tx.send(PtyCommand::Kill);
         }
-        self.session.split_root.remove_leaf(id);
-        // remove_leaf leaves the tree pointing at the removed pane when it was
-        // the tree's only leaf; rebuild so rendering never dereferences a dead id.
-        self.session.reconcile_tree();
+        // Removes the leaf AND reconciles: the tree never keeps a dead id,
+        // so rendering never dereferences a removed pane.
+        self.session.remove_pane_from_tree(id);
         self.session.tabs.retain(|t| t.id != id);
         if self.session.floating == Some(id) {
             self.session.floating = None;
@@ -600,7 +684,7 @@ impl App {
         if was_active {
             let first = *self.session.panes.keys().next().unwrap_or(&0);
             self.session.active_pane = first;
-            self.editing = None;
+            self.editor.cancel();
             self.session.scroll_offset = 0;
         }
         self.hovered_tab = None;
@@ -618,27 +702,14 @@ impl App {
             // Dock: re-insert at first remaining tree leaf.
             // ponytail: original slot lost (insert_leaf only splits a parent) — root-ish
             // placement is the accepted ceiling.
-            self.session.floating = None;
-            if !self.session.split_root.leaves().contains(&active) {
-                let parent = *self.session.split_root.leaves().first().unwrap_or(&active);
-                self.session
-                    .split_root
-                    .insert_leaf(active, SplitDir::Vertical, parent, 0.5);
-            }
+            self.session.dock_pane(active);
             self.resize_panes_to_rects();
         } else {
             // Dock whatever was floating (one float at a time), then float active.
             if let Some(prev) = self.session.floating.take() {
-                if !self.session.split_root.leaves().contains(&prev) {
-                    let parent = *self.session.split_root.leaves().first().unwrap_or(&prev);
-                    self.session
-                        .split_root
-                        .insert_leaf(prev, SplitDir::Vertical, parent, 0.5);
-                }
+                self.session.dock_pane(prev);
             }
-            if self.session.split_root.leaves().len() > 1 {
-                self.session.split_root.remove_leaf(active);
-                self.session.floating = Some(active);
+            if self.session.float_pane(active) {
                 self.resize_panes_to_rects();
             } else {
                 // ponytail: last visible pane stays in tree AND floats (overlay wins when
@@ -688,7 +759,7 @@ impl App {
     }
 
     fn compute_split_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
-        self.session.compute_split_rects()
+        self.session.rects()
     }
 
     fn focus_adjacent_pane(&mut self, dir: KeyCode) {
@@ -941,15 +1012,13 @@ impl App {
             warn!("Pane {} process exited", id);
             if self.session.panes.len() > 1 {
                 self.session.panes.remove(id);
-                self.session.split_root.remove_leaf(*id);
+                self.session.remove_pane_from_tree(*id);
                 if self.session.active_pane == *id {
                     self.session.active_pane = *self.session.panes.keys().next().unwrap_or(&0);
-                    self.editing = None;
+                    self.editor.cancel();
                 }
             }
         }
-        // Keep the tree in sync after any pane removal (see close_tab).
-        self.session.reconcile_tree();
         self.resize_panes_to_rects();
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {
@@ -1008,7 +1077,47 @@ impl App {
         self.apply_config_to_renderer();
     }
 
+    /// [ZTDIAG] Ground-truth screen probe: emits one line per render pass so
+    /// a blank window can be attributed to an empty parser screen vs. a
+    /// presentation failure. Gated on ZTDIAG=1 (see render()).
+    fn ztdiag_screen(&self, label: &str) {
+        let ready = self.renderer.is_some();
+        let Some(pane) = self.session.active_pane() else {
+            eprintln!("[ZTDIAG] {} renderer={} NO_ACTIVE_PANE", label, ready);
+            return;
+        };
+        let screen = pane.parser.screen();
+        let buffer = screen.buffer();
+        let rows = buffer.len();
+        let cols = buffer.first().map_or(0, |r| r.len());
+        let mut ink = 0usize;
+        let mut last_text = String::new();
+        for row in buffer {
+            let text: String = row.iter().map(|c| c.ch).collect();
+            let trimmed = text.trim_end();
+            if !trimmed.is_empty() {
+                ink += trimmed.chars().count();
+                last_text = text;
+            }
+        }
+        eprintln!(
+            "[ZTDIAG] {} renderer={} {}x{} ink={} scrollback={} cursor=({},{}) last='{}'",
+            label,
+            ready,
+            cols,
+            rows,
+            ink,
+            screen.scrollback().len(),
+            screen.cursor().row,
+            screen.cursor().col,
+            last_text.chars().take(70).collect::<String>()
+        );
+    }
+
     fn render(&mut self) -> Result<()> {
+        if std::env::var("ZTDIAG").is_ok() {
+            self.ztdiag_screen("render");
+        }
         self.check_renderer_ready();
         if self.config_changed.load(Ordering::SeqCst) {
             self.config_changed.store(false, Ordering::SeqCst);
@@ -1016,13 +1125,6 @@ impl App {
                 config.reload(None).ok();
             }
             self.apply_config_to_renderer();
-        }
-        if let Some(rx) = &self.config_rx {
-            if let Ok(hydrated) = rx.try_recv() {
-                self.config_rx = None;
-                self.config = Some(hydrated);
-                self.apply_config_to_renderer();
-            }
         }
         if self.settings.open {
             self.draw_settings_overlay();
@@ -1035,17 +1137,13 @@ impl App {
         }
         // Collect an in-flight AI line completion only while the editor is
         // open; closing the editor discards the pending request.
-        if self.editing.is_some() {
-            if let Some(comp) = self.ai_completion.as_mut() {
-                comp.poll();
-            }
-        } else {
-            self.ai_completion = None;
+        if self.editor.is_active() {
+            self.editor.poll_ai();
         }
         // Ghost completion string for the editor title; computed before the
-        // renderer borrow below (completion_ghost borrows all of self).
-        let edit_ghost = if self.editing.is_some() {
-            self.completion_ghost()
+        // renderer borrow below.
+        let edit_ghost = if self.editor.is_active() {
+            self.editor.completion_ghost()
         } else {
             None
         };
@@ -1066,47 +1164,37 @@ impl App {
         // shell title. Editing is bound to the active pane and cleared on any
         // pane switch, so this is only ever the pane that owns the editor. A
         // pending AI completion appends a ghost suffix after the cursor marker.
-        let edit_display = self.editing.as_ref().map(|e| match &edit_ghost {
-            Some(ghost) => e.display_with_suffix(ghost),
-            None => e.display(),
-        });
-        let tab_infos: Vec<TabInfo> = tab_ids
-            .iter()
-            .map(|&id| TabInfo {
-                title: match &edit_display {
-                    Some(d) if id == self.session.active_pane => d.clone(),
-                    _ => self
-                        .session
-                        .panes
-                        .get(&id)
-                        .map_or_else(String::new, |p| p.title.clone()),
-                },
-                active: id == self.session.active_pane,
-                hovered: self.hovered_tab == Some(id),
-                close_hovered: self.hovered_tab_close,
-            })
-            .collect();
+        let edit_display = self
+            .editor
+            .is_active()
+            .then(|| self.editor.display_line(edit_ghost.as_deref()));
+        let tab_infos = frame::tab_infos(
+            &tab_ids,
+            self.session.active_pane,
+            |id| {
+                self.session
+                    .panes
+                    .get(&id)
+                    .map_or_else(String::new, |p| p.title.clone())
+            },
+            edit_display.as_deref(),
+            self.hovered_tab,
+            self.hovered_tab_close,
+        );
 
-        let rects = self.session.split_root.compute_rects();
+        let rects = self.session.rects();
         // Active pane's window-space viewport rect (for the scrollbar overlay).
         // Mirrors the pane-rect transform in render_screen calls below.
-        let (scroll_px, scroll_py, scroll_pw, scroll_ph) =
-            if self.session.floating == Some(self.session.active_pane) {
-                let fw = win_size.width as f32 * 0.7;
-                let fx = (win_size.width as f32 - fw) / 2.0;
-                (fx, tab_h + content_h * 0.15, fw, content_h * 0.7)
-            } else {
-                let (nx, ny, nw, nh) = rects
-                    .get(&self.session.active_pane)
-                    .copied()
-                    .unwrap_or((0.0, 0.0, 1.0, 1.0));
-                (
-                    nx * win_size.width as f32,
-                    ny * content_h + tab_h,
-                    nw * win_size.width as f32,
-                    nh * content_h,
-                )
-            };
+        let (scroll_px, scroll_py, scroll_pw, scroll_ph) = frame::active_pane_rect(
+            self.session.floating == Some(self.session.active_pane),
+            win_size.width as f32,
+            tab_h,
+            content_h,
+            rects
+                .get(&self.session.active_pane)
+                .copied()
+                .unwrap_or((0.0, 0.0, 1.0, 1.0)),
+        );
         if rects.len() <= 1 {
             // Render the tree leaf, not the floating pane (it renders last as overlay).
             let tree_id = rects
@@ -1153,9 +1241,13 @@ impl App {
         // Floating pane overlay — drawn last, on top of all split leaves.
         if let Some(id) = self.session.floating {
             if let Some(pane) = self.session.panes.get(&id) {
-                let fw = win_size.width as f32 * 0.7;
-                let fx = (win_size.width as f32 - fw) / 2.0;
-                let fy = tab_h + content_h * 0.15;
+                let (fx, fy, _fw, _fh) = frame::active_pane_rect(
+                    true,
+                    win_size.width as f32,
+                    tab_h,
+                    content_h,
+                    (0.0, 0.0, 1.0, 1.0),
+                );
                 let is_active = id == self.session.active_pane;
                 renderer.set_viewport(fx, fy);
                 renderer.render_screen(
@@ -1177,21 +1269,29 @@ impl App {
             .session
             .active_pane()
             .map_or_else(String::new, |p| p.title.clone());
-        let right = if max_scroll > 0 {
-            format!(
-                "[{}%]",
-                (100 * self.session.scroll_offset)
-                    .checked_div(max_scroll)
-                    .unwrap_or(0)
-            )
-        } else {
-            String::new()
-        };
-        renderer.draw_status_bar(&active_title, &right)?;
+        renderer.draw_status_bar(
+            &active_title,
+            &frame::status_right(max_scroll, self.session.scroll_offset),
+        )?;
 
-        if max_scroll > 0 {
-            let fraction = self.session.scroll_offset as f32 / max_scroll as f32;
-            renderer.draw_scrollbar(scroll_px, scroll_py, scroll_pw, scroll_ph, fraction)?;
+        // Policy: hide the bar while scrollback is trivial; a near-full-height
+        // thumb reads as a colored strip on the right edge (the old bug
+        // painted it solid accent blue at full height).
+        if let Some((fraction, thumb_fraction)) = frame::scrollbar_policy(
+            max_scroll,
+            self.session.scroll_offset,
+            self.session
+                .active_pane()
+                .map_or(1, |p| p.parser.screen().size().rows),
+        ) {
+            renderer.draw_scrollbar(
+                scroll_px,
+                scroll_py,
+                scroll_pw,
+                scroll_ph,
+                fraction,
+                thumb_fraction,
+            )?;
         }
 
         renderer.end_frame()?;
@@ -1207,7 +1307,7 @@ impl App {
         let tab_h = renderer.cell_size()[1];
         let status_h = renderer.status_bar_height();
         let content_h = (size.height as f32 - tab_h - status_h).max(0.0);
-        let rects = self.session.split_root.compute_rects();
+        let rects = self.session.rects();
         for (&id, &(_, _, nw, nh)) in &rects {
             let cols = renderer.cols_for(nw * size.width as f32);
             let rows = renderer.rows_for(nh * content_h);
@@ -1231,8 +1331,8 @@ impl App {
         if self.settings.open || self.host_picker.open {
             return false;
         }
-        if self.editing.is_some() {
-            self.editing = None;
+        if self.editor.is_active() {
+            self.editor.cancel();
         } else {
             self.start_editing();
         }
@@ -1242,107 +1342,22 @@ impl App {
         true
     }
 
+    /// Begin an editing session seeded with the shell's current line. The
+    /// shell's readline line is killed (Ctrl+U) so the local buffer is the
+    /// sole source of truth on Enter; Ctrl+U is a no-op on an empty line.
     fn start_editing(&mut self) {
-        // Seed the buffer with whatever the shell's readline already holds so
-        // the line under the cursor appears in the editor. The shell line is
-        // killed (Ctrl+U) so the local buffer is the sole source of truth on
-        // Enter; Ctrl+U is a no-op on an empty line.
         let line = self.current_line();
-        let state = EditingState::from_line(&line);
-        if !state.is_empty() {
+        self.editor.start(&line);
+        if !self.editor.is_empty() {
             self.write_pty(b"\x15");
         }
-        // Fresh editing session: Up starts at the most recent history entry.
-        self.history.reset();
         self.session.scroll_offset = 0;
-        self.editing = Some(state);
     }
 
-    /// Handle a key while the line editor is active. Returns true when the key
-    /// was consumed by the editor (never forwarded to the shell).
-    fn handle_editing_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> bool {
-        // Ctrl+Shift+M toggles the editing mode (Emacs <-> Vi). Free in the
-        // global key dispatch, so it is safe to claim while editing.
-        if ctrl && shift && !alt && code == KeyCode::KeyM {
-            self.editing.as_mut().unwrap().toggle_mode();
-            return true;
-        }
-        // Vi-normal mode interprets its own key subset; Vi-insert and Emacs
-        // behave alike below.
-        if self.editing.as_ref().unwrap().mode() == EditMode::Vi
-            && self.editing.as_ref().unwrap().vi_normal()
-        {
-            return self.handle_editing_key_vi(code, ctrl, alt, shift);
-        }
-        match code {
-            KeyCode::Enter => self.submit_editor(),
-            KeyCode::Escape => {
-                // In Vi-insert mode Esc returns to normal instead of canceling.
-                let is_vi = self.editing.as_ref().unwrap().mode() == EditMode::Vi;
-                if is_vi {
-                    self.editing.as_mut().unwrap().set_vi_normal(true);
-                } else {
-                    self.editing = None;
-                }
-            }
-            // Word moves and deletes (readline M-b / M-f / M-d / M-backspace).
-            KeyCode::KeyB if alt && !ctrl => self.editing.as_mut().unwrap().word_left(),
-            KeyCode::KeyF if alt && !ctrl => self.editing.as_mut().unwrap().word_right(),
-            KeyCode::KeyD if alt && !ctrl => self.editing.as_mut().unwrap().delete_word_after(),
-            KeyCode::Backspace if alt && !ctrl => {
-                self.editing.as_mut().unwrap().delete_word_before()
-            }
-            // Cursor / kill chords (readline C-a / C-e / C-k).
-            KeyCode::KeyA if ctrl && !alt => self.editing.as_mut().unwrap().home(),
-            KeyCode::KeyE if ctrl && !alt => self.editing.as_mut().unwrap().end(),
-            KeyCode::KeyK if ctrl && !alt => {
-                let state = self.editing.as_mut().unwrap();
-                state.truncate_to_cursor();
-            }
-            // Cancel like Esc, discarding the buffer without touching the shell.
-            KeyCode::KeyC if ctrl && !alt => self.editing = None,
-            KeyCode::KeyD if ctrl && !alt => {
-                if self.editing.as_ref().unwrap().is_empty() {
-                    self.editing = None;
-                } else {
-                    return true;
-                }
-            }
-            KeyCode::Backspace => self.editing.as_mut().unwrap().backspace(),
-            KeyCode::Delete => self.editing.as_mut().unwrap().delete(),
-            KeyCode::ArrowLeft => self.editing.as_mut().unwrap().left(),
-            KeyCode::ArrowRight => self.editing.as_mut().unwrap().right(),
-            KeyCode::Home => self.editing.as_mut().unwrap().home(),
-            KeyCode::End => self.editing.as_mut().unwrap().end(),
-            // History navigation (readline Up/Down, C-p / C-n). Recalled lines
-            // replace the buffer; the in-progress line is stashed on the first
-            // Up so Down can return to it.
-            KeyCode::ArrowUp => self.history_prev(),
-            KeyCode::KeyP if ctrl && !alt => self.history_prev(),
-            KeyCode::ArrowDown => self.history_next(),
-            KeyCode::KeyN if ctrl && !alt => self.history_next(),
-            KeyCode::Tab => self.editor_tab(),
-            // Let Alt+E fall through so the same key exits edit mode.
-            KeyCode::KeyE if alt && !ctrl => return false,
-            // Swallow other ctrl/alt chords; plain keys fall through to the
-            // text-input path which inserts them into the buffer.
-            _ if ctrl || alt => return true,
-            _ => return false,
-        }
-        true
-    }
-
-    /// Submit the editor buffer to the shell and push it to history. Wraps
-    /// the line in bracketed paste so readline inserts it literally; falls
-    /// back to raw bytes when the shell never enabled it. An empty buffer
-    /// submits a bare newline. Shared by Emacs-Enter and Vi-Enter.
-    fn submit_editor(&mut self) {
-        let state = self
-            .editing
-            .take()
-            .expect("caller guards editing.is_some()");
-        let line = state.line();
-        self.history.push(&line);
+    /// Execute the shell side of an editor submit: wrap the line in bracketed
+    /// paste so readline inserts it literally, falling back to raw bytes when
+    /// the shell never enabled it. An empty buffer submits a bare newline.
+    fn submit_editor_line(&mut self, line: &str) {
         let bracketed = self
             .session
             .active_pane()
@@ -1354,127 +1369,6 @@ impl App {
         data.extend_from_slice(line.as_bytes());
         data.extend_from_slice(if bracketed { b"\x1b[201~\r\n" } else { b"\r\n" });
         self.write_pty(&data);
-    }
-
-    /// Handle a key while Vi-normal mode is active (mode()==Vi &&
-    /// vi_normal()): a minimal motion/delete subset — `i`/`a` enter insert,
-    /// `h`/`l`/arrows move, `0`/`$` move to line start/end, `x` deletes the
-    /// char at the cursor, `d d` clears the line. Everything is consumed so
-    /// plain keys never leak into the buffer; Enter still submits and Ctrl+C
-    /// still cancels.
-    fn handle_editing_key_vi(&mut self, code: KeyCode, ctrl: bool, alt: bool, shift: bool) -> bool {
-        if code == KeyCode::KeyC && ctrl && !alt {
-            self.editing = None;
-            return true;
-        }
-        if ctrl || alt {
-            return true;
-        }
-        // `d` is a two-key prefix: `d d` clears the line.
-        if self.editing.as_ref().unwrap().vi_d_pending() {
-            self.editing.as_mut().unwrap().set_vi_d_pending(false);
-            if code == KeyCode::KeyD {
-                self.editing.as_mut().unwrap().set_line("");
-                return true;
-            }
-        }
-        // Self-borrowing actions first (history / submit) so no editor borrow
-        // is held across them.
-        match code {
-            KeyCode::Enter => {
-                self.submit_editor();
-                return true;
-            }
-            KeyCode::ArrowUp => {
-                self.history_prev();
-                return true;
-            }
-            KeyCode::ArrowDown => {
-                self.history_next();
-                return true;
-            }
-            _ => {}
-        }
-        let state = self.editing.as_mut().unwrap();
-        match code {
-            KeyCode::Escape => {} // already in normal mode
-            KeyCode::KeyI => state.set_vi_normal(false),
-            KeyCode::KeyA => {
-                state.right();
-                state.set_vi_normal(false);
-            }
-            KeyCode::KeyH | KeyCode::ArrowLeft => state.left(),
-            KeyCode::KeyL | KeyCode::ArrowRight => state.right(),
-            KeyCode::Digit0 => state.home(),
-            // `$` is Shift+4 on the US physical layout (no KeyCode::Dollar).
-            KeyCode::Digit4 if shift => state.end(),
-            KeyCode::KeyX => state.delete(),
-            KeyCode::KeyD => state.set_vi_d_pending(true),
-            KeyCode::Backspace => state.backspace(),
-            _ => {}
-        }
-        true
-    }
-
-    /// Recall the previous history entry into the editor buffer. A stale AI
-    /// ghost is dropped since the buffer changed.
-    fn history_prev(&mut self) {
-        let current = self.editing.as_ref().unwrap().buffer_text();
-        if let Some(line) = self.history.prev(&current) {
-            self.editing.as_mut().unwrap().set_line(&line);
-            self.ai_completion = None;
-        }
-    }
-
-    /// Recall the next (more recent) history entry, or restore the stashed
-    /// in-progress line at the top.
-    fn history_next(&mut self) {
-        if let Some(line) = self.history.next() {
-            self.editing.as_mut().unwrap().set_line(&line);
-            self.ai_completion = None;
-        }
-    }
-
-    /// Tab in the line editor. Accepts a staged AI completion when one is
-    /// ready; otherwise, with AI configured and idle, fires a new completion
-    /// request for the current buffer; otherwise inserts a literal tab.
-    fn editor_tab(&mut self) {
-        #[cfg(feature = "ai")]
-        {
-            if let Some(suffix) = completion_tab(self.ai_completion.as_ref()) {
-                self.editing.as_mut().unwrap().accept_suffix(&suffix);
-                self.ai_completion = None;
-                return;
-            }
-            let idle = match self.ai_completion.as_ref() {
-                Some(c) => c.pending.is_none(),
-                None => true,
-            };
-            if idle {
-                if let Some(client) = self.ai_client.clone() {
-                    let buffer = self.editing.as_ref().unwrap().buffer_text();
-                    let comp = self.ai_completion.get_or_insert_with(AiCompletion::default);
-                    comp.request(client, buffer);
-                    return;
-                }
-            }
-        }
-        self.editing.as_mut().unwrap().insert('\t');
-    }
-
-    /// Ghost text appended after the edit cursor in the tab title: the staged
-    /// suffix once a completion result lands, or a "completing…" indicator
-    /// while the request is in flight. Non-ai builds always have no completion,
-    /// so this yields None.
-    fn completion_ghost(&self) -> Option<String> {
-        let comp = self.ai_completion.as_ref()?;
-        if comp.pending.is_some() {
-            Some(" completing\u{2026} ".to_string())
-        } else if comp.ready() {
-            Some(comp.text.clone())
-        } else {
-            None
-        }
     }
 
     /// Text of the line the cursor sits on, up to the cursor column.
@@ -1689,7 +1583,7 @@ impl App {
     /// Single-pane shortcut keeps the historical "any pixel -> the one pane"
     /// answer (even over the bars) so cursor/mouse-tracking stays unchanged.
     fn pane_at_point(&self, x: f32, y: f32) -> Option<usize> {
-        let rects = self.session.split_root.compute_rects();
+        let rects = self.session.rects();
         if rects.len() <= 1 {
             return rects.keys().next().copied();
         }
@@ -1698,9 +1592,7 @@ impl App {
         let tab_h = self.tab_bar_height();
         let content_h =
             (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        self.session
-            .split_root
-            .pane_at(x / win_w, (y - tab_h) / content_h)
+        self.session.pane_at(x / win_w, (y - tab_h) / content_h)
     }
 
     /// Focus-follow-on-hover: if enabled and the pointer has drifted into a
@@ -1718,7 +1610,7 @@ impl App {
         }
         let id = hovered.unwrap();
         self.session.active_pane = id;
-        self.editing = None;
+        self.editor.cancel();
         self.session.scroll_offset = 0;
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -1786,7 +1678,7 @@ impl App {
         None
     }
     fn divider_at_point(&self, x: f32, y: f32, tolerance: f32) -> Option<(usize, SplitDir)> {
-        if self.session.split_root.leaves().len() <= 1 || y < self.tab_bar_height() {
+        if self.session.leaves().len() <= 1 || y < self.tab_bar_height() {
             return None;
         }
         let window = self.window.as_ref()?;
@@ -1794,7 +1686,7 @@ impl App {
         let tab_h = self.tab_bar_height();
         let content_h =
             (window.inner_size().height as f32 - tab_h - self.status_bar_height()).max(0.0);
-        for (dir, boundary, target) in self.session.split_root.dividers() {
+        for (dir, boundary, target) in self.session.dividers() {
             let (px, py) = match dir {
                 SplitDir::Vertical => (boundary * win_w, y),
                 SplitDir::Horizontal => (x, tab_h + boundary * content_h),
@@ -1817,12 +1709,7 @@ impl App {
         else {
             return None;
         };
-        let rect = self
-            .session
-            .split_root
-            .compute_rects()
-            .get(&pane_id)
-            .copied()?;
+        let rect = self.session.rects().get(&pane_id).copied()?;
         let window = self.window.as_ref()?;
         let win_w = window.inner_size().width as f32;
         let tab_h = self.tab_bar_height();
@@ -1966,7 +1853,7 @@ impl App {
         // Click focuses the clicked pane so selection renders/copies against its screen.
         if pane_id != self.session.active_pane {
             self.session.active_pane = pane_id;
-            self.editing = None;
+            self.editor.cancel();
             self.session.scroll_offset = 0;
         }
         if let Some((row, col)) = self.screen_to_cell(pane_id, x, y) {
@@ -2228,6 +2115,34 @@ impl App {
 }
 
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Re-arm a redraw whenever a WaitUntil deadline has passed. Without
+        // this the event loop sleeps through every blink / animation /
+        // init-poll deadline: the cursor freezes, repaints stop, and before
+        // the renderer arrives check_renderer_ready() is never polled again
+        // (the window stays dark even after init completes).
+        if self.renderer.is_none() {
+            let every = std::time::Duration::from_millis(50);
+            if self.last_init_poll.elapsed() >= every {
+                self.last_init_poll = std::time::Instant::now();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_init_poll + every));
+            return;
+        }
+        if let Some(renderer) = &mut self.renderer {
+            let next = renderer.blink_next();
+            if next <= std::time::Instant::now() {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             if let Err(e) = self.init(event_loop) {
@@ -2257,6 +2172,25 @@ impl ApplicationHandler for App {
                     renderer.resize(size.width, size.height);
                 }
                 self.resize_panes_to_rects();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(focused) => {
+                // A window that was unfocused / on another workspace can come
+                // back holding a stale (or blank) frame if the compositor
+                // dropped its frame-callback stream; force a repaint on focus.
+                if focused {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::Occluded(_) => {
+                // Wayland/X11: the occlusion transition is exactly when the
+                // compositor may stop/start delivering frame callbacks. A
+                // repaint on every occlusion change keeps the window from
+                // freezing on its last (possibly empty) frame.
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -2330,13 +2264,23 @@ impl ApplicationHandler for App {
                         // Local line editor: while active, editing keys are
                         // intercepted here and printable text is absorbed in
                         // the text-input path below — nothing reaches the pty.
-                        if self.editing.is_some()
-                            && self.handle_editing_key(*code, ctrl, shift, alt)
-                        {
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
+                        if self.editor.is_active() {
+                            match self.editor.handle(*code, ctrl, shift, alt) {
+                                EditAction::Pass => {}
+                                EditAction::Submit(line) => {
+                                    self.submit_editor_line(&line);
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                    return;
+                                }
+                                EditAction::Handled => {
+                                    if let Some(window) = &self.window {
+                                        window.request_redraw();
+                                    }
+                                    return;
+                                }
                             }
-                            return;
                         }
                         // Alt+E toggles the line editor. Alt is a prefix winit
                         // reports with every Escape-prefixed chord, so this is
@@ -2666,10 +2610,8 @@ impl ApplicationHandler for App {
                 });
                 if let Some(text) = &text {
                     if !text.is_empty() && !ctrl && !alt {
-                        if let Some(state) = self.editing.as_mut() {
-                            for c in text.chars() {
-                                state.insert(c);
-                            }
+                        if self.editor.is_active() {
+                            self.editor.insert_text(text);
                             if let Some(window) = &self.window {
                                 window.request_redraw();
                             }
@@ -2692,6 +2634,20 @@ impl ApplicationHandler for App {
 
                 if let Err(e) = self.render() {
                     error!("Render error: {}", e);
+                    // A failed acquire (occluded surface, frame timeout) must
+                    // not dead-end rendering: retry on a short interval so the
+                    // window repaints as soon as the surface is presentable.
+                    self.render_failed_at = Some(std::time::Instant::now());
+                } else {
+                    self.render_failed_at = None;
+                }
+                if let Some(failed_at) = self.render_failed_at {
+                    if failed_at.elapsed() > std::time::Duration::from_millis(100) {
+                        self.render_failed_at = None;
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    }
                 }
                 if let Some(delay) = self.renderer.as_mut().and_then(|r| r.next_frame_delay()) {
                     self.last_anim_frame = std::time::Instant::now() + delay;
@@ -2700,18 +2656,31 @@ impl ApplicationHandler for App {
                     }
                 } else if self.renderer.is_none() {
                     // Renderer still initializing on the background thread —
-                    // keep polling until check_renderer_ready() picks it up.
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                    // poll at ~20 Hz instead of a tight spin. A busy loop here
+                    // pegs a CPU core and starves the init thread, delaying the
+                    // first frame by minutes on loaded iGPUs (observed: window
+                    // stayed dark ~2 min under load, then init finished in
+                    // 400 ms once the machine went idle).
+                    let every = std::time::Duration::from_millis(50);
+                    if self.last_init_poll.elapsed() >= every {
+                        self.last_init_poll = std::time::Instant::now();
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
                     }
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_init_poll + every));
                 }
-                if self
-                    .renderer
-                    .as_mut()
-                    .is_some_and(|r| r.cursor_blink_tick().is_some())
-                {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
+                // Cursor blink drives redraws at the blink cadence (~2/s),
+                // not every vsync: redraw when the phase just toggled, else
+                // sleep the event loop until the next toggle instant.
+                let blink_next = self.renderer.as_mut().map(|r| r.blink_next());
+                if let Some(next) = blink_next {
+                    if next <= std::time::Instant::now() {
+                        if let Some(window) = &self.window {
+                            window.request_redraw();
+                        }
+                    } else {
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
                     }
                 }
             }
@@ -2743,7 +2712,6 @@ impl ApplicationHandler for App {
                     // Find this target's current divider to resize against its real boundary.
                     let found = self
                         .session
-                        .split_root
                         .dividers()
                         .into_iter()
                         .find(|(_, _, t)| *t == target);
@@ -2752,7 +2720,7 @@ impl ApplicationHandler for App {
                             SplitDir::Vertical => dx / win_w,
                             SplitDir::Horizontal => dy / content_h,
                         };
-                        self.session.split_root.resize_leaf(target, boundary, delta);
+                        self.session.resize_divider(target, boundary, delta);
                     }
                     self.session.divider_anchor = (x, y);
                     self.resize_panes_to_rects();
@@ -2805,7 +2773,7 @@ impl ApplicationHandler for App {
                     if let Some(pane_id) = self.tab_at_point(x, y) {
                         if pane_id != self.session.active_pane {
                             self.session.active_pane = pane_id;
-                            self.editing = None;
+                            self.editor.cancel();
                             self.session.scroll_offset = 0;
                         }
                         self.end_selection();
@@ -2890,7 +2858,7 @@ impl ApplicationHandler for App {
                 if let Some(id) = self.pane_at_point(x, y) {
                     if id != self.session.active_pane {
                         self.session.active_pane = id;
-                        self.editing = None;
+                        self.editor.cancel();
                         self.session.scroll_offset = 0;
                         self.scroll_fraction = 0.0;
                     }
@@ -2999,6 +2967,7 @@ fn upgrade() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::input::EditMode;
 
     #[test]
     fn split_scroll_fraction_keeps_sub_line_remainder() {
@@ -3026,16 +2995,22 @@ mod tests {
 
     #[test]
     fn editing_readline_bindings() {
-        // Ctrl+K deletes to end of buffer, Ctrl+C cancels editing (App-level).
+        // Ctrl+K deletes to end of buffer, Ctrl+C cancels editing.
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("hello world"));
-        app.editing.as_mut().unwrap().home();
-        app.editing.as_mut().unwrap().word_right();
-        assert!(app.handle_editing_key(KeyCode::KeyK, true, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "hello");
-        assert!(app.editing.is_some());
-        assert!(app.handle_editing_key(KeyCode::KeyC, true, false, false));
-        assert!(app.editing.is_none());
+        app.editor.start("hello world");
+        app.editor.state.as_mut().unwrap().home();
+        app.editor.state.as_mut().unwrap().word_right();
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyK, true, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "hello");
+        assert!(app.editor.is_active());
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyC, true, false, false),
+            EditAction::Handled
+        );
+        assert!(!app.editor.is_active());
     }
 
     #[test]
@@ -3055,29 +3030,50 @@ mod tests {
     #[test]
     fn editing_history_up_down_recalls_lines() {
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line(""));
-        app.history.push("echo one");
-        app.history.push("echo two");
+        app.editor.history.push("echo one");
+        app.editor.history.push("echo two");
+        app.editor.start("");
         // Up recalls the most recent entry; the in-progress line is stashed.
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
-        // Down walks forward again.
-        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
-        // Ctrl+P / Ctrl+N are the readline chords for Up / Down.
-        assert!(app.handle_editing_key(KeyCode::KeyP, true, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "echo one");
-        assert!(app.handle_editing_key(KeyCode::KeyN, true, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "echo two");
-        // Up then Enter submits the recalled line into history.
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
-        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
-        assert!(app.editing.is_none());
-        assert_eq!(app.history.len(), 3);
         assert_eq!(
-            app.history.prev(""),
+            app.editor.handle(KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "echo two");
+        assert_eq!(
+            app.editor.handle(KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "echo one");
+        // Down walks forward again.
+        assert_eq!(
+            app.editor.handle(KeyCode::ArrowDown, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "echo two");
+        // Ctrl+P / Ctrl+N are the readline chords for Up / Down.
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyP, true, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "echo one");
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyN, true, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "echo two");
+        // Up then Enter submits the recalled line into history.
+        assert_eq!(
+            app.editor.handle(KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
+        assert!(matches!(
+            app.editor.handle(KeyCode::Enter, false, false, false),
+            EditAction::Submit(_)
+        ));
+        assert!(!app.editor.is_active());
+        assert_eq!(app.editor.history.len(), 3);
+        assert_eq!(
+            app.editor.history.prev(""),
             Some("echo one".to_string()),
             "recalled submission must be the newest entry"
         );
@@ -3086,21 +3082,30 @@ mod tests {
     #[test]
     fn editing_history_enter_dedupes_last_entry() {
         let mut app = App::new();
-        app.history.push("ls");
-        app.history.push("cd /tmp");
-        app.editing = Some(EditingState::from_line("cd /tmp"));
-        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
-        assert_eq!(app.history.len(), 2, "repeat of last entry must be a no-op");
+        app.editor.history.push("ls");
+        app.editor.history.push("cd /tmp");
+        app.editor.start("cd /tmp");
+        assert!(matches!(
+            app.editor.handle(KeyCode::Enter, false, false, false),
+            EditAction::Submit(_)
+        ));
+        assert_eq!(app.editor.history.len(), 2, "repeat of last entry must be a no-op");
     }
 
     #[test]
     fn editing_history_empty_noop() {
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("ls"));
-        assert!(app.handle_editing_key(KeyCode::ArrowUp, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
-        assert!(app.handle_editing_key(KeyCode::ArrowDown, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "ls");
+        app.editor.start("ls");
+        assert_eq!(
+            app.editor.handle(KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "ls");
+        assert_eq!(
+            app.editor.handle(KeyCode::ArrowDown, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "ls");
     }
 
     #[test]
@@ -3108,106 +3113,163 @@ mod tests {
         // No AI client (App::new) and no staged/requested completion: Tab must
         // fall back to inserting a literal tab, never a panic or a no-op.
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("ab"));
-        app.editing.as_mut().unwrap().home();
-        assert!(app.handle_editing_key(KeyCode::Tab, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "\tab");
-        assert!(app.ai_completion.is_none());
+        app.editor.start("ab");
+        app.editor.state.as_mut().unwrap().home();
+        assert_eq!(
+            app.editor.handle(KeyCode::Tab, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "\tab");
+        assert!(app.editor.ai_completion.is_none());
     }
 
     #[test]
     fn vi_toggle_mode_and_normal_subset() {
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line(""));
+        app.editor.start("");
         // Ctrl+Shift+M toggles Emacs -> Vi (normal mode) -> Emacs.
-        assert!(app.handle_editing_key(KeyCode::KeyM, true, true, false));
-        assert_eq!(app.editing.as_ref().unwrap().mode(), EditMode::Vi);
-        assert!(app.editing.as_ref().unwrap().vi_normal());
-        assert!(app.handle_editing_key(KeyCode::KeyM, true, true, false));
-        assert_eq!(app.editing.as_ref().unwrap().mode(), EditMode::Emacs);
-        assert!(!app.editing.as_ref().unwrap().vi_normal());
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyM, true, true, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.mode(), EditMode::Vi);
+        assert!(app.editor.vi_normal());
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyM, true, true, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.mode(), EditMode::Emacs);
+        assert!(!app.editor.vi_normal());
     }
 
     #[test]
     fn vi_normal_motions_and_insert() {
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("ab\ncd"));
-        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
-                                                     // `h` / `l` move the cursor; letters in normal mode are swallowed.
-        assert!(app.handle_editing_key(KeyCode::KeyH, false, false, false));
-        assert!(app.handle_editing_key(KeyCode::KeyQ, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\ncd");
+        app.editor.start("ab\ncd");
+        app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
+        // `h` / `l` move the cursor; letters in normal mode are swallowed.
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyH, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyQ, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "ab\ncd");
         // `0` -> start of the current line (revealed by inserting in insert mode).
-        assert!(app.handle_editing_key(KeyCode::Digit0, false, false, false));
-        app.editing.as_mut().unwrap().set_vi_normal(false);
-        app.editing.as_mut().unwrap().insert('X');
-        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\nXcd");
+        assert_eq!(
+            app.editor.handle(KeyCode::Digit0, false, false, false),
+            EditAction::Handled
+        );
+        app.editor.state.as_mut().unwrap().set_vi_normal(false);
+        app.editor.state.as_mut().unwrap().insert('X');
+        assert_eq!(app.editor.line(), "ab\nXcd");
         // `$` (Shift+4) -> end of the current line.
-        app.editing.as_mut().unwrap().set_vi_normal(true);
-        app.editing.as_mut().unwrap().set_line("xy\nzw");
-        app.editing.as_mut().unwrap().home();
-        assert!(app.handle_editing_key(KeyCode::Digit4, false, true, false));
-        app.editing.as_mut().unwrap().set_vi_normal(false);
-        app.editing.as_mut().unwrap().insert('Y');
-        assert_eq!(app.editing.as_ref().unwrap().line(), "xy\nzwY");
+        app.editor.state.as_mut().unwrap().set_vi_normal(true);
+        app.editor.state.as_mut().unwrap().set_line("xy\nzw");
+        app.editor.state.as_mut().unwrap().home();
+        assert_eq!(
+            app.editor.handle(KeyCode::Digit4, false, true, false),
+            EditAction::Handled
+        );
+        app.editor.state.as_mut().unwrap().set_vi_normal(false);
+        app.editor.state.as_mut().unwrap().insert('Y');
+        assert_eq!(app.editor.line(), "xy\nzwY");
         // `x` deletes the char at the cursor.
-        app.editing.as_mut().unwrap().set_vi_normal(true);
-        app.editing.as_mut().unwrap().set_line("ab\ncd");
-        assert!(app.handle_editing_key(KeyCode::KeyH, false, false, false));
-        assert!(app.handle_editing_key(KeyCode::KeyX, false, false, false));
-        assert_eq!(app.editing.as_ref().unwrap().line(), "ab\nc");
+        app.editor.state.as_mut().unwrap().set_vi_normal(true);
+        app.editor.state.as_mut().unwrap().set_line("ab\ncd");
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyH, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyX, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(app.editor.line(), "ab\nc");
         // `dd` clears the line.
-        assert!(app.handle_editing_key(KeyCode::KeyD, false, false, false));
-        assert!(app.handle_editing_key(KeyCode::KeyD, false, false, false));
-        assert!(app.editing.as_ref().unwrap().is_empty());
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyD, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyD, false, false, false),
+            EditAction::Handled
+        );
+        assert!(app.editor.is_empty());
         // `i` enters insert mode; a plain key now lands in the buffer.
-        assert!(app.handle_editing_key(KeyCode::KeyI, false, false, false));
-        assert!(!app.editing.as_ref().unwrap().vi_normal());
-        app.editing.as_mut().unwrap().insert('H');
-        assert_eq!(app.editing.as_ref().unwrap().line(), "H");
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyI, false, false, false),
+            EditAction::Handled
+        );
+        assert!(!app.editor.vi_normal());
+        app.editor.state.as_mut().unwrap().insert('H');
+        assert_eq!(app.editor.line(), "H");
         // Esc returns to normal mode; the editor stays open.
-        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
-        assert!(app.editing.as_ref().unwrap().vi_normal());
+        assert_eq!(
+            app.editor.handle(KeyCode::Escape, false, false, false),
+            EditAction::Handled
+        );
+        assert!(app.editor.vi_normal());
         // `a` appends after the cursor: home, then a, then type.
-        app.editing.as_mut().unwrap().set_vi_normal(true);
-        app.editing.as_mut().unwrap().set_line("ab");
-        app.editing.as_mut().unwrap().home();
-        assert!(app.handle_editing_key(KeyCode::KeyA, false, false, false));
-        app.editing.as_mut().unwrap().insert('Z');
-        assert_eq!(app.editing.as_ref().unwrap().line(), "aZb");
+        app.editor.state.as_mut().unwrap().set_vi_normal(true);
+        app.editor.state.as_mut().unwrap().set_line("ab");
+        app.editor.state.as_mut().unwrap().home();
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyA, false, false, false),
+            EditAction::Handled
+        );
+        app.editor.state.as_mut().unwrap().insert('Z');
+        assert_eq!(app.editor.line(), "aZb");
     }
 
     #[test]
     fn vi_normal_enter_submits_and_ctrl_c_cancels() {
         let mut app = App::new();
-        app.history.push("cmd");
-        app.editing = Some(EditingState::from_line("run"));
-        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
-        assert!(app.handle_editing_key(KeyCode::Enter, false, false, false));
-        assert!(app.editing.is_none(), "Enter submits in Vi-normal too");
-        assert_eq!(app.history.len(), 2);
+        app.editor.history.push("cmd");
+        app.editor.start("run");
+        app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
+        assert!(matches!(
+            app.editor.handle(KeyCode::Enter, false, false, false),
+            EditAction::Submit(_)
+        ));
+        assert!(!app.editor.is_active(), "Enter submits in Vi-normal too");
+        assert_eq!(app.editor.history.len(), 2);
 
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("run"));
-        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
-        assert!(app.handle_editing_key(KeyCode::KeyC, true, false, false));
-        assert!(app.editing.is_none(), "Ctrl+C cancels in Vi-normal");
+        app.editor.start("run");
+        app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyC, true, false, false),
+            EditAction::Handled
+        );
+        assert!(!app.editor.is_active(), "Ctrl+C cancels in Vi-normal");
     }
 
     #[test]
     fn vi_escape_returns_to_normal_not_cancel() {
         let mut app = App::new();
-        app.editing = Some(EditingState::from_line("ab"));
-        app.editing.as_mut().unwrap().toggle_mode(); // Vi, normal
-                                                     // Into insert, then Esc back to normal; editor stays open.
-        assert!(app.handle_editing_key(KeyCode::KeyI, false, false, false));
-        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
-        assert!(app.editing.is_some());
-        assert!(app.editing.as_ref().unwrap().vi_normal());
+        app.editor.start("ab");
+        app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
+        // Into insert, then Esc back to normal; editor stays open.
+        assert_eq!(
+            app.editor.handle(KeyCode::KeyI, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            app.editor.handle(KeyCode::Escape, false, false, false),
+            EditAction::Handled
+        );
+        assert!(app.editor.is_active());
+        assert!(app.editor.vi_normal());
         // Emacs mode still cancels on Esc.
-        app.editing.as_mut().unwrap().toggle_mode(); // back to Emacs
-        assert!(app.handle_editing_key(KeyCode::Escape, false, false, false));
-        assert!(app.editing.is_none());
+        app.editor.state.as_mut().unwrap().toggle_mode(); // back to Emacs
+        assert_eq!(
+            app.editor.handle(KeyCode::Escape, false, false, false),
+            EditAction::Handled
+        );
+        assert!(!app.editor.is_active());
     }
 
     #[test]

@@ -1,5 +1,6 @@
-use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
+
+use crate::overlay::ScreenScratch;
 
 /// SSH host picker overlay, drawn into the active pane like the settings menu.
 /// Destructive to covered cells, so the region is snapshotted on open and
@@ -8,9 +9,8 @@ pub struct HostPicker {
     pub open: bool,
     aliases: Vec<String>,
     cursor: usize,
-    saved_cells: Option<Vec<Vec<Cell>>>,
-    saved_top: Option<usize>,
-    saved_cursor: Option<Cursor>,
+    /// Snapshot of the covered screen region, restored on close.
+    scratch: ScreenScratch,
 }
 
 impl HostPicker {
@@ -19,9 +19,7 @@ impl HostPicker {
             open: false,
             aliases: Vec::new(),
             cursor: 0,
-            saved_cells: None,
-            saved_top: None,
-            saved_cursor: None,
+            scratch: ScreenScratch::default(),
         }
     }
 
@@ -112,28 +110,10 @@ impl HostPicker {
     #[cfg(all(unix, feature = "ssh"))]
     pub fn save_screen(&mut self, screen: &Screen) {
         let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
-        let buf = screen.buffer();
-        self.saved_cells = Some(
-            (0..height)
-                .map(|i| buf.get(top + i).cloned().unwrap_or_default())
-                .collect(),
-        );
-        self.saved_top = Some(top);
-        self.saved_cursor = Some(screen.cursor());
+        self.scratch.save_region(screen, top, height);
     }
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
-        if let (Some(cells), Some(top), Some(cursor)) =
-            (&self.saved_cells, self.saved_top, &self.saved_cursor)
-        {
-            for (i, row_cells) in cells.iter().enumerate() {
-                screen.set_cells(top + i, row_cells);
-            }
-            screen.cursor_pos(cursor.row + 1, cursor.col + 1);
-            screen.set_cursor_visible(cursor.visible);
-        }
-        self.saved_cells = None;
-        self.saved_top = None;
-        self.saved_cursor = None;
+        self.scratch.restore(screen);
     }
 }

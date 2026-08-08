@@ -272,13 +272,21 @@ pub fn spawn_ssh_process(
 /// navigation logic lives here; anything that needs the renderer/window
 /// (redraws, hit-testing, resize math) stays in `App` and delegates to a
 /// `SessionManager` method.
+///
+/// The split tree is PRIVATE: `App` may only reshape it through the ops below
+/// (`split_active`, `dock_pane`, `float_pane`, `remove_pane_from_tree`, …),
+/// each of which reconciles the tree against the live pane map before
+/// returning. Direct field mutation from the app is what let a stale tree
+/// blank the window (the old `reconcile_tree` repair pass was bolted on after
+/// the fact); with a closed surface the tree↔panes invariant holds by
+/// construction.
 pub struct SessionManager {
     pub panes: HashMap<usize, PaneState>,
     pub active_pane: usize,
     pub next_pane_id: usize,
     pub tabs: Vec<Tab>,
     // ponytail: per-pane scroll kept as single field, inactive panes render at offset 0
-    pub split_root: SplitNode,
+    split_root: SplitNode,
     // ponytail: no mouse hit-testing on the overlay rect; keyboard focus only
     pub floating: Option<usize>,
     // Split divider drag: Some(target) = dragging the divider whose first leaf
@@ -327,8 +335,39 @@ impl SessionManager {
         keys
     }
 
-    pub fn compute_split_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
+    /// Read-only tree access for persistence (layout.json) — the app never
+    /// mutates the tree through this handle.
+    pub fn tree(&self) -> &SplitNode {
+        &self.split_root
+    }
+
+    /// Replace the whole tree, e.g. with a remapped session-restore layout.
+    pub fn set_tree(&mut self, root: SplitNode) {
+        self.split_root = root;
+        self.reconcile_tree();
+    }
+
+    pub fn rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
         self.split_root.compute_rects()
+    }
+
+    pub fn leaves(&self) -> Vec<usize> {
+        self.split_root.leaves()
+    }
+
+    /// Pane id containing the normalized content-space point, if any.
+    pub fn pane_at(&self, x: f32, y: f32) -> Option<usize> {
+        self.split_root.pane_at(x, y)
+    }
+
+    pub fn dividers(&self) -> Vec<(SplitDir, f32, usize)> {
+        self.split_root.dividers()
+    }
+
+    /// Resize the divider whose second-child first leaf is `target`. Returns
+    /// true when a matching divider was found and adjusted.
+    pub fn resize_divider(&mut self, target: usize, boundary: f32, delta: f32) -> bool {
+        self.split_root.resize_leaf(target, boundary, delta)
     }
 
     /// Advance to the next tab in sorted order (wraps). Returns true if the
@@ -455,6 +494,38 @@ impl SessionManager {
         let parent = self.active_pane;
         self.split_root.insert_leaf(new_id, dir, parent, 0.5);
         self.reconcile_tree();
+    }
+
+    /// Remove a pane from the tree (after its PaneState is dropped) and
+    /// reconcile so the tree never keeps a dead leaf — the stale-sole-leaf
+    /// case that blanked the window.
+    pub fn remove_pane_from_tree(&mut self, id: usize) {
+        self.split_root.remove_leaf(id);
+        self.reconcile_tree();
+    }
+
+    /// Re-insert a floating (or otherwise absent) pane into the tree at the
+    /// first remaining leaf, then clear the floating slot.
+    pub fn dock_pane(&mut self, id: usize) {
+        if !self.split_root.leaves().contains(&id) {
+            let parent = *self.split_root.leaves().first().unwrap_or(&id);
+            self.split_root.insert_leaf(id, SplitDir::Vertical, parent, 0.5);
+        }
+        self.floating = None;
+        self.reconcile_tree();
+    }
+
+    /// Float the pane: remove it from the tree and mark it floating. Returns
+    /// false when it was the tree's only leaf (the overlay stays in the tree
+    /// so at least one pane renders).
+    pub fn float_pane(&mut self, id: usize) -> bool {
+        if self.split_root.leaves().len() <= 1 {
+            return false;
+        }
+        self.split_root.remove_leaf(id);
+        self.floating = Some(id);
+        self.reconcile_tree();
+        true
     }
 
     /// Rebuild the split tree from the pane map whenever its leaves have
