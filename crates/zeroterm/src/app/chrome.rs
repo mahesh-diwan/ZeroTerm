@@ -1,6 +1,6 @@
 use zeroterm_core::screen::Screen;
 
-use crate::overlay::ScreenScratch;
+use crate::overlay::{Overlay, ScreenScratch};
 
 /// SSH host picker overlay, drawn into the active pane like the settings menu.
 /// Destructive to covered cells, so the region is snapshotted on open and
@@ -23,7 +23,7 @@ impl HostPicker {
         }
     }
 
-    #[cfg(all(unix, feature = "ssh"))]
+    #[cfg_attr(not(all(unix, feature = "ssh")), allow(dead_code))]
     pub fn open(&mut self, aliases: Vec<String>) {
         self.aliases = aliases;
         self.cursor = 0;
@@ -42,7 +42,7 @@ impl HostPicker {
         }
     }
 
-    #[cfg(all(unix, feature = "ssh"))]
+    #[cfg_attr(not(all(unix, feature = "ssh")), allow(dead_code))]
     pub fn selected(&self) -> Option<String> {
         self.aliases.get(self.cursor).cloned()
     }
@@ -107,7 +107,6 @@ impl HostPicker {
         out
     }
 
-    #[cfg(all(unix, feature = "ssh"))]
     pub fn save_screen(&mut self, screen: &Screen) {
         let (top, _, height, _) = self.overlay_rect(screen.size().cols, screen.size().rows);
         self.scratch.save_region(screen, top, height);
@@ -115,5 +114,20 @@ impl HostPicker {
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
         self.scratch.restore(screen);
+    }
+}
+
+impl Overlay for HostPicker {
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    fn draw_bytes(&self, cols: usize, rows: usize) -> Vec<u8> {
+        self.overlay_bytes(cols, rows)
+    }
+    fn snapshot(&mut self, screen: &Screen) {
+        self.save_screen(screen);
+    }
+    fn restore(&mut self, screen: &mut Screen) {
+        self.restore_screen(screen);
     }
 }

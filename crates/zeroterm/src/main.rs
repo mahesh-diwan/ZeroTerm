@@ -37,6 +37,8 @@ use crate::ai_overlay::AiOverlay;
 use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
+use crate::app::key_router;
+use crate::app::selection;
 use crate::app::{
     block_output_text, word_left, word_right, EditAction, HostPicker, LineEditor, PaneState,
     PtyCommand, SessionManager,
@@ -50,6 +52,18 @@ mod app;
 mod frame;
 mod overlay;
 mod search;
+
+use overlay::Overlay;
+
+/// Which modal overlay owns the screen right now. One slot instead of four
+/// booleans scattered through the input arm and the render loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayKind {
+    Search,
+    Settings,
+    Ai,
+    HostPicker,
+}
 // Retained for the legacy session.json format + its tests; session layout
 // persistence now lives in zeroterm-mux (SessionLayout) via save_session_layout().
 #[allow(dead_code)]
@@ -589,10 +603,10 @@ impl App {
                 )?
             };
             let parser = Parser::new(cols, rows);
-            let id = self.session.next_pane_id;
-            self.session.next_pane_id += 1;
-            self.session.panes.insert(
-                id,
+            // A new tab is another pane in the global tree; insert it next to
+            // the active pane instead of replacing the whole tree (which hid
+            // every existing split and orphaned the other panes).
+            self.session.register_pane(
                 PaneState {
                     parser,
                     pty_rx,
@@ -601,14 +615,9 @@ impl App {
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
                 },
+                SplitDir::Vertical,
+                true,
             );
-            self.session.active_pane = id;
-            self.session.scroll_offset = 0;
-            // A new tab is another pane in the global tree; insert it next to
-            // the active pane instead of replacing the whole tree (which hid
-            // every existing split and orphaned the other panes).
-            self.session.insert_pane_as_split(id, SplitDir::Vertical);
-            self.session.tabs.push(Tab::new(id));
         }
         Ok(())
     }
@@ -641,10 +650,10 @@ impl App {
                 )?
             };
             let parser = Parser::new(cols, rows);
-            let id = self.session.next_pane_id;
-            self.session.next_pane_id += 1;
-            self.session.panes.insert(
-                id,
+            // The split only exists once the pane is in the tree: Ctrl+Shift+E/D
+            // inserts the new pane as a split of the active pane. Split panes
+            // are not tabs.
+            self.session.register_pane(
                 PaneState {
                     parser,
                     pty_rx,
@@ -653,12 +662,9 @@ impl App {
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
                 },
+                dir,
+                false,
             );
-            self.session.active_pane = id;
-            self.session.scroll_offset = 0;
-            // The split only exists once the pane is in the tree: Ctrl+Shift+E/D
-            // inserts the new pane as a split of the active pane.
-            self.session.insert_pane_as_split(id, dir);
             self.resize_panes_to_rects();
         }
         Ok(())
@@ -669,56 +675,23 @@ impl App {
     }
 
     fn close_tab(&mut self, id: usize) {
-        if self.session.panes.len() <= 1 {
-            return;
-        }
-        let was_active = self.session.active_pane == id;
-        if let Some(pane) = self.session.panes.remove(&id) {
-            let _ = pane.pty_tx.send(PtyCommand::Kill);
-        }
-        // Removes the leaf AND reconciles: the tree never keeps a dead id,
-        // so rendering never dereferences a removed pane.
-        self.session.remove_pane_from_tree(id);
-        self.session.tabs.retain(|t| t.id != id);
-        if self.session.floating == Some(id) {
-            self.session.floating = None;
-        }
-        if was_active {
-            let first = *self.session.panes.keys().next().unwrap_or(&0);
-            self.session.active_pane = first;
-            self.editor.cancel();
-            self.session.scroll_offset = 0;
-        }
-        self.hovered_tab = None;
-        self.hovered_tab_close = false;
-        self.resize_panes_to_rects();
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if let Some(effect) = self.session.close_pane(id) {
+            let _ = effect.pane.pty_tx.send(PtyCommand::Kill);
+            if effect.was_active {
+                self.editor.cancel();
+            }
+            self.hovered_tab = None;
+            self.hovered_tab_close = false;
+            self.resize_panes_to_rects();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
     /// Toggle active pane between split-tree and floating overlay (Ctrl+Shift+F).
     fn toggle_floating_pane(&mut self) {
-        let active = self.session.active_pane;
-        if self.session.floating == Some(active) {
-            // Dock: re-insert at first remaining tree leaf.
-            // ponytail: original slot lost (insert_leaf only splits a parent) — root-ish
-            // placement is the accepted ceiling.
-            self.session.dock_pane(active);
-            self.resize_panes_to_rects();
-        } else {
-            // Dock whatever was floating (one float at a time), then float active.
-            if let Some(prev) = self.session.floating.take() {
-                self.session.dock_pane(prev);
-            }
-            if self.session.float_pane(active) {
-                self.resize_panes_to_rects();
-            } else {
-                // ponytail: last visible pane stays in tree AND floats (overlay wins when
-                // drawn twice); zero visible panes not allowed.
-                self.session.floating = Some(active);
-            }
-        }
+        self.session.toggle_floating();
         let Some(renderer) = &self.renderer else {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -837,30 +810,19 @@ impl App {
             }
             self.host_picker.open(aliases);
             if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-                self.host_picker.save_screen(pane.parser.screen());
+                Overlay::snapshot(&mut self.host_picker, pane.parser.screen());
             }
             self.draw_host_picker();
         }
     }
 
     fn draw_host_picker(&mut self) {
-        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
-            return;
-        };
-        let (cols, rows) = {
-            let s = pane.parser.screen();
-            (s.size().cols, s.size().rows)
-        };
-        let bytes = self.host_picker.overlay_bytes(cols, rows);
-        pane.parser.parse(&bytes);
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        self.draw_overlay(OverlayKind::HostPicker);
     }
 
     fn close_host_picker(&mut self) {
         if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            self.host_picker.restore_screen(pane.parser.screen_mut());
+            Overlay::restore(&mut self.host_picker, pane.parser.screen_mut());
         }
         self.host_picker.open = false;
         if let Some(window) = &self.window {
@@ -906,7 +868,7 @@ impl App {
             return;
         };
         if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            self.ai.save_screen(pane.parser.screen());
+            Overlay::snapshot(&mut self.ai, pane.parser.screen());
         }
         self.ai.open(kind);
         let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
@@ -938,7 +900,7 @@ impl App {
 
     fn close_ai(&mut self) {
         if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            self.ai.restore_screen(pane.parser.screen_mut());
+            Overlay::restore(&mut self.ai, pane.parser.screen_mut());
         }
         self.ai.close();
         self.redraw();
@@ -948,15 +910,7 @@ impl App {
         if !self.ai.open {
             return;
         }
-        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
-            return;
-        };
-        let (cols, rows) = {
-            let s = pane.parser.screen();
-            (s.size().cols, s.size().rows)
-        };
-        let bytes = self.ai.overlay_bytes(cols, rows);
-        pane.parser.parse(&bytes);
+        self.draw_overlay(OverlayKind::Ai);
     }
 
     fn drain_pty(&mut self) -> bool {
@@ -1128,14 +1082,13 @@ impl App {
             }
             self.apply_config_to_renderer();
         }
-        if self.settings.open {
-            self.draw_settings_overlay();
-        }
         if self.ai.open {
-            // Fire-and-poll: collect the finished AI result, then redraw the
-            // panel with the response (or error) in this frame.
+            // Fire-and-poll: collect the finished AI result before drawing,
+            // so the panel paints the response (or error) this frame.
             self.ai.poll();
-            self.draw_ai_overlay();
+        }
+        if let Some(kind) = self.active_overlay() {
+            self.draw_overlay(kind);
         }
         // Collect an in-flight AI line completion only while the editor is
         // open; closing the editor discards the pending request.
@@ -1481,7 +1434,7 @@ impl App {
         self.search.toggle();
         if self.search.open {
             if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-                self.search.save_screen(pane.parser.screen());
+                Overlay::snapshot(&mut self.search, pane.parser.screen());
             }
         } else {
             self.close_search();
@@ -1506,7 +1459,7 @@ impl App {
 
     fn close_search(&mut self) {
         if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            self.search.restore_screen(pane.parser.screen_mut());
+            Overlay::restore(&mut self.search, pane.parser.screen_mut());
         }
         self.search.open = false;
         self.redraw();
@@ -1516,16 +1469,7 @@ impl App {
         if !self.search.open {
             return;
         }
-        let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
-            return;
-        };
-        let (cols, rows) = {
-            let s = pane.parser.screen();
-            (s.size().cols, s.size().rows)
-        };
-        let bytes = self.search.overlay_bytes(cols, rows);
-        pane.parser.parse(&bytes);
-        self.redraw();
+        self.draw_overlay(OverlayKind::Search);
     }
 
     /// Re-run the scan for the current query and jump to the current match.
@@ -1835,45 +1779,9 @@ impl App {
     }
 
     fn copy_selection(&mut self) {
-        let sel = self.selection.clone();
-        let text = sel.as_ref().and_then(|sel| {
+        let text = self.selection.as_ref().and_then(|sel| {
             self.session.active_pane().map(|pane| {
-                let screen = pane.parser.screen();
-                let scrollback = screen.scrollback();
-                let buffer = screen.buffer();
-                let visible_rows = buffer.len();
-                let cols = if visible_rows > 0 { buffer[0].len() } else { 0 };
-
-                let (start_row, start_col, end_row, end_col) = if sel.start_row < sel.end_row
-                    || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
-                {
-                    (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
-                } else {
-                    (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
-                };
-
-                let mut text = String::new();
-                let total_scrollback = scrollback.len();
-                let total_rows = total_scrollback + visible_rows;
-
-                for r in start_row..=end_row.min(total_rows - 1) {
-                    let line = if r < total_scrollback {
-                        &scrollback[total_scrollback - 1 - r]
-                    } else {
-                        &buffer[r - total_scrollback]
-                    };
-
-                    let line_start = if r == start_row { start_col } else { 0 };
-                    let line_end = if r == end_row { end_col + 1 } else { cols };
-
-                    for c in line_start..line_end.min(line.len()) {
-                        text.push(line[c].ch);
-                    }
-                    if r < end_row {
-                        text.push('\n');
-                    }
-                }
-                text
+                selection::selection_text(sel, pane.parser.screen())
             })
         });
         if let Some(text) = text {
@@ -1966,7 +1874,7 @@ impl App {
             let ctx = self.settings_ctx();
             self.settings.refresh(&ctx);
             if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-                self.settings.save_screen(pane.parser.screen());
+                Overlay::snapshot(&mut self.settings, pane.parser.screen());
             }
             self.draw_settings_overlay();
         } else {
@@ -1976,7 +1884,7 @@ impl App {
 
     fn close_settings(&mut self) {
         if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            self.settings.restore_screen(pane.parser.screen_mut());
+            Overlay::restore(&mut self.settings, pane.parser.screen_mut());
         }
         self.settings.open = false;
         if let Some(window) = &self.window {
@@ -1985,6 +1893,16 @@ impl App {
     }
 
     fn draw_settings_overlay(&mut self) {
+        self.draw_overlay(OverlayKind::Settings);
+    }
+
+    /// Paint the given overlay into the active pane's screen via its `Overlay`
+    /// impl (one draw path instead of four copies). No-op when the overlay is
+    /// not open, so callers can fire it unconditionally.
+    fn draw_overlay(&mut self, kind: OverlayKind) {
+        if !self.overlay_open(kind) {
+            return;
+        }
         let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) else {
             return;
         };
@@ -1992,10 +1910,40 @@ impl App {
             let s = pane.parser.screen();
             (s.size().cols, s.size().rows)
         };
-        let bytes = self.settings.overlay_bytes(cols, rows);
+        let bytes = match kind {
+            OverlayKind::Search => Overlay::draw_bytes(&self.search, cols, rows),
+            OverlayKind::Settings => Overlay::draw_bytes(&self.settings, cols, rows),
+            OverlayKind::Ai => Overlay::draw_bytes(&self.ai, cols, rows),
+            OverlayKind::HostPicker => Overlay::draw_bytes(&self.host_picker, cols, rows),
+        };
         pane.parser.parse(&bytes);
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        self.redraw();
+    }
+
+    /// Whether the given overlay is currently open (owns the screen region).
+    fn overlay_open(&self, kind: OverlayKind) -> bool {
+        match kind {
+            OverlayKind::Search => Overlay::is_open(&self.search),
+            OverlayKind::Settings => Overlay::is_open(&self.settings),
+            OverlayKind::Ai => Overlay::is_open(&self.ai),
+            OverlayKind::HostPicker => Overlay::is_open(&self.host_picker),
+        }
+    }
+
+    /// The one overlay currently owning the screen, if any. Drives the
+    /// input-arm routing and the render loop from a single slot instead of
+    /// four independent booleans.
+    fn active_overlay(&self) -> Option<OverlayKind> {
+        if self.search.open {
+            Some(OverlayKind::Search)
+        } else if self.ai.open {
+            Some(OverlayKind::Ai)
+        } else if self.settings.open {
+            Some(OverlayKind::Settings)
+        } else if self.host_picker.open {
+            Some(OverlayKind::HostPicker)
+        } else {
+            None
         }
     }
 
@@ -2061,6 +2009,319 @@ impl App {
         }
         self.apply_config_to_renderer();
         self.draw_settings_overlay();
+    }
+    /// Route a pressed key through the pure KeyRouter decode tables.
+    ///
+    /// The old `KeyboardInput` arm interleaved decoding and execution in one
+    /// 430-line match; this method is the thin stateful glue that applies
+    /// actions the pure `key_router` module decodes. Overlay routing,
+    /// keybindings, and escape-sequence encoding are unit-tested there.
+    fn handle_key(&mut self, event: winit::event::KeyEvent) {
+        if event.state != winit::event::ElementState::Pressed {
+            return;
+        }
+        let mods = key_router::Mods::from_state(&self.modifiers);
+        let ctrl = mods.ctrl;
+        let shift = mods.shift;
+        let alt = mods.alt;
+        let code: Option<KeyCode> = match &event.physical_key {
+            PhysicalKey::Code(c) => Some(*c),
+            _ => None,
+        };
+        let text = event.text.clone().or_else(|| match &event.logical_key {
+            winit::keyboard::Key::Character(c) => Some(c.clone()),
+            _ => None,
+        });
+
+        // 1. Search overlay owns every key while open.
+        if self.search.open {
+            match code {
+                Some(code) => match key_router::search_key(code, mods, text.as_deref()) {
+                    key_router::SearchKey::Close => self.close_search(),
+                    key_router::SearchKey::Backspace => {
+                        self.search.backspace();
+                        self.search_apply();
+                    }
+                    key_router::SearchKey::Step(fwd) => self.search_step(fwd),
+                    key_router::SearchKey::Text(t) => {
+                        for c in t.chars() {
+                            self.search.append(c);
+                        }
+                        self.search_apply();
+                    }
+                },
+                // No physical code (IME / dead keys): append printable text.
+                None => {
+                    if let Some(t) = &text {
+                        if !t.is_empty() && !ctrl && !alt {
+                            for c in t.chars() {
+                                self.search.append(c);
+                            }
+                            self.search_apply();
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // 2. AI overlay owns every key while open.
+        if self.ai.open {
+            if let Some(code) = code {
+                if let Some(key_router::AiKey::Close) = key_router::ai_key(code, mods) {
+                    self.close_ai();
+                }
+            }
+            return;
+        }
+
+        // 3. Local line editor owns keys while active (Pass falls through to
+        //    the global bindings below).
+        if let Some(code) = code {
+            if self.editor.is_active() {
+                match self.editor.handle(code, ctrl, shift, alt) {
+                    EditAction::Pass => {}
+                    EditAction::Submit(line) => {
+                        self.submit_editor_line(&line);
+                        self.redraw();
+                        return;
+                    }
+                    EditAction::Handled => {
+                        self.redraw();
+                        return;
+                    }
+                }
+            }
+            // Alt+E toggles the editor (before the global chords; winit
+            // reports Alt as a prefix on every Escape-prefixed chord, so this
+            // must be claimed before the printable path).
+            if alt && !ctrl && !shift && code == KeyCode::KeyE && self.toggle_editing() {
+                return;
+            }
+
+            // 4. Global keybindings (incl. modal picker/settings keys).
+            let ctx = key_router::KeyCtx {
+                picker_open: self.host_picker.open,
+                settings_open: self.settings.open,
+            };
+            match key_router::global_key(code, mods, ctx) {
+                key_router::GlobalAction::NewTab => {
+                    if let Err(e) = self.create_new_tab() {
+                        error!("Failed to create tab: {}", e);
+                    }
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::CloseTab => {
+                    self.close_active_tab();
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::Split(dir) => {
+                    if let Err(e) = self.create_split_pane(dir) {
+                        error!("Failed to split pane: {}", e);
+                    }
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::ToggleSettings => {
+                    self.toggle_settings();
+                    return;
+                }
+                key_router::GlobalAction::ToggleSearch => {
+                    self.toggle_search();
+                    return;
+                }
+                key_router::GlobalAction::ToggleFloating => {
+                    self.toggle_floating_pane();
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::ToggleQuake => {
+                    self.toggle_quake();
+                    return;
+                }
+                key_router::GlobalAction::NextTab => {
+                    self.next_tab();
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::PrevTab => {
+                    self.previous_tab();
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::SwitchToTab(idx) => {
+                    self.switch_to_tab(idx);
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::FocusPane(dir) => {
+                    self.focus_adjacent_pane(dir);
+                    self.update_window_title();
+                    return;
+                }
+                key_router::GlobalAction::CycleOpacity => {
+                    self.cycle_opacity();
+                    return;
+                }
+                key_router::GlobalAction::JumpBlock(delta) => {
+                    self.jump_to_block(delta);
+                    return;
+                }
+                #[cfg(feature = "ai")]
+                key_router::GlobalAction::OpenAi(kind) => {
+                    self.open_ai(kind);
+                    return;
+                }
+                #[cfg(all(unix, feature = "ssh"))]
+                key_router::GlobalAction::Ssh => {
+                    if let Some(config) = &self.config {
+                        if !config.ssh.host.is_empty() {
+                            let host = config.ssh.host.clone();
+                            let user = config.ssh.user.clone();
+                            let port = config.ssh.port;
+                            if let Err(e) = self.connect_ssh(&host, &user, port) {
+                                error!("SSH connect failed: {}", e);
+                            }
+                            self.update_window_title();
+                        } else {
+                            self.open_host_picker();
+                        }
+                    }
+                    return;
+                }
+                #[cfg(feature = "plugins")]
+                key_router::GlobalAction::RunPlugin => {
+                    if let Some(name) = self.plugins.keys().min().cloned() {
+                        self.run_plugin(&name);
+                    } else {
+                        warn!("No plugins loaded; put *.wasm files in the plugins dir to enable");
+                    }
+                    return;
+                }
+                key_router::GlobalAction::Picker(key) => match key {
+                    key_router::PickerKey::Up => self.host_picker.prev(),
+                    key_router::PickerKey::Down => self.host_picker.next(),
+                    key_router::PickerKey::Select => self.pick_host(),
+                    key_router::PickerKey::Escape => self.close_host_picker(),
+                },
+                key_router::GlobalAction::Settings(key) => match key {
+                    key_router::SettingsKey::Up => self.settings.prev(),
+                    key_router::SettingsKey::Down => self.settings.next(),
+                    key_router::SettingsKey::Activate => {
+                        let ctx = self.settings_ctx();
+                        let action = self.settings.activate(&ctx);
+                        self.apply_settings_action(action);
+                    }
+                    key_router::SettingsKey::Escape => self.close_settings(),
+                },
+                key_router::GlobalAction::Pass => {}
+            }
+            // A modal overlay is open: it swallowed the key (no fallthrough
+            // to the console layer), but its view must repaint.
+            if self.host_picker.open || self.settings.open {
+                if self.host_picker.open {
+                    self.draw_host_picker();
+                }
+                if self.settings.open {
+                    self.draw_settings_overlay();
+                }
+                return;
+            }
+
+            // 5. Console layer: scroll, selection extend, copy/paste, escape
+            //    sequences.
+            match key_router::console_key(code, mods) {
+                key_router::ConsoleAction::ScrollUp(n) => {
+                    self.scroll_up(n);
+                    self.redraw();
+                    return;
+                }
+                key_router::ConsoleAction::ScrollDown(n) => {
+                    self.scroll_down(n);
+                    self.redraw();
+                    return;
+                }
+                key_router::ConsoleAction::ScrollTop => {
+                    self.session.scroll_offset = self.max_scroll_offset();
+                    self.redraw();
+                    return;
+                }
+                key_router::ConsoleAction::ScrollBottom => {
+                    self.session.scroll_offset = 0;
+                    self.redraw();
+                    return;
+                }
+                key_router::ConsoleAction::ExtendSelection { code, ctrl } => {
+                    if self.shift_arrow_extend(code, ctrl) {
+                        self.redraw();
+                        return;
+                    }
+                    // Feature disabled: fall back to the raw escape sequence.
+                    if let Some(seq) = key_router::key_sequence(code, mods) {
+                        self.clear_selection();
+                        self.write_pty(&seq);
+                    }
+                    return;
+                }
+                key_router::ConsoleAction::CopySelection => {
+                    self.copy_selection();
+                    self.redraw();
+                    return;
+                }
+                key_router::ConsoleAction::Paste => {
+                    self.paste_clipboard();
+                    return;
+                }
+                key_router::ConsoleAction::Pty(seq) => {
+                    self.clear_selection();
+                    self.write_pty(&seq);
+                }
+                key_router::ConsoleAction::None => {}
+            }
+        }
+
+        // 6. Printable text (IME text input). Some keymaps/dead keys report
+        //    text=None; fall back to the logical key so printable characters
+        //    still reach the pty.
+        if let Some(text) = &text {
+            if !text.is_empty() && !ctrl && !alt {
+                if self.editor.is_active() {
+                    self.editor.insert_text(text);
+                    self.redraw();
+                } else {
+                    self.clear_selection();
+                    self.write_pty(text.as_bytes());
+                }
+            }
+        }
+
+        if self.drain_pty() {
+            self.redraw();
+        }
+    }
+
+    /// Paste the clipboard into the active pane, bracketed when the shell
+    /// advertises bracketed paste (readline) so multi-line text is inserted
+    /// literally. Plain fallback writes the raw bytes.
+    fn paste_clipboard(&mut self) {
+        if let Some(clipboard) = &mut self.clipboard {
+            if let Ok(text) = clipboard.get_text() {
+                let bracketed = self
+                    .session
+                    .active_pane()
+                    .map_or(false, |p| p.parser.bracketed_paste());
+                if bracketed {
+                    let mut data = b"\x1b[200~".to_vec();
+                    data.extend_from_slice(text.as_bytes());
+                    data.extend_from_slice(b"\x1b[201~");
+                    self.write_pty(&data);
+                } else {
+                    self.write_pty(text.as_bytes());
+                }
+            }
+        }
     }
 }
 
@@ -2149,434 +2410,7 @@ impl ApplicationHandler for App {
                 self.modifiers = state.state();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != winit::event::ElementState::Pressed {
-                    return;
-                }
-
-                let ctrl = self.modifiers.control_key();
-                let shift = self.modifiers.shift_key();
-                let alt = self.modifiers.alt_key();
-
-                // Search overlay: while open, all keys route to the prompt.
-                if self.search.open {
-                    match &event.physical_key {
-                        PhysicalKey::Code(code) => match code {
-                            KeyCode::Escape => self.close_search(),
-                            KeyCode::KeyF if ctrl && shift => self.close_search(),
-                            KeyCode::Backspace => {
-                                self.search.backspace();
-                                self.search_apply();
-                            }
-                            KeyCode::Enter | KeyCode::ArrowDown if !shift => {
-                                self.search_step(true);
-                            }
-                            KeyCode::Enter | KeyCode::ArrowUp if shift => {
-                                self.search_step(false);
-                            }
-                            KeyCode::ArrowUp => self.search_step(false),
-                            KeyCode::ArrowDown => self.search_step(true),
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                    let text = event.text.clone().or_else(|| match &event.logical_key {
-                        winit::keyboard::Key::Character(c) => Some(c.clone()),
-                        _ => None,
-                    });
-                    if let Some(text) = &text {
-                        if !text.is_empty() && !ctrl && !alt {
-                            for c in text.chars() {
-                                self.search.append(c);
-                            }
-                            self.search_apply();
-                        }
-                    }
-                    return;
-                }
-
-                // AI overlay: while open, Escape or the toggle keys close it.
-                if self.ai.open {
-                    match &event.physical_key {
-                        PhysicalKey::Code(code) => match code {
-                            KeyCode::Escape => self.close_ai(),
-                            KeyCode::KeyI if ctrl && shift => self.close_ai(),
-                            KeyCode::KeyA if ctrl && shift => self.close_ai(),
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                    return;
-                }
-
-                // Tab management shortcuts
-                match &event.physical_key {
-                    PhysicalKey::Code(code) => {
-                        // Local line editor: while active, editing keys are
-                        // intercepted here and printable text is absorbed in
-                        // the text-input path below — nothing reaches the pty.
-                        if self.editor.is_active() {
-                            match self.editor.handle(*code, ctrl, shift, alt) {
-                                EditAction::Pass => {}
-                                EditAction::Submit(line) => {
-                                    self.submit_editor_line(&line);
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                                EditAction::Handled => {
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        // Alt+E toggles the line editor. Alt is a prefix winit
-                        // reports with every Escape-prefixed chord, so this is
-                        // handled before the printable path and never reaches
-                        // the shell (M-e is unbound in readline).
-                        if alt && !ctrl && !shift && *code == KeyCode::KeyE && self.toggle_editing()
-                        {
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyP {
-                            self.toggle_settings();
-                            return;
-                        }
-                        if self.host_picker.open {
-                            match code {
-                                KeyCode::ArrowUp => self.host_picker.prev(),
-                                KeyCode::ArrowDown => self.host_picker.next(),
-                                KeyCode::Enter => self.pick_host(),
-                                KeyCode::Escape => self.close_host_picker(),
-                                _ => {}
-                            }
-                            if self.host_picker.open {
-                                self.draw_host_picker();
-                            }
-                            return;
-                        }
-                        if self.settings.open {
-                            match code {
-                                KeyCode::ArrowUp => self.settings.prev(),
-                                KeyCode::ArrowDown => self.settings.next(),
-                                KeyCode::Enter => {
-                                    let ctx = self.settings_ctx();
-                                    let action = self.settings.activate(&ctx);
-                                    self.apply_settings_action(action);
-                                }
-                                KeyCode::Escape => self.close_settings(),
-                                _ => {}
-                            }
-                            if self.settings.open {
-                                self.draw_settings_overlay();
-                            }
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyT {
-                            if let Err(e) = self.create_new_tab() {
-                                error!("Failed to create tab: {}", e);
-                            }
-                            self.update_window_title();
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyW {
-                            self.close_active_tab();
-                            self.update_window_title();
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyE {
-                            if let Err(e) = self.create_split_pane(SplitDir::Vertical) {
-                                error!("Failed to split pane: {}", e);
-                            }
-                            self.update_window_title();
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyD {
-                            if let Err(e) = self.create_split_pane(SplitDir::Horizontal) {
-                                error!("Failed to split pane: {}", e);
-                            }
-                            self.update_window_title();
-                            return;
-                        }
-                        #[cfg(feature = "ai")]
-                        if ctrl && shift && !alt && *code == KeyCode::KeyI {
-                            self.open_ai(AiKind::Explain);
-                            return;
-                        }
-                        #[cfg(feature = "ai")]
-                        if ctrl && shift && !alt && *code == KeyCode::KeyA {
-                            self.open_ai(AiKind::Suggest);
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyO {
-                            self.cycle_opacity();
-                            return;
-                        }
-                        #[cfg(all(unix, feature = "ssh"))]
-                        if ctrl && shift && !alt && *code == KeyCode::KeyS {
-                            if let Some(config) = &self.config {
-                                if !config.ssh.host.is_empty() {
-                                    let host = config.ssh.host.clone();
-                                    let user = config.ssh.user.clone();
-                                    let port = config.ssh.port;
-                                    if let Err(e) = self.connect_ssh(&host, &user, port) {
-                                        error!("SSH connect failed: {}", e);
-                                    }
-                                    self.update_window_title();
-                                } else {
-                                    self.open_host_picker();
-                                }
-                            }
-                            return;
-                        }
-                        #[cfg(feature = "plugins")]
-                        if ctrl && shift && !alt && *code == KeyCode::KeyB {
-                            if let Some(name) = self.plugins.keys().min().cloned() {
-                                self.run_plugin(&name);
-                            } else {
-                                warn!("No plugins loaded; put *.wasm files in the plugins dir to enable");
-                            }
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyK {
-                            self.jump_to_block(-1);
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyJ {
-                            self.jump_to_block(1);
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyF {
-                            self.toggle_search();
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::KeyG {
-                            self.toggle_floating_pane();
-                            self.update_window_title();
-                            return;
-                        }
-                        if !ctrl && !shift && !alt && *code == KeyCode::F12 {
-                            self.toggle_quake();
-                            return;
-                        }
-                        if ctrl && shift && !alt && *code == KeyCode::Tab {
-                            self.previous_tab();
-                            self.update_window_title();
-                            return;
-                        }
-                        if ctrl && !shift && !alt && *code == KeyCode::Tab {
-                            self.next_tab();
-                            self.update_window_title();
-                            return;
-                        }
-                        if alt && !ctrl && !shift {
-                            match code {
-                                KeyCode::ArrowLeft
-                                | KeyCode::ArrowRight
-                                | KeyCode::ArrowUp
-                                | KeyCode::ArrowDown => {
-                                    self.focus_adjacent_pane(*code);
-                                    self.update_window_title();
-                                    return;
-                                }
-                                _ => {}
-                            }
-                            let idx = match code {
-                                KeyCode::Digit1 => Some(0),
-                                KeyCode::Digit2 => Some(1),
-                                KeyCode::Digit3 => Some(2),
-                                KeyCode::Digit4 => Some(3),
-                                KeyCode::Digit5 => Some(4),
-                                KeyCode::Digit6 => Some(5),
-                                KeyCode::Digit7 => Some(6),
-                                KeyCode::Digit8 => Some(7),
-                                KeyCode::Digit9 => Some(8),
-                                _ => None,
-                            };
-                            if let Some(idx) = idx {
-                                self.switch_to_tab(idx);
-                                self.update_window_title();
-                                return;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
-                match &event.physical_key {
-                    PhysicalKey::Code(code) => {
-                        // Handle scrollback navigation + selection extend with Shift modifier
-                        let shift = self.modifiers.shift_key();
-                        if shift && !alt {
-                            match code {
-                                KeyCode::PageUp if !ctrl => {
-                                    self.scroll_up(20);
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                                KeyCode::PageDown if !ctrl => {
-                                    self.scroll_down(20);
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                                KeyCode::Home if !ctrl => {
-                                    self.session.scroll_offset = self.max_scroll_offset();
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                                KeyCode::End if !ctrl => {
-                                    self.session.scroll_offset = 0;
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    return;
-                                }
-                                KeyCode::ArrowLeft
-                                | KeyCode::ArrowRight
-                                | KeyCode::ArrowUp
-                                | KeyCode::ArrowDown => {
-                                    if self.shift_arrow_extend(*code, ctrl) {
-                                        if let Some(window) = &self.window {
-                                            window.request_redraw();
-                                        }
-                                        return;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        let seq: Vec<u8> = match code {
-                            KeyCode::Enter => vec![b'\r'],
-                            KeyCode::Backspace => vec![0x7f],
-                            KeyCode::Tab => vec![b'\t'],
-                            KeyCode::Escape => vec![0x1b],
-                            KeyCode::ArrowUp => vec![0x1b, b'[', b'A'],
-                            KeyCode::ArrowDown => vec![0x1b, b'[', b'B'],
-                            KeyCode::ArrowRight => vec![0x1b, b'[', b'C'],
-                            KeyCode::ArrowLeft => vec![0x1b, b'[', b'D'],
-                            KeyCode::Home => vec![0x1b, b'[', b'H'],
-                            KeyCode::End => vec![0x1b, b'[', b'F'],
-                            KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-                            KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-                            KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-                            KeyCode::F1 => vec![0x1b, b'[', b'1', b'1', b'~'],
-                            KeyCode::F2 => vec![0x1b, b'[', b'1', b'2', b'~'],
-                            KeyCode::F3 => vec![0x1b, b'[', b'1', b'3', b'~'],
-                            KeyCode::F4 => vec![0x1b, b'[', b'1', b'4', b'~'],
-                            KeyCode::F5 => vec![0x1b, b'[', b'1', b'5', b'~'],
-                            KeyCode::F6 => vec![0x1b, b'[', b'1', b'7', b'~'],
-                            KeyCode::F7 => vec![0x1b, b'[', b'1', b'8', b'~'],
-                            KeyCode::F8 => vec![0x1b, b'[', b'1', b'9', b'~'],
-                            KeyCode::F9 => vec![0x1b, b'[', b'2', b'0', b'~'],
-                            KeyCode::F10 => vec![0x1b, b'[', b'2', b'1', b'~'],
-                            KeyCode::F11 => vec![0x1b, b'[', b'2', b'3', b'~'],
-                            KeyCode::F12 => vec![0x1b, b'[', b'2', b'4', b'~'],
-                            _ if ctrl && !alt => match code {
-                                KeyCode::KeyA => vec![0x01],
-                                KeyCode::KeyB => vec![0x02],
-                                KeyCode::KeyC => vec![0x03],
-                                KeyCode::KeyD => vec![0x04],
-                                KeyCode::KeyE => vec![0x05],
-                                KeyCode::KeyF => vec![0x06],
-                                KeyCode::KeyG => vec![0x07],
-                                KeyCode::KeyH => vec![0x08],
-                                KeyCode::KeyI => vec![0x09],
-                                KeyCode::KeyJ => vec![0x0a],
-                                KeyCode::KeyK => vec![0x0b],
-                                KeyCode::KeyL => vec![0x0c],
-                                KeyCode::KeyM => vec![0x0d],
-                                KeyCode::KeyN => vec![0x0e],
-                                KeyCode::KeyO => vec![0x0f],
-                                KeyCode::KeyP => vec![0x10],
-                                KeyCode::KeyQ => vec![0x11],
-                                KeyCode::KeyR => vec![0x12],
-                                KeyCode::KeyS => vec![0x13],
-                                KeyCode::KeyT => vec![0x14],
-                                KeyCode::KeyU => vec![0x15],
-                                KeyCode::KeyV => vec![0x16],
-                                KeyCode::KeyW => vec![0x17],
-                                KeyCode::KeyX => vec![0x18],
-                                KeyCode::KeyY => vec![0x19],
-                                KeyCode::KeyZ => vec![0x1a],
-                                KeyCode::Space => vec![0x00],
-                                _ => vec![],
-                            },
-                            // Ctrl+Shift+C: Copy selection
-                            _ if ctrl && shift && !alt => match code {
-                                KeyCode::KeyC => {
-                                    self.copy_selection();
-                                    if let Some(window) = &self.window {
-                                        window.request_redraw();
-                                    }
-                                    vec![]
-                                }
-                                // Ctrl+Shift+V: Paste from clipboard
-                                KeyCode::KeyV => {
-                                    if let Some(clipboard) = &mut self.clipboard {
-                                        if let Ok(text) = clipboard.get_text() {
-                                            let bracketed = self
-                                                .session
-                                                .active_pane()
-                                                .map_or(false, |p| p.parser.bracketed_paste());
-                                            if bracketed {
-                                                let mut data = b"\x1b[200~".to_vec();
-                                                data.extend_from_slice(text.as_bytes());
-                                                data.extend_from_slice(b"\x1b[201~");
-                                                self.write_pty(&data);
-                                            } else {
-                                                self.write_pty(text.as_bytes());
-                                            }
-                                        }
-                                    }
-                                    vec![]
-                                }
-                                _ => vec![],
-                            },
-                            _ => vec![],
-                        };
-                        if !seq.is_empty() {
-                            self.clear_selection();
-                            self.write_pty(&seq);
-                        }
-                    }
-                    _ => {}
-                }
-
-                // Handle printable text (IME text input). Some keymaps/dead
-                // keys/IME states report text=None; fall back to the
-                // logical key so printable characters still reach the pty.
-                let text = event.text.clone().or_else(|| match &event.logical_key {
-                    winit::keyboard::Key::Character(c) => Some(c.clone()),
-                    _ => None,
-                });
-                if let Some(text) = &text {
-                    if !text.is_empty() && !ctrl && !alt {
-                        if self.editor.is_active() {
-                            self.editor.insert_text(text);
-                            if let Some(window) = &self.window {
-                                window.request_redraw();
-                            }
-                        } else {
-                            self.clear_selection();
-                            self.write_pty(text.as_bytes());
-                        }
-                    }
-                }
-
-                if self.drain_pty() {
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                }
+                self.handle_key(event);
             }
             WindowEvent::RedrawRequested => {
                 self.periodic_sync();
@@ -2784,7 +2618,8 @@ impl ApplicationHandler for App {
                         self.end_selection();
                         if dragged
                             && self.selection.as_ref().is_some_and(|s| {
-                                s.start_row != s.end_row || s.start_col != s.end_col
+                                let (a, b, c, d) = selection::normalize(s);
+                                (a, b) != (c, d)
                             })
                         {
                             self.copy_selection();

@@ -6,6 +6,26 @@
 use zeroterm_core::cell::{Cell, Cursor};
 use zeroterm_core::screen::Screen;
 
+/// Lifecycle contract shared by every screen-drawn overlay (search bar,
+/// settings menu, AI panel, SSH host picker). Each overlay owns its content
+/// and state; this trait is the narrow seam App uses to draw/restore any of
+/// them uniformly. `ScreenScratch` implements the save/restore backing.
+///
+/// Method names deliberately differ from each overlay's inherent methods
+/// (`overlay_bytes` / `save_screen` / `restore_screen`) so a trait impl can
+/// delegate to the inherent one without recursing, and so the trait keeps
+/// working when a feature (e.g. ssh) compiles some inherent methods out.
+pub trait Overlay {
+    /// Whether the overlay is currently open (owns the screen region).
+    fn is_open(&self) -> bool;
+    /// CSI bytes that paint the overlay into a `cols x rows` screen.
+    fn draw_bytes(&self, cols: usize, rows: usize) -> Vec<u8>;
+    /// Snapshot the covered region before drawing (via ScreenScratch).
+    fn snapshot(&mut self, screen: &Screen);
+    /// Restore the covered region after closing (via ScreenScratch).
+    fn restore(&mut self, screen: &mut Screen);
+}
+
 /// A saved screen region: the exact cells (and cursor) an overlay overwrites,
 /// restored verbatim when the overlay closes.
 #[derive(Debug, Default)]

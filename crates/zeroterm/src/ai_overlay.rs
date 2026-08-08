@@ -13,7 +13,7 @@ use zeroterm_core::screen::Screen;
 #[cfg(feature = "ai")]
 use zeroterm_ai::client::{AiClient, AiError};
 
-use crate::overlay::ScreenScratch;
+use crate::overlay::{Overlay, ScreenScratch};
 
 use crate::app::block_output_text;
 
@@ -160,6 +160,21 @@ impl AiOverlay {
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
         self.scratch.restore(screen);
+    }
+}
+
+impl Overlay for AiOverlay {
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    fn draw_bytes(&self, cols: usize, rows: usize) -> Vec<u8> {
+        self.overlay_bytes(cols, rows)
+    }
+    fn snapshot(&mut self, screen: &Screen) {
+        self.save_screen(screen);
+    }
+    fn restore(&mut self, screen: &mut Screen) {
+        self.restore_screen(screen);
     }
 }
 

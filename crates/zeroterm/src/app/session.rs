@@ -280,6 +280,13 @@ pub fn spawn_ssh_process(
 /// blank the window (the old `reconcile_tree` repair pass was bolted on after
 /// the fact); with a closed surface the tree↔panes invariant holds by
 /// construction.
+/// Outcome of a pane close: the removed `PaneState` (caller kills its pty)
+/// plus whether it was the active pane (caller cancels the editor).
+pub struct CloseEffect {
+    pub pane: PaneState,
+    pub was_active: bool,
+}
+
 pub struct SessionManager {
     pub panes: HashMap<usize, PaneState>,
     pub active_pane: usize,
@@ -551,6 +558,73 @@ impl SessionManager {
             self.split_root = SplitNode::from_ids(&ids);
         }
     }
+
+    /// Assign an id to a freshly spawned pane, register it, insert it into
+    /// the split tree next to the active pane, focus it, and (optionally) add
+    /// its tab. The caller provides the already-spawned `PaneState` (PTY
+    /// channels + parser) — id allocation and tree/tab bookkeeping are the
+    /// session's invariants, so no external code can desync them.
+    pub fn register_pane(&mut self, pane: PaneState, dir: SplitDir, push_tab: bool) -> usize {
+        let id = self.next_pane_id;
+        self.next_pane_id += 1;
+        self.panes.insert(id, pane);
+        self.active_pane = id;
+        self.scroll_offset = 0;
+        self.insert_pane_as_split(id, dir);
+        if push_tab {
+            self.tabs.push(Tab::new(id));
+        }
+        id
+    }
+
+    /// Close a pane: drop it from the map, remove its tree leaf (reconciling
+    /// so no dead id survives), drop its tab, clear the floating slot if it
+    /// was floating, and refocus the lowest remaining pane when it was active.
+    /// Refuses to close the last pane. Returns None when the pane is missing
+    /// or the session would be emptied.
+    pub fn close_pane(&mut self, id: usize) -> Option<CloseEffect> {
+        if self.panes.len() <= 1 {
+            return None;
+        }
+        let was_active = self.active_pane == id;
+        let pane = self.panes.remove(&id)?;
+        // Removes the leaf AND reconciles: the tree never keeps a dead id,
+        // so rendering never dereferences a removed pane.
+        self.remove_pane_from_tree(id);
+        self.tabs.retain(|t| t.id != id);
+        if self.floating == Some(id) {
+            self.floating = None;
+        }
+        if was_active {
+            self.active_pane = *self.panes.keys().next().unwrap_or(&0);
+            self.scroll_offset = 0;
+        }
+        Some(CloseEffect { pane, was_active })
+    }
+
+    /// Toggle the active pane between the split tree and the floating
+    /// overlay. Mirrors the old App-level dance: dock whatever was floating
+    /// (one float at a time), then float the active pane; the last visible
+    /// pane stays in the tree AND floats (overlay wins when drawn twice) so
+    /// zero visible panes are impossible.
+    pub fn toggle_floating(&mut self) {
+        let active = self.active_pane;
+        if self.floating == Some(active) {
+            // Dock: re-insert at the first remaining tree leaf.
+            self.dock_pane(active);
+        } else {
+            // Dock whatever was floating, then float active.
+            if let Some(prev) = self.floating.take() {
+                self.dock_pane(prev);
+            }
+            if !self.float_pane(active) {
+                // ponytail: last visible pane stays in tree AND floats
+                // (overlay wins when drawn twice); zero visible panes not
+                // allowed.
+                self.floating = Some(active);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +747,94 @@ mod tests {
             pane_cmd: String::new(),
             pty_dead: false,
         }
+    }
+
+    #[test]
+    fn register_pane_assigns_id_and_keeps_session_consistent() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.active_pane = 0;
+        let id = m.register_pane(pane_state(), SplitDir::Vertical, true);
+        assert_eq!(id, 1);
+        assert_eq!(m.next_pane_id, 2);
+        assert_eq!(m.active_pane, 1, "new pane is focused");
+        assert_eq!(m.scroll_offset, 0);
+        let mut leaves = m.split_root.leaves();
+        leaves.sort_unstable();
+        assert_eq!(leaves, vec![0, 1], "pane registered in the tree");
+        assert!(m.tabs.iter().any(|t| t.id == 1));
+    }
+
+    #[test]
+    fn register_pane_without_tab_keeps_tabs_empty() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.active_pane = 0;
+        m.register_pane(pane_state(), SplitDir::Horizontal, false);
+        assert!(m.tabs.is_empty(), "split panes are not tabs");
+    }
+
+    #[test]
+    fn close_pane_removes_leaf_and_refocuses() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.split_root = SplitNode::from_ids(&[0, 1]);
+        m.active_pane = 1;
+        let effect = m.close_pane(1).expect("pane 1 closes");
+        assert!(effect.was_active);
+        assert_eq!(m.active_pane, 0, "focus moves to the remaining pane");
+        assert_eq!(m.panes.len(), 1);
+        assert_eq!(m.split_root.leaves(), vec![0], "dead leaf removed");
+    }
+
+    #[test]
+    fn close_pane_refuses_to_close_last_pane() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        assert!(m.close_pane(0).is_none(), "last pane cannot close");
+        assert_eq!(m.panes.len(), 1);
+    }
+
+    #[test]
+    fn close_pane_clears_floating_slot() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.split_root = SplitNode::Leaf(0);
+        m.floating = Some(1);
+        m.active_pane = 1;
+        m.close_pane(1);
+        assert_eq!(m.floating, None, "floating slot cleared on close");
+    }
+
+    #[test]
+    fn toggle_floating_docks_then_floats() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.panes.insert(1, pane_state());
+        m.split_root = SplitNode::from_ids(&[0, 1]);
+        m.active_pane = 1;
+        m.toggle_floating();
+        assert_eq!(m.floating, Some(1), "active pane floats");
+        assert_eq!(m.split_root.leaves(), vec![0], "floated pane leaves tree");
+        // Toggle again: docks and floats the (same) active pane.
+        m.toggle_floating();
+        assert_eq!(m.split_root.leaves().len(), 2, "pane back in tree");
+    }
+
+    #[test]
+    fn toggle_floating_keeps_last_visible_pane_in_tree() {
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.active_pane = 0;
+        m.toggle_floating();
+        assert_eq!(
+            m.split_root.leaves(),
+            vec![0],
+            "sole pane stays in the tree while floating"
+        );
+        assert_eq!(m.floating, Some(0));
     }
 
     #[test]

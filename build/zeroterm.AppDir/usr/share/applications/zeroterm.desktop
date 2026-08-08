@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ZeroTerm
+Comment=GPU-accelerated terminal emulator
+Exec=zeroterm
+Icon=zeroterm
+Terminal=false
+Type=Application
+Categories=TerminalEmulator;
+StartupNotify=true

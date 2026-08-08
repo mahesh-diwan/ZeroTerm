@@ -6,7 +6,7 @@
 
 use zeroterm_core::screen::Screen;
 
-use crate::overlay::ScreenScratch;
+use crate::overlay::{Overlay, ScreenScratch};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -254,5 +254,20 @@ impl SettingsMenu {
 
     pub fn restore_screen(&mut self, screen: &mut Screen) {
         self.scratch.restore(screen);
+    }
+}
+
+impl Overlay for SettingsMenu {
+    fn is_open(&self) -> bool {
+        self.open
+    }
+    fn draw_bytes(&self, cols: usize, rows: usize) -> Vec<u8> {
+        self.overlay_bytes(cols, rows)
+    }
+    fn snapshot(&mut self, screen: &Screen) {
+        self.save_screen(screen);
+    }
+    fn restore(&mut self, screen: &mut Screen) {
+        self.restore_screen(screen);
     }
 }
