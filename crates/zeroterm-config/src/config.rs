@@ -46,6 +46,10 @@ pub struct Config {
 pub struct KeybindingsConfig {
     pub vim_mode: bool,
     pub shift_arrows_select: bool,
+    /// Accepted for backwards compatibility but currently a no-op: sending
+    /// CSI CUP to the shell at a bare prompt made readline render escape
+    /// garbage on the command line, so click-to-position was removed. Apps
+    /// that enable mouse tracking still get click positions via SGR sequences.
     pub click_to_position: bool,
 }
 
