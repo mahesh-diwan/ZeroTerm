@@ -2871,24 +2871,12 @@ impl ApplicationHandler for App {
                         {
                             self.copy_selection();
                         }
-                        // Click-to-position: send CSI CUP so the shell moves its cursor.
-                        if self.keybindings().click_to_position
-                            && self.session.scroll_offset == 0
-                            && y >= self.tab_bar_height()
-                            && self.pane_at_point(x, y) == Some(self.session.active_pane)
-                        {
-                            if let Some((global_row, col)) =
-                                self.screen_to_cell(self.session.active_pane, x, y)
-                            {
-                                let row = global_row.saturating_sub(
-                                    self.session
-                                        .panes
-                                        .get(&self.session.active_pane)
-                                        .map_or(0, |p| p.parser.screen().scrollback().len()),
-                                );
-                                self.write_pty(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
-                            }
-                        }
+                        // NOTE: click-to-position via CSI CUP is intentionally NOT sent.
+                        // Injecting "\x1b[<row>;<col>H" into the PTY at a bare shell prompt
+                        // makes readline render escape garbage on the command line ("clicks
+                        // trigger texts"). Apps that want click positions enable mouse
+                        // tracking and receive SGR sequences above; selection/copy is all
+                        // a click should do otherwise.
                     }
                     if let Some(window) = &self.window {
                         window.request_redraw();

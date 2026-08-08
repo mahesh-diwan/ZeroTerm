@@ -130,7 +130,7 @@ pub fn spawn_pty_process(
         return Ok(spawn_err_channels(shell, e.to_string()));
     }
 
-    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
     let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
 
     // Dedicated reader thread: forward PTY output to the parser without ever
@@ -180,7 +180,7 @@ pub fn spawn_pty_process(
 /// and swallows all commands, so panes render "failed to spawn" instead of
 /// dying silently. All `spawn_pty_process` call sites keep working unchanged.
 fn spawn_err_channels(shell: &str, err: String) -> (Receiver<Vec<u8>>, Sender<PtyCommand>) {
-    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
     let msg = format!(
         "\x1b[31m[zeroterm] failed to spawn shell '{}': {}\x1b[0m\r\n",
         shell, err
@@ -208,7 +208,7 @@ pub fn spawn_ssh_process(
     let password = password.map(|s| s.to_string());
     let key_path = key_path.map(|p| p.to_path_buf());
 
-    let (output_tx, pty_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    let (output_tx, pty_rx) = mpsc::channel::<Vec<u8>>();
     let (pty_tx, input_rx) = mpsc::channel::<PtyCommand>();
 
     std::thread::spawn(move || {
