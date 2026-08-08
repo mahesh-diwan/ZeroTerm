@@ -34,7 +34,9 @@ pub(crate) struct GlyphAtlas {
     row_height: u32,
     font_size: f32,
     /// Baseline position within a cell (ascent, in px) — glyph bitmaps are
-    /// anchored to it via `baseline + placement.top`.
+    /// anchored to it via `baseline - placement.top` (swash Origin::BottomLeft:
+    /// placement.top is the ink's top edge above the baseline, so in the cell's
+    /// y-down space the ink top sits `baseline - top` px below the cell top).
     baseline: f32,
     cell_width: f32,
     cell_height: f32,
@@ -229,11 +231,14 @@ impl GlyphAtlas {
     ) -> GlyphInfo {
         let w = image.placement.width;
         let h = image.placement.height;
-        // placement.left/top position the bitmap relative to the pen origin
-        // (cell left edge at the baseline, y-down): the ink of a normal glyph
-        // starts a hair left of the cell and its top sits above the baseline.
+        // swash renders with Origin::BottomLeft (y-up, baseline at 0):
+        // placement.top is the ink's TOP edge ABOVE the baseline, so in the
+        // cell's y-down space the ink top sits `baseline - placement.top` px
+        // below the cell top. The old `baseline + top` pushed every bitmap
+        // below the cell bottom, so the shader coverage test always failed
+        // and all text was invisible.
         let offset_x = image.placement.left as f32;
-        let offset_y = self.baseline + image.placement.top as f32;
+        let offset_y = self.baseline - image.placement.top as f32;
 
         // Advance to next row if needed
         if self.cursor_x + w > ATLAS_SIZE {

@@ -79,6 +79,11 @@ const ATTR_HAS_IMAGE: u32 = 0x400;
 const ATTR_BLOCK_DIVIDER: u32 = 0x800;
 const ATTR_DIM: u32 = 0x10;
 
+/// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
+/// this; the content viewport offset in main.rs derives from tab_bar_height(),
+/// so a mismatch would draw the bar taller than the layout reserves.
+const TAB_BAR_ROWS: usize = 2;
+
 const COPY_MARKER: &str = "[copy]";
 
 #[repr(C)]
@@ -641,7 +646,7 @@ impl Renderer {
         );
 
         let tab_bar_buffer = {
-            let cells = vec![CellData::zeroed(); cols as usize];
+            let cells = vec![CellData::zeroed(); (cols as usize) * 2];
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Tab Bar Cell Buffer"),
                 contents: bytemuck::cast_slice(&cells),
@@ -843,7 +848,7 @@ impl Renderer {
                 ],
             });
             self.tab_bar_buffer = {
-                let cells = vec![CellData::zeroed(); new_cols];
+                let cells = vec![CellData::zeroed(); new_cols * 2];
                 self.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Tab Bar Cell Buffer"),
@@ -1119,11 +1124,17 @@ impl Renderer {
                 .get(visible_rows.saturating_sub(1))
                 .map(|row| row.iter().take(70).map(|c| c.ch).collect())
                 .unwrap_or_default();
-            log::info!(
-                "[ZTDIAG] render_screen {}x{} ink={} last='{}'",
+            eprintln!(
+                "[ZTDIAG] render_screen {}x{} ink={} cap={} size={}x{} cell={}x{} viewport={:?} last='{}'",
                 visible_rows,
                 cols,
                 ink,
+                capacity,
+                self.size.width,
+                self.size.height,
+                self.cell_width,
+                self.cell_height,
+                self.viewport_origin,
                 last_text
             );
         }
@@ -1300,37 +1311,36 @@ impl Renderer {
         Ok(())
     }
 
-    /// Render a horizontal tab strip at the top of the window (one cell tall).
-    /// Runs as its own instanced pass after the pane(s); shader is unchanged.
+    /// Render a horizontal tab strip at the top of the window (two cell rows
+    /// tall, ~40px — Ghostty/Kitty proportions). Runs as its own instanced
+    /// pass after the pane(s); shader is unchanged. Row 0 carries the tab
+    /// titles and close buttons; both rows carry the pill backgrounds so the
+    /// bar reads as a solid strip with an active tab that stands out.
     pub fn draw_tab_bar(&mut self, tabs: &[TabInfo]) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
             return Ok(());
         }
 
         let t = self.theme;
-        let inactive_bg: [f32; 4] = [
+        let bar_bg: [f32; 4] = [
             t.surface.r as f32 / 255.0,
             t.surface.g as f32 / 255.0,
             t.surface.b as f32 / 255.0,
             1.0,
         ];
-        // Active tab bg: surface_highlight tinted ~30% toward accent (the pill).
+        // Active tab pill: surface_highlight tinted ~40% toward accent so the
+        // active tab clearly separates from the bar and from hover states.
         let active_bg: [f32; 4] = [
-            (t.accent.r as f32 * 0.3 + t.surface_highlight.r as f32 * 0.7) / 255.0,
-            (t.accent.g as f32 * 0.3 + t.surface_highlight.g as f32 * 0.7) / 255.0,
-            (t.accent.b as f32 * 0.3 + t.surface_highlight.b as f32 * 0.7) / 255.0,
+            (t.accent.r as f32 * 0.4 + t.surface_highlight.r as f32 * 0.6) / 255.0,
+            (t.accent.g as f32 * 0.4 + t.surface_highlight.g as f32 * 0.6) / 255.0,
+            (t.accent.b as f32 * 0.4 + t.surface_highlight.b as f32 * 0.6) / 255.0,
             1.0,
         ];
-        let fg: [f32; 4] = [
-            t.fg.r as f32 / 255.0,
-            t.fg.g as f32 / 255.0,
-            t.fg.b as f32 / 255.0,
-            1.0,
-        ];
-        let fg_dim: [f32; 4] = [
-            t.border.r as f32 / 255.0,
-            t.border.g as f32 / 255.0,
-            t.border.b as f32 / 255.0,
+        // Hovered (inactive) tab pill: one step above the bar background.
+        let hover_bg: [f32; 4] = [
+            t.surface_highlight.r as f32 / 255.0,
+            t.surface_highlight.g as f32 / 255.0,
+            t.surface_highlight.b as f32 / 255.0,
             1.0,
         ];
         let accent_fg: [f32; 4] = [
@@ -1339,10 +1349,10 @@ impl Renderer {
             t.accent.b as f32 / 255.0,
             1.0,
         ];
-        let hover_bg: [f32; 4] = [
-            t.border.r as f32 / 255.0,
-            t.border.g as f32 / 255.0,
-            t.border.b as f32 / 255.0,
+        let fg: [f32; 4] = [
+            t.fg.r as f32 / 255.0,
+            t.fg.g as f32 / 255.0,
+            t.fg.b as f32 / 255.0,
             1.0,
         ];
         let close_red: [f32; 4] = [
@@ -1359,16 +1369,18 @@ impl Renderer {
             .glyph_atlas
             .get_or_insert_glyph(' ', &self.device, &self.queue);
 
-        let mut batch = vec![CellData::zeroed(); cols];
+        let mut batch = vec![CellData::zeroed(); TAB_BAR_ROWS * cols];
         for cell in &mut batch {
-            cell.bg = inactive_bg;
-            cell.fg = fg_dim;
+            cell.bg = bar_bg;
+            cell.fg = fg;
             cell.glyph_uv_min = [space.0, space.1];
             cell.glyph_uv_max = [space.2, space.3];
             cell.glyph_size = [space.4, space.5];
             cell.glyph_offset = [space.6, space.7];
         }
 
+        // Same col layout as tab_at_point: starts at col 1, span = chars + 2,
+        // col += span + 1, so hover and click land on the same cells.
         let mut col = 1usize;
         for tab in tabs {
             if col >= cols {
@@ -1376,22 +1388,28 @@ impl Renderer {
             }
             let title = truncate_title(&tab.title, 20);
             let span = tab_span(&tab.title, 20);
-            let (bg, fgc) = if tab.active {
-                (active_bg, accent_fg)
-            } else if tab.hovered {
-                (hover_bg, fg)
-            } else {
-                (inactive_bg, fg_dim)
-            };
             let end = (col + span).min(cols);
-            for cell in batch.iter_mut().take(end).skip(col) {
-                cell.bg = bg;
-                cell.fg = fgc;
+
+            let (pill, title_fg, title_attrs) = if tab.active {
+                (active_bg, accent_fg, 0)
+            } else if tab.hovered {
+                (hover_bg, fg, 0)
+            } else {
+                // Inactive titles: full fg passed to the shader, dimmed there
+                // (ATTR_DIM = 0x10) so they recede without muddying colors.
+                (bar_bg, fg, ATTR_DIM)
+            };
+
+            // Pill background across both rows (title row + indicator row).
+            for r in 0..TAB_BAR_ROWS {
+                let base = r * cols;
+                for cell in batch.iter_mut().take(base + end).skip(base + col) {
+                    cell.bg = pill;
+                    cell.attrs = if r == 0 { title_attrs } else { 0 };
+                }
             }
-            // 1-cell accent line under the active tab (left padding cell).
-            if tab.active && col < end {
-                batch[col].bg = accent_fg;
-            }
+
+            // Title text on row 0.
             for (k, ch) in title.chars().enumerate() {
                 let c = col + 1 + k;
                 if c >= cols {
@@ -1400,27 +1418,30 @@ impl Renderer {
                 let (u0, v0, u1, v1, gw, gh, ox, oy) =
                     self.glyph_atlas
                         .get_or_insert_glyph(ch, &self.device, &self.queue);
-                batch[c].glyph_uv_min = [u0, v0];
-                batch[c].glyph_uv_max = [u1, v1];
-                batch[c].glyph_size = [gw, gh];
-                batch[c].glyph_offset = [ox, oy];
+                let cell = &mut batch[c];
+                cell.glyph_uv_min = [u0, v0];
+                cell.glyph_uv_max = [u1, v1];
+                cell.glyph_size = [gw, gh];
+                cell.glyph_offset = [ox, oy];
+                cell.fg = title_fg;
+                cell.attrs = title_attrs;
             }
-            // Close button occupies the right padding cell; only drawn while hovered.
-            if tab.hovered {
+
+            // Close button in the right padding cell: always on the active
+            // tab, on hover for the rest.
+            if tab.active || tab.hovered {
                 let close_c = col + span - 1;
                 if close_c < cols {
                     let (u0, v0, u1, v1, gw, gh, ox, oy) =
                         self.glyph_atlas
                             .get_or_insert_glyph('×', &self.device, &self.queue);
-                    batch[close_c].glyph_uv_min = [u0, v0];
-                    batch[close_c].glyph_uv_max = [u1, v1];
-                    batch[close_c].glyph_size = [gw, gh];
-                    batch[close_c].glyph_offset = [ox, oy];
-                    batch[close_c].fg = if tab.close_hovered {
-                        close_red
-                    } else {
-                        accent_fg
-                    };
+                    let cell = &mut batch[close_c];
+                    cell.glyph_uv_min = [u0, v0];
+                    cell.glyph_uv_max = [u1, v1];
+                    cell.glyph_size = [gw, gh];
+                    cell.glyph_offset = [ox, oy];
+                    cell.fg = if tab.close_hovered { close_red } else { accent_fg };
+                    cell.attrs = 0;
                 }
             }
             col += span + 1;
@@ -1434,7 +1455,7 @@ impl Renderer {
             cell_size: [self.cell_width, self.cell_height],
             viewport_origin: [0.0, 0.0],
             cols: cols as u32,
-            rows: 1,
+            rows: TAB_BAR_ROWS as u32,
             premultiply: self.premultiply_output,
             _pad: 0,
         };
@@ -1468,9 +1489,15 @@ impl Renderer {
         render_pass.set_bind_group(0, &self.tab_bar_bind_group, &[]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.quad_vertex_buffer.slice(..));
-        render_pass.draw(0..6, 0..cols as u32);
+        render_pass.draw(0..6, 0..(TAB_BAR_ROWS * cols) as u32);
 
         Ok(())
+    }
+
+    /// Height of the tab bar in pixels (two cell rows). main.rs uses this for
+    /// the content viewport offset; must stay in sync with draw_tab_bar.
+    pub fn tab_bar_height(&self) -> f32 {
+        TAB_BAR_ROWS as f32 * self.cell_height
     }
 
     /// Height of the status bar in pixels (one cell row).
@@ -1871,6 +1898,44 @@ impl Renderer {
                 attrs,
                 _pad1: [0; 3],
             };
+        }
+
+        // [ZTDIAG] Content-pass red-cell test: paint every cell bright red so a
+        // framebuffer dump can tell whether the content pass draws at all.
+        if std::env::var("ZTDIAG_CELLTEST").is_ok() {
+            for cell in batch.iter_mut() {
+                cell.bg = [1.0, 0.1, 0.1, 1.0];
+                cell.glyph_size = [0.0, 0.0];
+                cell.glyph_uv_min = [0.0, 0.0];
+                cell.glyph_uv_max = [0.0, 0.0];
+            }
+        }
+        if std::env::var("ZTDIAG_CELLDUMP").is_ok() {
+            // Find batch rows that carry actual glyph ink (scrollback offset can
+            // shift the prompt away from its screen row) and dump the first one.
+            let mut rows_with_ink = Vec::new();
+            for r in 0..visible_rows {
+                let base = r * cols;
+                if (0..cols).any(|c| batch.get(base + c).is_some_and(|cd| cd.glyph_size[0] > 0.0)) {
+                    rows_with_ink.push(r);
+                }
+            }
+            eprintln!("[ZTDIAG] batch rows-with-glyphs: {:?} (of {} rows)", rows_with_ink, visible_rows);
+            if let Some(&r) = rows_with_ink.first() {
+                let mut out = format!("[ZTDIAG] batch row {r} (cols={cols} rows={visible_rows}):\n");
+                for c in 0..cols.min(40) {
+                    if let Some(cd) = batch.get(r * cols + c) {
+                        if cd.glyph_size[0] > 0.0 {
+                            out.push_str(&format!(
+                                "  c{c}: uv=({:.3},{:.3})-({:.3},{:.3}) sz=({:.1},{:.1}) off=({:.1},{:.1})\n",
+                                cd.glyph_uv_min[0], cd.glyph_uv_min[1], cd.glyph_uv_max[0], cd.glyph_uv_max[1],
+                                cd.glyph_size[0], cd.glyph_size[1], cd.glyph_offset[0], cd.glyph_offset[1]
+                            ));
+                        }
+                    }
+                }
+                eprintln!("{out}");
+            }
         }
 
         self.queue

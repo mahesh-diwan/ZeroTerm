@@ -727,7 +727,7 @@ impl App {
             // Resize floating pane to overlay dims so cells don't overflow the box.
             if let Some(id) = self.session.floating {
                 if let Some(pane) = self.session.panes.get_mut(&id) {
-                    let tab_h = renderer.cell_size()[1];
+                    let tab_h = renderer.tab_bar_height();
                     let status_h = renderer.status_bar_height();
                     let content_h = (window.inner_size().height as f32 - tab_h - status_h).max(0.0);
                     let cols = renderer.cols_for(window.inner_size().width as f32 * 0.7);
@@ -1151,7 +1151,7 @@ impl App {
             return Ok(());
         };
         let win_size = window.inner_size();
-        let tab_h = renderer.cell_size()[1];
+        let tab_h = renderer.tab_bar_height();
         let status_h = renderer.status_bar_height();
         let content_h = (win_size.height as f32 - tab_h - status_h).max(0.0);
 
@@ -1304,7 +1304,7 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let tab_h = renderer.cell_size()[1];
+        let tab_h = renderer.tab_bar_height();
         let status_h = renderer.status_bar_height();
         let content_h = (size.height as f32 - tab_h - status_h).max(0.0);
         let rects = self.session.rects();
@@ -1567,9 +1567,9 @@ impl App {
     }
 
     // Selection methods
-    /// Tab bar height in pixels = one cell row (must match render()'s content_h math).
+    /// Tab bar height in pixels = two cell rows (must match render()'s content_h math).
     fn tab_bar_height(&self) -> f32 {
-        self.renderer.as_ref().map_or(0.0, |r| r.cell_size()[1])
+        self.renderer.as_ref().map_or(0.0, |r| r.tab_bar_height())
     }
 
     /// Status bar height in pixels = one cell row (must match render()'s content_h math).

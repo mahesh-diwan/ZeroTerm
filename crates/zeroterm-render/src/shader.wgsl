@@ -28,7 +28,7 @@ struct CellData {
     glyph_uv_max: vec2<f32>,
     glyph_size: vec2<f32>,
     // Top-left of the glyph bitmap inside the cell, in cell pixels
-    // (placement.left, baseline + placement.top).
+    // (placement.left, baseline - placement.top).
     glyph_offset: vec2<f32>,
     fg: vec4<f32>,
     bg: vec4<f32>,
