@@ -26,6 +26,12 @@ jobs:
             cargo_exclude: "--exclude zeroterm"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Transient crates.io failures are the #1 CI flake source; make cargo retry
+    # individual requests (10x, 120s timeout) so a single dropped connection
+    # never fails the whole pipeline.
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_TIMEOUT: 120
     steps:
       - uses: actions/checkout@v4
       # components must be a single comma-separated string (a YAML list or
@@ -54,16 +60,16 @@ jobs:
           # Note: run: steps execute with set -e, so the retry loop must turn
           # it off or the first failed fetch would abort the whole step.
           set +e
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             cargo fetch --locked
             status=$?
             if [ "$status" -eq 0 ]; then break; fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
+            echo "::warning::cargo fetch attempt ${i}/5 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::error::cargo fetch failed after 3 attempts"
+            echo "::error::cargo fetch failed after 5 attempts"
             exit 1
           fi
           cargo build --locked --offline --workspace ${{ matrix.cargo_exclude }}

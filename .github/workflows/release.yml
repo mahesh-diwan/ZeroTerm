@@ -27,6 +27,12 @@ jobs:
           # first-time Windows build can't block the linux/macos release.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Transient crates.io failures are the #1 CI flake source; make cargo retry
+    # individual requests (10x, 120s timeout) so a dropped connection never
+    # fails the whole pipeline.
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_TIMEOUT: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,16 +52,16 @@ jobs:
           # depends on the network. (run: steps use set -e, so the loop must
           # turn it off or the first failed fetch aborts the step.)
           set +e
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             cargo fetch --locked
             status=$?
             if [ "$status" -eq 0 ]; then break; fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
+            echo "::warning::cargo fetch attempt ${i}/5 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::error::cargo fetch failed after 3 attempts"
+            echo "::error::cargo fetch failed after 5 attempts"
             exit 1
           fi
           cargo build --release --locked --offline -p zeroterm
@@ -97,6 +103,9 @@ jobs:
     # verified on a real Windows host, so a Windows failure must not block
     # publishing the Linux/macOS release. If it ever passes, its zip ships too.
     continue-on-error: true
+    env:
+      CARGO_NET_RETRY: 10
+      CARGO_HTTP_TIMEOUT: 120
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,16 +117,16 @@ jobs:
           # would abort the step on the first failed fetch. Turn set -e off
           # inside the retry loop (same pattern as the build matrix job).
           set +e
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             cargo fetch --locked
             status=$?
             if [ "$status" -eq 0 ]; then break; fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
+            echo "::warning::cargo fetch attempt ${i}/5 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::error::cargo fetch failed after 3 attempts"
+            echo "::error::cargo fetch failed after 5 attempts"
             exit 1
           fi
           cargo build --release --locked --offline -p zeroterm
@@ -147,9 +156,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
-          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install -y --noninteractive org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
-          flatpak install -y --noninteractive org.freedesktop.Sdk.Extension.rust-stable//24.08
+          # GH runners run unprivileged: system-wide flatpak config is denied
+          # ("ConfigureRemote not allowed for user"), so configure the user
+          # installation explicitly.
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+          flatpak install --user -y --noninteractive org.freedesktop.Sdk.Extension.rust-stable//24.08
       - name: Build Flatpak
         run: flatpak-builder --repo=repo --force-clean build-dir scripts/io.github.zeroterm.ZeroTerm.yml
       - name: Bundle Flatpak
@@ -173,18 +185,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
       - name: Build .deb package
+        env:
+          CARGO_NET_RETRY: 10
+          CARGO_HTTP_TIMEOUT: 120
         run: |
           set +e
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             cargo fetch --locked
             status=$?
             if [ "$status" -eq 0 ]; then break; fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
+            echo "::warning::cargo fetch attempt ${i}/5 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::error::cargo fetch failed after 3 attempts"
+            echo "::error::cargo fetch failed after 5 attempts"
             exit 1
           fi
           cargo build --release --locked --offline
@@ -208,18 +223,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rpm libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl-dev libssl-dev pkg-config
       - name: Build .rpm package
+        env:
+          CARGO_NET_RETRY: 10
+          CARGO_HTTP_TIMEOUT: 120
         run: |
           set +e
-          for i in 1 2 3; do
+          for i in 1 2 3 4 5; do
             cargo fetch --locked
             status=$?
             if [ "$status" -eq 0 ]; then break; fi
-            echo "::warning::cargo fetch attempt ${i}/3 failed (exit ${status}); retrying in 10s"
+            echo "::warning::cargo fetch attempt ${i}/5 failed (exit ${status}); retrying in 10s"
             sleep 10
           done
           set -e
           if [ "$status" -ne 0 ]; then
-            echo "::error::cargo fetch failed after 3 attempts"
+            echo "::error::cargo fetch failed after 5 attempts"
             exit 1
           fi
           cargo build --release --locked --offline
