@@ -1,6 +1,6 @@
 [package]
 name = "zeroterm-config"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT"
 description = "TOML parser, Lua runtime, and GUI settings for ZeroTerm"
