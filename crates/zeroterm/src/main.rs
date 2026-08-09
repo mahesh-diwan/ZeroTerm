@@ -188,6 +188,16 @@ fn cells_for_size(cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, 
     (cols, rows)
 }
 
+/// Remove a stale session layout file, if present. Called when session
+/// restore is disabled — at init (so a leftover file can't resurrect old
+/// tabs) and on close (so nothing accumulates) — guaranteeing every launch
+/// starts fresh while restore stays off.
+fn discard_stale_layout(path: &Path) {
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 impl App {
     fn new() -> Self {
         Self {
@@ -489,9 +499,7 @@ impl App {
         // through the pty layer (never bypassed). A missing or corrupt file
         // falls back to the single default tab already set up.
         if !config.session.restore {
-            if layout_path.exists() {
-                let _ = std::fs::remove_file(&layout_path);
-            }
+            discard_stale_layout(&layout_path);
         } else if let Some(saved) = SessionLayout::restore(&layout_path) {
             // Restore per-tab: pane 0 (the shell spawned above) stands in for
             // saved tab 0's first pane; every other PaneSpec spawns through the
@@ -631,9 +639,7 @@ impl App {
         let restore = self.config.as_ref().map_or(false, |c| c.session.restore);
         let path = Config::default_config_path().with_file_name("layout.json");
         if !restore {
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
+            discard_stale_layout(&path);
             return;
         }
         let cwd = std::env::current_dir()
