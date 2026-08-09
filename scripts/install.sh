@@ -42,39 +42,57 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || err "required command not found:
 
 # --- version resolution ------------------------------------------------------
 
+# Print the newest version from a newline-separated tag list. Normalizes a
+# leading 'v' and ranks stable releases above prereleases, so ordering is
+# correct regardless of GitHub's list order: v0.10.0 > v0.9.2, and
+# v0.3.5 > v0.3.5-rc1.
+pick_newest() {
+    printf '%s\n' "$1" | awk '
+        {
+            name = $0
+            v = $0
+            sub(/^v/, "", v)              # drop leading v
+            split(v, s, "-")              # s[1] = core, s[2] = prerelease suffix
+            core = s[1]
+            stab = (s[2] == "" ? 9 : 1)   # stable releases outrank prereleases
+            n = split(core, p, ".")
+            key = sprintf("%08d", p[1])
+            for (i = 2; i <= 4; i++) key = key "." sprintf("%08d", (i <= n ? p[i] : 0))
+            print key "." stab " " name
+        }' | sort | tail -1 | sed 's/^[^ ]* //'
+}
+
 resolve_version() {
     if [[ -n "${ZEROTERM_VERSION:-}" ]]; then
         log "installing pinned version ${ZEROTERM_VERSION}"
         printf '%s\n' "${ZEROTERM_VERSION}"
         return
     fi
-    local json tags v latest lv newer
+    local json tags v latest lv
     v=""
-    # The newest *tag* wins, compared numerically so v0.10.0 beats v0.9.x
-    # regardless of GitHub's ordering. The newest *published release* tag is
-    # also considered; the newer of the two is installed. This guarantees the
+    # The newest *tag* wins (see pick_newest). The newest *published release*
+    # tag is also considered; the newer of the two wins. This guarantees the
     # curl flow always installs the latest tagged version, even when an older
     # release with prebuilt assets is published.
     json="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/tags?per_page=100" 2>/dev/null || true)"
     if [[ -n "$json" ]]; then
         tags="$(printf '%s' "$json" \
-            | grep -o '"name"[[:space:]]*:[[:space:]]*"v[^"]*"' \
+            | grep -o '"name"[[:space:]]*:[[:space:]]*"v\?[0-9][^"]*"' \
             | sed 's/.*"\([^"]*\)"$/\1/' \
             || true)"
-        v="$(printf '%s\n' "$tags" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 || true)"
+        v="$(pick_newest "$tags" || true)"
     fi
     latest="$(curl -fsSL --retry 3 --retry-delay 2 --max-time 20 "${API_URL}/releases/latest" 2>/dev/null || true)"
     if [[ -n "$latest" ]]; then
         lv="$(printf '%s' "$latest" \
-            | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+            | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"v\?[0-9][^"]*"' | head -1 \
             | sed 's/.*"\([^"]*\)"$/\1/' \
             || true)"
         if [[ -n "$lv" ]]; then
             if [[ -z "$v" ]]; then
                 v="$lv"
             else
-                newer="$(printf '%s\n%s\n' "$v" "$lv" | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1 || true)"
-                v="$newer"
+                v="$(pick_newest "$(printf '%s\n%s\n' "$v" "$lv")" || true)"
             fi
         fi
     fi
@@ -250,7 +268,11 @@ build_from_source() {
     local src dir bin tarball
     need_cmd cargo || err "no prebuilt binary is published for this platform and Rust (cargo) is not installed. Install Rust from https://rustup.rs and re-run."
     need_cmd tar
-    log "no prebuilt binary for this platform; building from source at ${version} ..."
+    if [[ -n "${ZEROTERM_TARBALL:-}" ]]; then
+        log "building from the supplied source tarball at ${version} ..."
+    else
+        log "no prebuilt binary for this platform; building from source at ${version} ..."
+    fi
     src="$(mktemp -d)"
     if [[ -n "${ZEROTERM_TARBALL:-}" ]]; then
         tarball="${ZEROTERM_TARBALL}"
@@ -326,7 +348,7 @@ Overrides:
   ZEROTERM_INSTALL_DIR  install destination (default: ~/.local/bin for
                         binaries, ~/Applications for the macOS app)
   ZEROTERM_SOURCE=1     build from source instead of the prebuilt package
-  ZEROTERM_TARBALL     override the source tarball URL (CI mirrors / local
+  ZEROTERM_TARBALL      override the source tarball URL (CI mirrors / local
                        testing); implies a source build
 HELP
             exit 0
@@ -341,7 +363,7 @@ HELP
     platform="$(detect_platform)"
 
     if [[ -n "${ZEROTERM_SOURCE:-}" || -n "${ZEROTERM_TARBALL:-}" ]]; then
-        log "ZEROTERM_SOURCE is set; building from source at ${version} (skipping prebuilt packages)"
+        log "building from source at ${version} (skipping prebuilt packages)"
         bin="$(build_from_source "$version")"
         verify_install "$bin"
         return 0
