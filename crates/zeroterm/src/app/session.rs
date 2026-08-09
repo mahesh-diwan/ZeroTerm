@@ -811,6 +811,31 @@ mod tests {
     }
 
     #[test]
+    fn resize_skips_unchanged_size() {
+        // Regression: the startup resize storm re-sent the same PTY size over
+        // and over, and bash reprints its prompt on every SIGWINCH. The dedupe
+        // must skip sizes already sent and still deliver real changes.
+        let (tx, rx) = mpsc::channel::<PtyCommand>();
+        let mut pane = PaneState {
+            parser: Parser::new(80, 24),
+            pty_rx: mpsc::channel().1,
+            pty_tx: tx,
+            title: String::new(),
+            pane_cmd: String::new(),
+            pty_dead: false,
+            last_resize: None,
+        };
+        pane.resize(80, 24);
+        assert!(matches!(rx.try_recv(), Ok(PtyCommand::Resize(_))));
+        // Same size again: must NOT re-send (no second SIGWINCH).
+        pane.resize(80, 24);
+        assert!(rx.try_recv().is_err(), "duplicate resize must be skipped");
+        // A real change still goes through.
+        pane.resize(90, 30);
+        assert!(matches!(rx.try_recv(), Ok(PtyCommand::Resize(_))));
+    }
+
+    #[test]
     fn register_pane_assigns_id_and_keeps_session_consistent() {
         let mut m = SessionManager::new();
         m.panes.insert(0, pane_state());

@@ -436,6 +436,27 @@ mod tests {
     }
 
     #[test]
+    fn estimate_cell_size_matches_atlas_metrics() {
+        // Regression: the app spawns the PTY at a size computed from
+        // estimate_cell_size (no GPU). If it drifts from the real atlas
+        // metrics, the spawn estimate disagrees with the renderer -> resize
+        // storm -> bash reprints its prompt. cell_metrics() below recomputes
+        // the atlas's ground truth without a GPU.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/DejaVuSansMono.ttf");
+        let (cell_height, _baseline) = cell_metrics(14.0);
+        let (w, h) = estimate_cell_size(14.0, Some(path));
+        assert!(w > 0.0 && h > 0.0, "metrics must be positive: {w}x{h}");
+        assert!(
+            (h - cell_height).abs() < 0.01,
+            "estimate height {h} must match atlas {cell_height}"
+        );
+        assert!(h > w, "monospace cell: height {h} > width {w}");
+        // No font available -> nonzero fallback with a sane aspect.
+        let (w2, h2) = estimate_cell_size(14.0, None);
+        assert!(w2 > 0.0 && h2 > 0.0 && h2 > w2);
+    }
+
+    #[test]
     fn glyph_bitmaps_fit_inside_their_cell() {
         // Regression for the invisible-text bug: pack_glyph computed
         // offset_y = baseline + placement.top, which put every bitmap below

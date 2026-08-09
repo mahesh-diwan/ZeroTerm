@@ -80,7 +80,13 @@ pub struct TabInfo {
 /// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
 /// this; the content viewport offset in main.rs derives from tab_bar_height(),
 /// so a mismatch would draw the bar taller than the layout reserves.
-const TAB_BAR_ROWS: usize = 2;
+/// Chrome rows reserved above the grid: tab bar plus status bar. These are
+/// the single source of truth for spawn-time size estimates in the app crate
+/// (cells_for_size) so they can never drift from this layout.
+pub const TAB_BAR_ROWS: usize = 2;
+pub const STATUS_BAR_ROWS: usize = 1;
+/// Grid padding in physical pixels, ordered [left, right, top, bottom].
+pub const PADDING: [f32; 4] = [16.0, 16.0, 16.0, 16.0];
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -651,7 +657,7 @@ impl Renderer {
             cell_height,
             dirty_cells: Vec::new(),
             viewport_origin: [0.0, 0.0],
-            padding: [16.0, 16.0, 16.0, 16.0],
+            padding: PADDING,
             current_frame: None,
             current_view: None,
             current_encoder: None,
@@ -1161,7 +1167,7 @@ impl Renderer {
 
     /// Height of the status bar in pixels (one cell row).
     pub fn status_bar_height(&self) -> f32 {
-        self.cell_height
+        STATUS_BAR_ROWS as f32 * self.cell_height
     }
 
     /// Render a one-cell-tall status bar across the bottom of the window,

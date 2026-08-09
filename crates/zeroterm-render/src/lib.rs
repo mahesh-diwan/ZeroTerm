@@ -8,7 +8,7 @@ pub mod renderer;
 pub mod theme;
 
 pub use atlas::estimate_cell_size;
-pub use renderer::{tab_span, Renderer, Selection, TabInfo};
+pub use renderer::{tab_span, Renderer, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
 
 pub struct RenderConfig {
     pub font_size: f32,

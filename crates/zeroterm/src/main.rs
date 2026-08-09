@@ -166,15 +166,25 @@ fn should_focus_follow(
 
 #[allow(dead_code)]
 /// cols/rows for a window of `size` at `cell_w` x `cell_h`, mirroring the
-/// renderer's resize_panes_to_rects math exactly: 2 tab-bar rows + 1 status
-/// row of chrome, 16px padding per side, floor, clamp to >= 1. Every PTY
-/// spawn site shares this so the shell starts at its final size and the
-/// PaneState resize dedupe never re-sends — bash prints its prompt exactly
-/// once instead of reprinting on a resize storm.
+/// renderer's resize_panes_to_rects math exactly. Chrome rows (tab bar +
+/// status bar) and padding come from the renderer crate's public constants,
+/// so the spawn estimate can never drift from the renderer layout; floor and
+/// clamp to >= 1 match cols_for/rows_for. Every PTY spawn site shares this so
+/// the shell starts at its final size and the PaneState resize dedupe never
+/// re-sends — bash prints its prompt exactly once instead of reprinting on a
+/// startup resize storm. (Split/SSH panes still receive one resize to their
+/// final, smaller rect after insertion — a single prompt reprint per pane
+/// creation, inherent to splits and acceptable.)
 fn cells_for_size(cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
-    let content_h = (size.height as f32 - 3.0 * cell_h).max(0.0);
-    let cols = ((size.width as f32 - 32.0) / cell_w).floor().max(1.0) as usize;
-    let rows = ((content_h - 32.0) / cell_h).floor().max(1.0) as usize;
+    use zeroterm_render::{PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
+    let chrome = (TAB_BAR_ROWS + STATUS_BAR_ROWS) as f32 * cell_h;
+    let content_h = (size.height as f32 - chrome).max(0.0);
+    let cols = ((size.width as f32 - PADDING[1] - PADDING[3]) / cell_w)
+        .floor()
+        .max(1.0) as usize;
+    let rows = ((content_h - PADDING[0] - PADDING[2]) / cell_h)
+        .floor()
+        .max(1.0) as usize;
     (cols, rows)
 }
 
@@ -397,7 +407,7 @@ impl App {
         // same size, the PaneState dedupe skips it — no SIGWINCH, and bash
         // prints its prompt exactly once instead of reprinting on a startup
         // resize storm (was 8.4x15px guess -> three resizes -> three prompts).
-        let dpr = window.scale_factor().max(1.0) as f32;
+        let dpr = window.scale_factor().max(0.5) as f32; // same clamp as Renderer::new
         let (cell_w, cell_h) =
             zeroterm_render::estimate_cell_size(font_size * dpr, self.font_path.as_deref());
         let (cols, rows) = cells_for_size(cell_w, cell_h, size);
@@ -604,7 +614,7 @@ impl App {
                     (c[0], c[1])
                 }
                 None => {
-                    let dpr = window.scale_factor().max(1.0) as f32;
+                    let dpr = window.scale_factor().max(0.5) as f32; // same clamp as Renderer::new
                     zeroterm_render::estimate_cell_size(
                         self.font_size * dpr,
                         self.font_path.as_deref(),
@@ -657,7 +667,7 @@ impl App {
                     (c[0], c[1])
                 }
                 None => {
-                    let dpr = window.scale_factor().max(1.0) as f32;
+                    let dpr = window.scale_factor().max(0.5) as f32; // same clamp as Renderer::new
                     zeroterm_render::estimate_cell_size(
                         self.font_size * dpr,
                         self.font_path.as_deref(),
@@ -784,7 +794,7 @@ impl App {
                     (c[0], c[1])
                 }
                 None => {
-                    let dpr = window.scale_factor().max(1.0) as f32;
+                    let dpr = window.scale_factor().max(0.5) as f32; // same clamp as Renderer::new
                     zeroterm_render::estimate_cell_size(
                         self.font_size * dpr,
                         self.font_path.as_deref(),
@@ -3093,6 +3103,18 @@ mod tests {
             EditAction::Handled
         );
         assert!(!app.editor.is_active());
+    }
+
+    #[test]
+    fn cells_for_size_matches_renderer_math() {
+        // Pins the exact pair the renderer produced at runtime (verified
+        // live: 946x501 at 10x22 cells -> 91 cols x 18 rows). Chrome = 3 rows
+        // (2 tab + 1 status), padding 16px per side. If the shared constants
+        // drift, this fails.
+        let (cols, rows) = cells_for_size(10.0, 22.0, PhysicalSize::new(946, 501));
+        assert_eq!((cols, rows), (91, 18));
+        // Degenerate windows clamp to >= 1 col/row like cols_for/rows_for.
+        assert_eq!(cells_for_size(10.0, 22.0, PhysicalSize::new(5, 5)), (1, 1));
     }
 
     #[test]
