@@ -19,8 +19,8 @@ use zeroterm_ai::client::{AiClient, AiError};
 use zeroterm_config::{Config, KeybindingsConfig};
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::Parser;
-use zeroterm_mux::session::{PaneSpec, Session, SessionLayout};
-use zeroterm_mux::split::SplitDir;
+use zeroterm_mux::session::{PaneSpec, Session, SessionLayout, TabLayout};
+use zeroterm_mux::split::{SplitDir, SplitNode};
 use zeroterm_mux::tab::Tab;
 #[cfg(feature = "plugins")]
 use zeroterm_plugin::Plugin;
@@ -459,9 +459,13 @@ impl App {
         };
 
         self.window = Some(window);
+        // The pre-spawned shell becomes the first classic tab. `tabs` is never
+        // empty after init, so every SessionManager op has a live tab.
         self.session.panes = panes;
-        self.session.active_pane = 0;
         self.session.next_pane_id = 1;
+        self.session.tabs.push(Tab::with_pane(0, 0));
+        self.session.active_tab = 0;
+        self.session.sync_active();
 
         let layout_path = Config::default_config_path().with_file_name("layout.json");
         zt("session load start");
@@ -470,46 +474,73 @@ impl App {
         // PaneSpec spawns through the pty layer (never bypassed). A missing or
         // corrupt file falls back to the single default tab already set up.
         if let Some(saved) = SessionLayout::restore(&layout_path) {
-            let mut restored_ids = vec![0usize];
-            for spec in saved.panes.iter().skip(1) {
-                let cmd = if spec.cmd.is_empty() {
-                    shell.clone()
-                } else {
-                    spec.cmd.clone()
-                };
-                match spawn_pty_process(&cmd, &[], &[], cols, rows, self.wake_proxy()) {
-                    Ok((pty_rx, pty_tx)) => {
-                        // FIXME(test): startup bracketed-paste probe removed for leak test.
-                        // let _ = pty_tx.send(PtyCommand::Write(b"\x1b[?2004h".to_vec()));
-                        let id = self.session.next_pane_id;
-                        self.session.next_pane_id += 1;
-                        self.session.panes.insert(
-                            id,
-                            PaneState {
-                                parser: Parser::new(cols, rows),
-                                pty_rx,
-                                pty_tx,
-                                title: spec.title.clone(),
-                                pane_cmd: cmd,
-                                pty_dead: false,
-                                last_resize: Some((cols, rows)),
-                            },
-                        );
-                        self.session.tabs.push(Tab::new(id));
-                        restored_ids.push(id);
+            // Restore per-tab: pane 0 (the shell spawned above) stands in for
+            // saved tab 0's first pane; every other PaneSpec spawns through the
+            // pty layer (never bypassed). A missing or corrupt file falls back
+            // to the single default tab already set up.
+            let mut restored: Vec<Vec<usize>> = Vec::new();
+            for (ti, tab) in saved.tabs.iter().enumerate() {
+                let mut ids = Vec::new();
+                if ti == 0 {
+                    ids.push(0usize); // the pre-spawned shell
+                }
+                for spec in tab.panes.iter().skip(if ti == 0 { 1 } else { 0 }) {
+                    let cmd = if spec.cmd.is_empty() {
+                        shell.clone()
+                    } else {
+                        spec.cmd.clone()
+                    };
+                    match spawn_pty_process(&cmd, &[], &[], cols, rows, self.wake_proxy()) {
+                        Ok((pty_rx, pty_tx)) => {
+                            let id = self.session.next_pane_id;
+                            self.session.next_pane_id += 1;
+                            self.session.panes.insert(
+                                id,
+                                PaneState {
+                                    parser: Parser::new(cols, rows),
+                                    pty_rx,
+                                    pty_tx,
+                                    title: spec.title.clone(),
+                                    pane_cmd: cmd,
+                                    pty_dead: false,
+                                    last_resize: Some((cols, rows)),
+                                },
+                            );
+                            ids.push(id);
+                        }
+                        Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
                     }
-                    Err(e) => warn!("Session restore: failed to spawn '{}': {}", cmd, e),
                 }
+                restored.push(ids);
             }
-            if let Some(split) = saved.split {
-                // Saved leaf ids are positions into `saved.panes`; remap them
-                // onto the freshly assigned ids so the tree survives the id reset.
-                self.session.set_tree(SessionLayout::remap_split(&split, &restored_ids));
-                if saved.active_pane < restored_ids.len() {
-                    self.session.active_pane = restored_ids[saved.active_pane];
-                    self.session.scroll_offset = 0;
+            // Rebuild the per-tab trees. Saved leaf ids are positions into
+            // that tab's pane list; remap them onto the freshly assigned ids.
+            self.session.tabs.clear();
+            for (ti, tab) in saved.tabs.iter().enumerate() {
+                let ids = &restored[ti];
+                if ids.is_empty() {
+                    continue;
                 }
+                let tree = tab
+                    .split
+                    .as_ref()
+                    .map(|s| SessionLayout::remap_split(s, ids))
+                    .unwrap_or_else(|| SplitNode::from_ids(ids));
+                let active = if tab.active_pane < ids.len() {
+                    ids[tab.active_pane]
+                } else {
+                    ids[0]
+                };
+                self.session.tabs.push(Tab {
+                    id: ids[0],
+                    panes: ids.clone(),
+                    tree,
+                    active_pane: active,
+                });
             }
+            self.session.active_tab =
+                saved.active_tab.min(self.session.tabs.len().saturating_sub(1));
+            self.session.sync_active();
         }
 
         #[cfg(feature = "ai")]
@@ -577,28 +608,39 @@ impl App {
     /// the split tree double as positions into the saved pane list.
     fn save_session_layout(&self) {
         let path = Config::default_config_path().with_file_name("layout.json");
-        let ids = self.session.pane_ids();
         let cwd = std::env::current_dir()
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let panes: Vec<PaneSpec> = ids
+        let tabs = self
+            .session
+            .tabs
             .iter()
-            .map(|&id| {
-                let pane = &self.session.panes[&id];
-                PaneSpec {
-                    title: pane.title.clone(),
-                    cmd: pane.pane_cmd.clone(),
-                    cwd: cwd.clone(),
+            .map(|tab| {
+                // Saved pane list in sorted-id order so tree leaf ids can be
+                // stored as positions (to_positions) and remapped on restore.
+                let mut ids = tab.panes.clone();
+                ids.sort();
+                let panes: Vec<PaneSpec> = ids
+                    .iter()
+                    .map(|&id| {
+                        let pane = &self.session.panes[&id];
+                        PaneSpec {
+                            title: pane.title.clone(),
+                            cmd: pane.pane_cmd.clone(),
+                            cwd: cwd.clone(),
+                        }
+                    })
+                    .collect();
+                TabLayout {
+                    panes,
+                    split: Some(tab.tree.to_positions(&ids)),
+                    active_pane: ids.iter().position(|&i| i == tab.active_pane).unwrap_or(0),
                 }
             })
             .collect();
         let layout = SessionLayout {
-            active_pane: ids
-                .iter()
-                .position(|&i| i == self.session.active_pane)
-                .unwrap_or(0),
-            panes,
-            split: Some(self.session.tree().clone()),
+            active_tab: self.session.active_tab,
+            tabs,
         };
         if let Err(e) = Session::new(0, layout).save(&path) {
             error!("Failed to save session layout: {}", e);
@@ -720,21 +762,36 @@ impl App {
     }
 
     fn close_active_tab(&mut self) {
-        self.close_tab(self.session.active_pane);
+        if let Some(tab) = self.session.tabs.get(self.session.active_tab) {
+            self.close_tab(tab.id);
+        }
     }
 
-    fn close_tab(&mut self, id: usize) {
-        if let Some(effect) = self.session.close_pane(id) {
-            let _ = effect.pane.pty_tx.send(PtyCommand::Kill);
-            if effect.was_active {
-                self.editor.cancel();
+    fn close_tab(&mut self, tab_id: usize) {
+        // A tab is all its panes: close every pane (the session refuses the
+        // last pane overall, so the window never empties).
+        let ids: Vec<usize> = self
+            .session
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.panes.clone())
+            .unwrap_or_default();
+        let mut closed_active = false;
+        for id in ids {
+            if let Some(effect) = self.session.close_pane(id) {
+                let _ = effect.pane.pty_tx.send(PtyCommand::Kill);
+                closed_active |= effect.was_active;
             }
-            self.hovered_tab = None;
-            self.hovered_tab_close = false;
-            self.resize_panes_to_rects();
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        }
+        if closed_active {
+            self.editor.cancel();
+        }
+        self.hovered_tab = None;
+        self.hovered_tab_close = false;
+        self.resize_panes_to_rects();
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 
@@ -765,18 +822,23 @@ impl App {
 
     fn next_tab(&mut self) {
         if self.session.next_tab() {
+            self.resize_panes_to_rects();
             self.redraw();
         }
     }
 
     fn previous_tab(&mut self) {
         if self.session.previous_tab() {
+            self.resize_panes_to_rects();
             self.redraw();
         }
     }
 
     fn switch_to_tab(&mut self, idx: usize) {
         if self.session.switch_to_tab(idx) {
+            // The newly visible tab's panes must match the current window (it
+            // may have resized while inactive).
+            self.resize_panes_to_rects();
             self.redraw();
         }
     }
@@ -829,10 +891,8 @@ impl App {
                 self.wake_proxy(),
             )?;
             let parser = Parser::new(cols, rows);
-            let id = self.session.next_pane_id;
-            self.session.next_pane_id += 1;
-            self.session.panes.insert(
-                id,
+            // An SSH session is a new classic tab (full-window pane).
+            self.session.register_pane(
                 PaneState {
                     parser,
                     pty_rx,
@@ -842,11 +902,10 @@ impl App {
                     pty_dead: false,
                     last_resize: Some((cols, rows)),
                 },
+                SplitDir::Vertical,
+                true,
             );
-            self.session.active_pane = id;
-            self.session.scroll_offset = 0;
-            self.session.insert_pane_as_split(id, SplitDir::Vertical);
-            self.session.tabs.push(Tab::new(id));
+            self.resize_panes_to_rects();
         }
         Ok(())
     }
@@ -1007,11 +1066,11 @@ impl App {
         }
         for id in &dead_panes {
             warn!("Pane {} process exited", id);
-            if self.session.panes.len() > 1 {
-                self.session.panes.remove(id);
-                self.session.remove_pane_from_tree(*id);
-                if self.session.active_pane == *id {
-                    self.session.active_pane = *self.session.panes.keys().next().unwrap_or(&0);
+            // close_pane refuses the last pane, so the session never empties
+            // (the final pane keeps its "[Process exited] - exit to quit").
+            if let Some(effect) = self.session.close_pane(*id) {
+                let _ = effect.pane.pty_tx.send(PtyCommand::Kill);
+                if effect.was_active {
                     self.editor.cancel();
                 }
             }
@@ -1156,25 +1215,21 @@ impl App {
         renderer.begin_frame()?;
         renderer.draw_background(renderer.theme_bg())?;
 
-        let mut tab_ids: Vec<usize> = self.session.panes.keys().copied().collect();
-        tab_ids.sort();
-        // While editing, the active tab shows the live buffer instead of the
-        // shell title. Editing is bound to the active pane and cleared on any
-        // pane switch, so this is only ever the pane that owns the editor. A
+        // One pill per CLASSIC tab (not per pane), in tab order. While
+        // editing, the active tab shows the live buffer instead of the shell
+        // title. Editing is bound to the active pane and cleared on any tab
+        // switch, so this is only ever the pane that owns the editor. A
         // pending AI completion appends a ghost suffix after the cursor marker.
+        let tab_ids: Vec<usize> = self.session.tabs.iter().map(|t| t.id).collect();
+        let active_tab_id = tab_ids.get(self.session.active_tab).copied().unwrap_or(0);
         let edit_display = self
             .editor
             .is_active()
             .then(|| self.editor.display_line(edit_ghost.as_deref()));
         let tab_infos = frame::tab_infos(
             &tab_ids,
-            self.session.active_pane,
-            |id| {
-                self.session
-                    .panes
-                    .get(&id)
-                    .map_or_else(String::new, |p| p.title.clone())
-            },
+            active_tab_id,
+            |id| self.session.tab_title(id),
             edit_display.as_deref(),
             self.hovered_tab,
             self.hovered_tab_close,
@@ -1267,7 +1322,7 @@ impl App {
             .session
             .active_pane()
             .map_or_else(String::new, |p| p.title.clone());
-        let status_left = format!("{} — {} tabs", active_title, self.session.panes.len());
+        let status_left = format!("{} — {} tabs", active_title, self.session.tabs.len());
         renderer.draw_status_bar(
             &status_left,
             &frame::status_right(max_scroll, self.session.scroll_offset),
@@ -1306,12 +1361,16 @@ impl App {
         let tab_h = renderer.tab_bar_height();
         let status_h = renderer.status_bar_height();
         let content_h = (size.height as f32 - tab_h - status_h).max(0.0);
-        let rects = self.session.rects();
-        for (&id, &(_, _, nw, nh)) in &rects {
-            let cols = renderer.cols_for(nw * size.width as f32);
-            let rows = renderer.rows_for(nh * content_h);
-            if let Some(pane) = self.session.panes.get_mut(&id) {
-                pane.resize(cols, rows);
+        // Every tab's panes, sized from their own tab's tree rects. Inactive
+        // tabs stay correct across window resizes, so switching tabs never
+        // shows a stale grid. PaneState::resize dedupes unchanged sizes.
+        for tab in &self.session.tabs {
+            for (&id, &(_, _, nw, nh)) in &tab.tree.compute_rects() {
+                let cols = renderer.cols_for(nw * size.width as f32);
+                let rows = renderer.rows_for(nh * content_h);
+                if let Some(pane) = self.session.panes.get_mut(&id) {
+                    pane.resize(cols, rows);
+                }
             }
         }
     }
@@ -1601,9 +1660,8 @@ impl App {
             return;
         }
         let id = hovered.unwrap();
-        self.session.active_pane = id;
+        self.session.set_active_pane(id);
         self.editor.cancel();
-        self.session.scroll_offset = 0;
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -1676,18 +1734,13 @@ impl App {
     }
 
     /// Sorted (pane id, title) pairs for tab hit-testing (mirrors draw_tab_bar).
+    /// (tab id, title) pairs for tab-bar hit-testing (mirrors draw_tab_bar:
+    /// one pill per classic tab, in tab order).
     fn sorted_tab_titles(&self) -> Vec<(usize, String)> {
-        let mut ids: Vec<usize> = self.session.panes.keys().copied().collect();
-        ids.sort();
-        ids.into_iter()
-            .map(|id| {
-                let title = self
-                    .session
-                    .panes
-                    .get(&id)
-                    .map_or_else(String::new, |p| p.title.clone());
-                (id, title)
-            })
+        self.session
+            .tabs
+            .iter()
+            .map(|t| (t.id, self.session.tab_title(t.id)))
             .collect()
     }
 
@@ -2641,15 +2694,16 @@ impl ApplicationHandler for App {
                 // Left press may close a tab (close button), start a divider
                 // drag, or switch tabs; release ends drags.
                 if button == MouseButton::Left && state == winit::event::ElementState::Pressed {
-                    if let Some((pane_id, true)) = self.tab_bar_hover(x, y) {
-                        self.close_tab(pane_id);
+                    if let Some((tab_id, true)) = self.tab_bar_hover(x, y) {
+                        self.close_tab(tab_id);
                         return;
                     }
-                    if let Some(pane_id) = self.tab_at_point(x, y) {
-                        if pane_id != self.session.active_pane {
-                            self.session.active_pane = pane_id;
-                            self.editor.cancel();
-                            self.session.scroll_offset = 0;
+                    if let Some(tab_id) = self.tab_at_point(x, y) {
+                        if let Some(idx) = self.session.tabs.iter().position(|t| t.id == tab_id) {
+                            if idx != self.session.active_tab {
+                                self.switch_to_tab(idx); // resizes + redraws
+                                self.editor.cancel();
+                            }
                         }
                         self.end_selection();
                         if let Some(window) = &self.window {

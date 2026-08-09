@@ -42,6 +42,26 @@ impl SplitNode {
         }
     }
 
+    /// Persistence form: map every leaf pane id onto its position in `ids`
+    /// (the saved pane list, sorted by id). `remap_split` on restore rebases
+    /// those positions onto freshly assigned ids, so a tree survives a
+    /// session save/restore round trip. Unknown ids map to position 0 (a
+    /// leaf that vanished between save and restore stays well-formed).
+    pub fn to_positions(&self, ids: &[usize]) -> Self {
+        match self {
+            SplitNode::Leaf(id) => SplitNode::Leaf(ids.iter().position(|i| i == id).unwrap_or(0)),
+            SplitNode::Split {
+                dir,
+                children,
+                ratio,
+            } => SplitNode::Split {
+                dir: *dir,
+                children: children.iter().map(|c| c.to_positions(ids)).collect(),
+                ratio: *ratio,
+            },
+        }
+    }
+
     /// Rebuild a tree from a flat pane-id list (pane order preserved, left to right).
     /// Empty list -> Leaf(0) so the default pane still renders.
     pub fn from_ids(ids: &[usize]) -> Self {
@@ -403,6 +423,17 @@ mod tests {
         assert_eq!(root.leaves(), vec![1, 2]);
         root.remove_leaf(2);
         assert_eq!(root.leaves(), vec![1]);
+    }
+
+    #[test]
+    fn to_positions_round_trips_through_remap() {
+        let root = SplitNode::from_ids(&[3, 1, 4, 2]);
+        let ids = vec![1, 2, 3, 4];
+        let positions = root.to_positions(&ids);
+        assert_eq!(positions.leaves(), vec![2, 0, 3, 1]);
+        // Unknown leaf maps to position 0, keeping the tree well-formed.
+        let bad = SplitNode::Leaf(99);
+        assert_eq!(bad.to_positions(&[1, 2]).leaves(), vec![0]);
     }
 
     #[test]

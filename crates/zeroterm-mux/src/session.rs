@@ -14,21 +14,51 @@ pub struct PaneSpec {
     pub cwd: String,
 }
 
-/// The on-disk session layout: the split tree plus the pane descriptors and
-/// which pane (an index into `panes`) was active at quit time.
+/// The on-disk layout of ONE tab: its pane descriptors (in sorted-id order,
+/// so tree leaf ids double as positions into `panes`), its own split tree,
+/// and which pane (an index into `panes`) was active inside it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionLayout {
-    pub active_pane: usize,
+pub struct TabLayout {
     pub panes: Vec<PaneSpec>,
     pub split: Option<SplitNode>,
+    pub active_pane: usize,
+}
+
+/// The on-disk session layout: one split tree per tab (classic tabs — each
+/// tab owns its panes and renders full-window when selected) plus which tab
+/// (an index into `tabs`) was active at quit time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionLayout {
+    pub active_tab: usize,
+    pub tabs: Vec<TabLayout>,
 }
 
 impl SessionLayout {
     /// Read and parse the layout file. A missing or corrupt file yields None so
-    /// the caller falls back to a single default tab.
+    /// the caller falls back to a single default tab. The legacy flat
+    /// single-tree format (`{active_pane, panes, split}`) is upgraded in place
+    /// to a one-tab layout, so old layout.json files survive.
     pub fn restore(path: &Path) -> Option<Self> {
         let contents = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&contents).ok()
+        if let Ok(layout) = serde_json::from_str::<SessionLayout>(&contents) {
+            return Some(layout);
+        }
+        // Legacy: a single global split tree of panes.
+        #[derive(Deserialize)]
+        struct Legacy {
+            active_pane: usize,
+            panes: Vec<PaneSpec>,
+            split: Option<SplitNode>,
+        }
+        let legacy: Legacy = serde_json::from_str(&contents).ok()?;
+        Some(SessionLayout {
+            active_tab: 0,
+            tabs: vec![TabLayout {
+                panes: legacy.panes,
+                split: legacy.split,
+                active_pane: legacy.active_pane,
+            }],
+        })
     }
 
     /// Persist this layout as pretty JSON, creating the parent directory as
@@ -96,36 +126,33 @@ mod tests {
         dir
     }
 
+    fn pane(title: &str) -> PaneSpec {
+        PaneSpec {
+            title: title.into(),
+            cmd: "/bin/sh".into(),
+            cwd: "/tmp".into(),
+        }
+    }
+
     fn sample_layout() -> SessionLayout {
-        // A nested split tree with a dragged ratio, so the round trip is
-        // checked against structure, not just a flat pane list.
+        // Two tabs, the first with a nested split tree (dragged ratio) so the
+        // round trip is checked against structure, not just a flat list.
         let mut split = SplitNode::from_ids(&[0, 1, 2, 3]);
         split.resize_leaf(2, 0.5, 0.13333334);
         SessionLayout {
-            active_pane: 2,
-            panes: vec![
-                PaneSpec {
-                    title: "t0".into(),
-                    cmd: "/bin/sh".into(),
-                    cwd: "/tmp".into(),
+            active_tab: 1,
+            tabs: vec![
+                TabLayout {
+                    panes: vec![pane("t0"), pane("t1"), pane("t2"), pane("t3")],
+                    split: Some(split),
+                    active_pane: 2,
                 },
-                PaneSpec {
-                    title: "t1".into(),
-                    cmd: "/bin/sh".into(),
-                    cwd: "/tmp".into(),
-                },
-                PaneSpec {
-                    title: "t2".into(),
-                    cmd: "/bin/zsh".into(),
-                    cwd: "/tmp".into(),
-                },
-                PaneSpec {
-                    title: "t3".into(),
-                    cmd: "/bin/sh".into(),
-                    cwd: "/tmp".into(),
+                TabLayout {
+                    panes: vec![pane("t4")],
+                    split: Some(SplitNode::Leaf(0)),
+                    active_pane: 0,
                 },
             ],
-            split: Some(split),
         }
     }
 
@@ -143,11 +170,39 @@ mod tests {
             serde_json::to_string(&restored).unwrap(),
             serde_json::to_string(&saved).unwrap()
         );
-        assert_eq!(restored.active_pane, saved.active_pane);
-        assert_eq!(
-            restored.split.clone().unwrap().leaves(),
-            saved.split.clone().unwrap().leaves()
-        );
+        assert_eq!(restored.active_tab, saved.active_tab);
+        assert_eq!(restored.tabs.len(), saved.tabs.len());
+        for (r, s) in restored.tabs.iter().zip(saved.tabs.iter()) {
+            assert_eq!(r.active_pane, s.active_pane);
+            assert_eq!(
+                r.split.clone().unwrap().leaves(),
+                s.split.clone().unwrap().leaves()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_flat_layout_upgrades_to_one_tab() {
+        let dir = temp_dir("legacy");
+        let path = dir.join("layout.json");
+        // The pre-classic-tabs format: a single global split tree.
+        let legacy = serde_json::json!({
+            "active_pane": 2,
+            "panes": [
+                {"title": "t0", "cmd": "/bin/sh", "cwd": "/tmp"},
+                {"title": "t1", "cmd": "/bin/sh", "cwd": "/tmp"},
+                {"title": "t2", "cmd": "/bin/zsh", "cwd": "/tmp"}
+            ],
+            "split": {"Leaf": 2}
+        });
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let restored = SessionLayout::restore(&path).expect("legacy layout loads");
+        assert_eq!(restored.active_tab, 0);
+        assert_eq!(restored.tabs.len(), 1);
+        assert_eq!(restored.tabs[0].panes.len(), 3);
+        assert_eq!(restored.tabs[0].active_pane, 2);
+        assert_eq!(restored.tabs[0].split.clone().unwrap().leaves(), vec![2]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
