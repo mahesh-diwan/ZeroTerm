@@ -36,6 +36,8 @@ pub struct Config {
     pub cursor: CursorConfig,
     #[serde(default)]
     pub mouse: MouseConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
     pub ai: AiConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
@@ -162,6 +164,9 @@ impl Config {
                 "focus_follows_mouse" | "mouse.focus_follows_mouse" => {
                     self.mouse.focus_follows_mouse = value.parse().unwrap_or(false);
                 }
+                "restore_session" | "session.restore" => {
+                    self.session.restore = value.parse().unwrap_or(false);
+                }
                 _ => {}
             }
         }
@@ -199,6 +204,7 @@ impl Config {
         self.window = new_config.window;
         self.cursor = new_config.cursor;
         self.mouse = new_config.mouse;
+        self.session = new_config.session;
         self.ai = new_config.ai;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
@@ -324,6 +330,42 @@ mod tests {
         table.remove("mouse");
         let parsed: Config = table.try_into().unwrap();
         assert!(parsed.mouse.focus_follows_mouse);
+    }
+
+    #[test]
+    fn session_restore_defaults_to_off() {
+        // Fresh start is the default: restore must be off unless explicitly set.
+        assert!(!Config::default().session.restore);
+        assert!(!SessionConfig::default().restore);
+    }
+
+    #[test]
+    fn session_config_deserializes_restore() {
+        let mut config = Config::default();
+        config.session.restore = true;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(parsed.session.restore);
+    }
+
+    #[test]
+    fn session_config_without_keys_uses_defaults() {
+        // A config with no [session] section must not reject the file: the
+        // whole section is serde-optional like [cursor]/[mouse].
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("session");
+        let parsed: Config = table.try_into().unwrap();
+        assert!(!parsed.session.restore);
+    }
+
+    #[test]
+    fn lua_override_toggles_session_restore() {
+        let mut config = Config::default();
+        config.apply_overrides(HashMap::from([("session.restore".to_string(), "true".into())]));
+        assert!(config.session.restore);
+        config.apply_overrides(HashMap::from([("restore_session".to_string(), "false".into())]));
+        assert!(!config.session.restore);
     }
 }
 
@@ -455,4 +497,26 @@ impl Default for MouseConfig {
 
 fn default_focus_follows_mouse() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// Restore the previous session's tabs/panes on launch. Off by default:
+    /// ZeroTerm starts with a single fresh tab every time. When on, the layout
+    /// is saved on close (layout.json next to config.toml) and re-spawned at
+    /// init; when off, any stale layout file is discarded.
+    #[serde(default = "default_session_restore")]
+    pub restore: bool,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            restore: default_session_restore(),
+        }
+    }
+}
+
+fn default_session_restore() -> bool {
+    false
 }

@@ -481,11 +481,18 @@ impl App {
 
         let layout_path = Config::default_config_path().with_file_name("layout.json");
         zt("session load start");
-        // Session restore (roadmap 2.1): layout.json from the last clean quit
-        // rebuilds tabs/splits. Pane 0 is the shell spawned above; each further
-        // PaneSpec spawns through the pty layer (never bypassed). A missing or
-        // corrupt file falls back to the single default tab already set up.
-        if let Some(saved) = SessionLayout::restore(&layout_path) {
+        // Session restore is opt-in via `[session] restore = true` (default
+        // off): every launch starts with a single fresh tab. When off, any
+        // stale layout.json is discarded so a later opt-in starts clean too.
+        // When on, layout.json from the last clean quit rebuilds tabs/splits.
+        // Pane 0 is the shell spawned above; each further PaneSpec spawns
+        // through the pty layer (never bypassed). A missing or corrupt file
+        // falls back to the single default tab already set up.
+        if !config.session.restore {
+            if layout_path.exists() {
+                let _ = std::fs::remove_file(&layout_path);
+            }
+        } else if let Some(saved) = SessionLayout::restore(&layout_path) {
             // Restore per-tab: pane 0 (the shell spawned above) stands in for
             // saved tab 0's first pane; every other PaneSpec spawns through the
             // pty layer (never bypassed). A missing or corrupt file falls back
@@ -615,11 +622,20 @@ impl App {
         Ok(())
     }
 
-    /// Serialize the current tabs/splits to layout.json (roadmap 2.1) so the
-    /// next launch can restore them. Pane order is sorted-by-id, so leaf ids in
-    /// the split tree double as positions into the saved pane list.
+    /// Persist or discard the session layout per config. With
+    /// `[session] restore = true` the tabs/splits are serialized to
+    /// layout.json for the next launch; otherwise any stale layout file is
+    /// removed so the app always starts fresh. Pane order is sorted-by-id, so
+    /// leaf ids in the split tree double as positions into the saved list.
     fn save_session_layout(&self) {
+        let restore = self.config.as_ref().map_or(false, |c| c.session.restore);
         let path = Config::default_config_path().with_file_name("layout.json");
+        if !restore {
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
+            return;
+        }
         let cwd = std::env::current_dir()
             .map(|d| d.to_string_lossy().into_owned())
             .unwrap_or_default();

@@ -173,10 +173,16 @@ rects are used for focus, not yet per-pane viewports.
 
 ## Session Restore
 
-`zeroterm/src/session.rs` persists pane titles and commands to `session.json`
-(next to the config) on close. On init, the first pane is always the configured
-shell; remaining saved panes are re-spawned as new PTYs. Restore failure is
-non-fatal (warn and continue).
+Session restore is **opt-in** via `[session] restore = true` (default off, see
+`zeroterm-config::SessionConfig`). With restore on, `App::save_session_layout`
+serializes the tab list and per-tab split trees to `layout.json` (next to the
+config, via `zeroterm-mux::SessionLayout`) on close, and `App::init` re-spawns
+them on the next launch: the first pane is always the configured shell;
+remaining saved panes are re-spawned as new PTYs with their leaf ids remapped
+onto the freshly assigned ids (`SessionLayout::remap_split`). Restore failure is
+non-fatal (warn and continue). With restore off (the default) every launch
+starts with a single fresh tab and any stale `layout.json` is discarded, so a
+later opt-in also starts clean.
 
 ## Auxiliary Crates
 

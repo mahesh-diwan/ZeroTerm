@@ -53,7 +53,8 @@ directory. See the config reference.
 - **SSH sessions** — native SSH client, one key to connect to a configured host
 - **Settings sync** — E2E encrypted (ChaCha20-Poly1305) push/pull of config
 - **Plugins** — sandboxed WASM/WASI command plugins (see [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md))
-- **Session restore** — tabs/panes are re-spawned on next launch
+- **Fresh start by default** — every launch opens a single clean tab; opt-in
+  session restore (`[session] restore = true`) re-opens your last tabs/panes
 - **Transparency** — cycle window opacity, persisted per config
 - **Quake mode** — `F12` toggles a full-width drop-down window over your desktop
 
@@ -173,10 +174,16 @@ Applications that enable mouse tracking take over mouse events (SGR 1000-1003).
 Selection is disabled while they're active; `Ctrl+Shift+C` copies whatever was
 selected before.
 
-**Where is the session restored from?**
-`session.json` lives next to `config.toml`. Tabs/panes are saved on exit and
-re-spawned on launch. The first saved pane is always the primary shell.
+**Why does ZeroTerm start with a single fresh tab instead of my old tabs?**
+Session restore is **off by default** — ZeroTerm always starts clean. To
+re-open the tabs and split panes from your last session, set
+`restore = true` under `[session]` in `config.toml`.
+
+**Where is the session saved when restore is on?**
+`layout.json` lives next to `config.toml`. Tabs/panes are saved on exit and
+re-spawned on launch. The first saved pane is always the primary shell. With
+restore off, any stale `layout.json` is discarded automatically.
 
 **How do I reset everything?**
-Delete `~/.config/zeroterm/config.toml` and `~/.config/zeroterm/session.json`.
+Delete `~/.config/zeroterm/config.toml` and `~/.config/zeroterm/layout.json`.
 Also remove `.zeroterm.lua` if you rely on it.

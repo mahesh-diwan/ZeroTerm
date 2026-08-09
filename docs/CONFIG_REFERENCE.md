@@ -11,9 +11,9 @@ The file is watched at runtime; edits hot-reload into the running app.
 
 > **Gotcha:** the TOML file is deserialized as a whole. Every non-optional key
 > below is required — a missing key rejects the whole file and ZeroTerm falls
-> back to built-in defaults. The only optional sections are `[cursor]`
-> (serde-default) and the `[window]` `blur`/`blur_radius` keys. Start from the
-> template below.
+> back to built-in defaults. The only optional sections are `[cursor]`,
+> `[mouse]`, and `[session]` (serde-default) and the `[window]`
+> `blur`/`blur_radius` keys. Start from the template below.
 
 ## TOML — Default Template
 
@@ -61,6 +61,9 @@ auto_connect = false
 vim_mode = false
 shift_arrows_select = true
 click_to_position = true
+
+[session]                    # optional section
+restore = false              # re-open last session's tabs on launch
 ```
 
 ## Section Reference
@@ -152,6 +155,18 @@ server never sees plaintext).
 
 Auth precedence: password (not currently passed), public key, then SSH agent.
 
+### `[session]`
+
+| Key       | Type | Default | Notes                                    |
+| --------- | ---- | ------- | ---------------------------------------- |
+| `restore` | bool | `false` | Optional (serde-default); re-open last session |
+
+The whole `[session]` section is optional and may be omitted entirely. With
+`restore = false` (the default) ZeroTerm always starts with a single fresh tab;
+any stale `layout.json` from a previous session is discarded. Set `restore =
+true` to re-open the tabs and split panes you had open when you last closed
+the window.
+
 ### `[keybindings]`
 
 | Key                   | Type | Default | Notes                                      |
@@ -208,7 +223,8 @@ Predefined globals:
 | `vim_mode`            | `keybindings.vim_mode`            | `keybindings.vim_mode`            | bool      |
 | `shift_arrows_select` | `keybindings.shift_arrows_select` | `keybindings.shift_arrows_select` | bool      |
 | `click_to_position`   | `keybindings.click_to_position`   | `keybindings.click_to_position`   | bool      |
+| `restore_session`     | `session.restore`                 | `session.restore`                 | bool      |
 
 Unrecognized keys are silently ignored. Not exposed to Lua: `shell.args`,
-`sync.server_url`, `window.blur`, `window.blur_radius`, the `[cursor]` section,
-and `colors.theme`.
+`sync.server_url`, `window.blur`, `window.blur_radius`, the `[cursor]`/`[mouse]`
+sections, and `colors.theme`.
