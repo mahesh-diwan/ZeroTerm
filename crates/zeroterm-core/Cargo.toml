@@ -1,6 +1,6 @@
 [package]
 name = "zeroterm-core"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 license = "MIT"
 description = "VT parser, screen buffer, cell model for ZeroTerm"
