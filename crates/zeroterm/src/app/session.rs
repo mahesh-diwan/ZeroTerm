@@ -426,12 +426,13 @@ impl SessionManager {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
-        let tab = &self.tabs[self.active_tab];
-        self.active_pane = if tab.panes.contains(&tab.active_pane) {
-            tab.active_pane
-        } else {
-            tab.panes.first().copied().unwrap_or(0)
-        };
+        // Resolve the tab's focused pane, writing the fallback back so the
+        // mirror and the tab can never disagree on the next sync.
+        let tab = &mut self.tabs[self.active_tab];
+        if !tab.panes.contains(&tab.active_pane) {
+            tab.active_pane = tab.panes.first().copied().unwrap_or(0);
+        }
+        self.active_pane = tab.active_pane;
     }
 
     /// Focus a pane within the active tab (click-to-focus, focus-follow).
@@ -448,13 +449,17 @@ impl SessionManager {
     }
 
     /// Title shown in the tab bar for the tab with `tab_id`: the title of its
-    /// active pane (or its first pane when the focused one is gone).
+    /// focused pane (falling back to its first pane when the focused one is
+    /// gone).
     pub fn tab_title(&self, tab_id: usize) -> String {
-        self.tabs
-            .iter()
-            .find(|t| t.id == tab_id)
-            .and_then(|t| self.panes.get(&t.active_pane))
-            .map_or_else(String::new, |p| p.title.clone())
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return String::new();
+        };
+        let pane = self
+            .panes
+            .get(&tab.active_pane)
+            .or_else(|| tab.panes.first().and_then(|id| self.panes.get(id)));
+        pane.map_or_else(String::new, |p| p.title.clone())
     }
 
     fn active_tree(&self) -> Option<&SplitNode> {
@@ -493,6 +498,24 @@ impl SessionManager {
         }
     }
 
+    /// Put any floating pane back into its own tab's tree before a tab switch,
+    /// so the fullscreen float overlay cannot leak across tabs (it only makes
+    /// sense for the tab that contains it; otherwise the pane renders over the
+    /// newly selected tab and `dock_pane` — which targets the active tab —
+    /// would refuse to un-float it).
+    fn dock_floating_before_switch(&mut self) {
+        let Some(fid) = self.floating.take() else {
+            return;
+        };
+        if let Some(idx) = self.tabs.iter().position(|t| t.panes.contains(&fid)) {
+            let tab = &mut self.tabs[idx];
+            if !tab.tree.leaves().contains(&fid) {
+                let parent = *tab.tree.leaves().first().unwrap_or(&fid);
+                tab.tree.insert_leaf(fid, SplitDir::Vertical, parent, 0.5);
+            }
+        }
+    }
+
     /// Advance to the next tab (wraps). Returns true if the tab changed.
     pub fn next_tab(&mut self) -> bool {
         if self.tabs.len() <= 1 {
@@ -502,6 +525,7 @@ impl SessionManager {
         if next == self.active_tab {
             return false;
         }
+        self.dock_floating_before_switch();
         self.active_tab = next;
         self.sync_active();
         self.scroll_offset = 0;
@@ -521,6 +545,7 @@ impl SessionManager {
         if prev == self.active_tab {
             return false;
         }
+        self.dock_floating_before_switch();
         self.active_tab = prev;
         self.sync_active();
         self.scroll_offset = 0;
@@ -533,6 +558,7 @@ impl SessionManager {
         if idx >= self.tabs.len() || idx == self.active_tab {
             return false;
         }
+        self.dock_floating_before_switch();
         self.active_tab = idx;
         self.sync_active();
         self.scroll_offset = 0;
@@ -626,37 +652,6 @@ impl SessionManager {
         self.reconcile_tree();
     }
 
-    /// Remove a pane from its tab's tree (after its PaneState is dropped) and
-    /// reconcile so the tab's tree never keeps a dead leaf — the stale-sole-
-    /// leaf case that blanked the window.
-    pub fn remove_pane_from_tree(&mut self, id: usize) {
-        let Some(idx) = self.tabs.iter().position(|t| t.panes.contains(&id)) else {
-            return;
-        };
-        let tab = &mut self.tabs[idx];
-        tab.panes.retain(|p| *p != id);
-        tab.tree.remove_leaf(id);
-        let ids = tab.panes.clone();
-        if ids.is_empty() {
-            // Tab emptied (caller also removes the tab itself); keep a sound
-            // placeholder tree until then.
-            tab.tree = SplitNode::Leaf(0);
-        } else {
-            // remove_leaf collapses geometry; only rebuild from scratch when it
-            // left a dead id behind (the sole-leaf close case).
-            let mut leaves = tab.tree.leaves();
-            leaves.sort_unstable();
-            let mut sorted = ids.clone();
-            sorted.sort_unstable();
-            if leaves != sorted {
-                tab.tree = SplitNode::from_ids(&ids);
-            }
-        }
-        if idx == self.active_tab {
-            self.sync_active();
-        }
-    }
-
     /// Re-insert a floating (or otherwise absent) pane into the ACTIVE tab's
     /// tree at the first remaining leaf, then clear the floating slot.
     pub fn dock_pane(&mut self, id: usize) {
@@ -731,6 +726,9 @@ impl SessionManager {
         self.next_pane_id += 1;
         self.panes.insert(id, pane);
         if push_tab {
+            // A new tab switches the view to itself — dock any float so the
+            // overlay cannot leak from the previously visible tab.
+            self.dock_floating_before_switch();
             self.tabs.push(Tab::with_pane(id, id));
             self.active_tab = self.tabs.len() - 1;
             self.active_pane = id;
@@ -770,7 +768,11 @@ impl SessionManager {
             tab.tree.remove_leaf(id);
             if tab.panes.is_empty() {
                 self.tabs.remove(idx);
-                if self.active_tab >= self.tabs.len() {
+                // Removing a tab BEFORE the active one shifts the active tab's
+                // index down; only clamp when it went out of range.
+                if idx < self.active_tab {
+                    self.active_tab -= 1;
+                } else if self.active_tab >= self.tabs.len() {
                     self.active_tab = self.tabs.len().saturating_sub(1);
                 }
             }
@@ -1104,6 +1106,49 @@ mod tests {
         // Toggle again: docks and floats the (same) active pane.
         m.toggle_floating();
         assert_eq!(m.tabs[0].tree.leaves().len(), 2, "pane back in tree");
+    }
+
+    #[test]
+    fn closing_earlier_tab_keeps_active_tab_index_pointing_at_same_tab() {
+        // The close button works on the hovered tab, which may be BEFORE the
+        // active one. Removing tab 0 while tab 2 is active shifts tab 2 to
+        // index 1 — active_tab must decrement, not stay at 2 (which would
+        // point at a different tab).
+        let mut m = tab_mgr();
+        m.register_pane(pane_state(), SplitDir::Vertical, true); // tab 1
+        m.register_pane(pane_state(), SplitDir::Vertical, true); // tab 2
+        assert_eq!(m.tabs.len(), 3);
+        m.switch_to_tab(2);
+        let active_id = m.tabs[2].id;
+        // Close tab 0 (an earlier, inactive tab) by removing its only pane.
+        m.close_pane(0).expect("closes");
+        assert_eq!(m.tabs.len(), 2);
+        assert_eq!(m.active_tab, 1, "active tab index shifts down");
+        assert_eq!(
+            m.tabs[m.active_tab].id, active_id,
+            "the same logical tab stays active"
+        );
+    }
+
+    #[test]
+    fn tab_switch_docks_floating_pane_so_overlay_cannot_leak() {
+        // Float a pane in tab 0, then switch to tab 1: the float overlay must
+        // be docked back into tab 0's tree instead of rendering over tab 1.
+        let mut m = tab_mgr();
+        m.panes.insert(1, pane_state());
+        m.tabs[0].panes.push(1);
+        m.tabs[0].tree = SplitNode::from_ids(&[0, 1]);
+        m.set_active_pane(1);
+        m.toggle_floating();
+        assert_eq!(m.floating, Some(1));
+        assert_eq!(m.tabs[0].tree.leaves(), vec![0]);
+        m.register_pane(pane_state(), SplitDir::Vertical, true); // tab 1
+        assert!(
+            m.floating.is_none(),
+            "switch must dock the float back into its own tab"
+        );
+        assert_eq!(m.tabs[0].tree.leaves().len(), 2, "pane re-docked");
+        assert_eq!(m.active_tab, 1);
     }
 
     #[test]
