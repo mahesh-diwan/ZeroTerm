@@ -75,6 +75,38 @@ pub(crate) struct GlyphAtlas {
     font_path: Option<String>,
 }
 
+/// Measure the exact cell size a Renderer will use for a font size, without a
+/// GPU. Mirrors the metrics block in GlyphAtlas::new (ascent/descent/leading
+/// for the row height, 'W' ink width for the column width) so the app can
+/// spawn the PTY at the final size *before* the renderer arrives. Spawning at
+/// the right size kills the startup resize storm: every PTY resize delivers
+/// SIGWINCH, and bash reprints its prompt on each — three startup resizes
+/// stacked three prompts.
+pub fn estimate_cell_size(font_size: f32, font_path: Option<&str>) -> (f32, f32) {
+    let mut cell_width = font_size * 0.5;
+    let mut cell_height = font_size * 1.2;
+    if let Ok(data) = load_font_bytes(font_path) {
+        if let Some(font) = FontRef::from_index(&data, 0) {
+            let metrics = font.metrics(&[]);
+            let scale = font_size / metrics.units_per_em as f32;
+            let ascent = metrics.ascent * scale;
+            let descent = metrics.descent * scale;
+            let leading = metrics.leading * scale;
+            cell_height = (ascent + descent + leading).ceil();
+            let mut scale_ctx = ScaleContext::new();
+            let mut scaler = scale_ctx.builder(font).size(font_size).build();
+            let charmap = font.charmap();
+            if let Some(img) = Render::new(&[Source::Outline])
+                .format(swash::zeno::Format::Alpha)
+                .render(&mut scaler, charmap.map(0x57u32))
+            {
+                cell_width = img.placement.width as f32;
+            }
+        }
+    }
+    (cell_width, cell_height)
+}
+
 impl GlyphAtlas {
     pub(crate) fn new(
         device: &wgpu::Device,
@@ -82,7 +114,7 @@ impl GlyphAtlas {
         font_size: f32,
         font_path: Option<String>,
     ) -> Result<Self> {
-        let font_data = Self::load_font(font_path.clone())?;
+        let font_data = load_font_bytes(font_path.as_deref())?;
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Glyph Atlas"),
@@ -169,30 +201,6 @@ impl GlyphAtlas {
         }
 
         Ok(atlas)
-    }
-
-    fn load_font(font_path: Option<String>) -> Result<Vec<u8>> {
-        if let Some(path) = font_path {
-            return std::fs::read(&path).map_err(|_| RendererError::FontNotFound(path));
-        }
-        let paths = [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
-            "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/MesloLGMNerdFontMono-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-            "/usr/share/fonts/GeistMonoVF.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ];
-        for path in &paths {
-            if let Ok(data) = std::fs::read(path) {
-                log::info!("Loaded font: {}", path);
-                return Ok(data);
-            }
-        }
-        log::info!("No system font found, using embedded DejaVu Sans Mono fallback");
-        Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
     }
 
     pub(crate) fn get_or_insert_glyph(
@@ -374,12 +382,36 @@ impl GlyphAtlas {
         queue: &wgpu::Queue,
         font_path: Option<String>,
     ) -> Result<()> {
-        let data = Self::load_font(font_path.clone())?;
+        let data = load_font_bytes(font_path.as_deref())?;
         self.font_path = font_path;
         self.font_data = data;
         self.repack_ascii(device, queue);
         Ok(())
     }
+}
+
+fn load_font_bytes(font_path: Option<&str>) -> Result<Vec<u8>> {
+    if let Some(path) = font_path {
+        return std::fs::read(path).map_err(|p| RendererError::FontNotFound(p.to_string()));
+    }
+    let paths = [
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/JetBrainsMonoNLNerdFont-Regular.ttf",
+        "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/MesloLGMNerdFontMono-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/GeistMonoVF.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    ];
+    for path in &paths {
+        if let Ok(data) = std::fs::read(path) {
+            log::info!("Loaded font: {}", path);
+            return Ok(data);
+        }
+    }
+    log::info!("No system font found, using embedded DejaVu Sans Mono fallback");
+    Ok(include_bytes!("../DejaVuSansMono.ttf").to_vec())
 }
 
 #[cfg(test)]

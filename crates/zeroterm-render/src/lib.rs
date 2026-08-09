@@ -7,6 +7,7 @@ pub mod atlas;
 pub mod renderer;
 pub mod theme;
 
+pub use atlas::estimate_cell_size;
 pub use renderer::{tab_span, Renderer, Selection, TabInfo};
 
 pub struct RenderConfig {

@@ -25,6 +25,11 @@ pub struct PaneState {
     pub title: String,
     pub pane_cmd: String,
     pub pty_dead: bool,
+    /// Last (cols, rows) sent to the PTY. Resizes that don't change the size
+    /// are skipped: every PTY resize delivers SIGWINCH, and bash reprints its
+    /// prompt on each — the startup spawn-estimate → renderer-ready → Resized
+    /// storm used to stack three prompts on top of each other.
+    pub last_resize: Option<(usize, usize)>,
 }
 impl PaneState {
     /// Drain available pty output into the parser. Returns true if any bytes
@@ -50,6 +55,20 @@ impl PaneState {
             }
         }
         got
+    }
+
+    /// Resize the parser screen and forward to the PTY — but only when the
+    /// size actually changed. Startup used to resize the PTY three times
+    /// (spawn estimate, renderer-ready, first Resized event), and each resize
+    /// makes bash reprint its prompt, stacking three prompts. Dedupe so a
+    /// pane whose size is already correct stays quiet.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        if self.last_resize == Some((cols, rows)) {
+            return;
+        }
+        self.last_resize = Some((cols, rows));
+        self.parser.screen_mut().resize(cols, rows);
+        let _ = self.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
     }
 }
 
@@ -93,14 +112,55 @@ pub fn starship_setup(
     env.push(("STARSHIP_SHELL", shell.to_string()));
 
     let init = if shell.ends_with("bash") {
-        Some(r#"eval "$(starship init bash)"; exec bash -l"#)
+        // bash --rcfile replaces ~/.bashrc for the interactive shell, but a
+        // `-l` login shell IGNORES --rcfile and reads profile files instead
+        // (verified in a PTY: with -l the rcfile never runs). So we run plain
+        // interactive bash with --rcfile pointing at a bootstrap that
+        // reproduces the login environment (/etc/profile, ~/.bash_profile),
+        // sources the user's real ~/.bashrc, then enables starship. The old
+        // `eval "$(starship init bash)"; exec bash -l` evaluated the init and
+        // immediately discarded it across exec — the fresh login shell never
+        // saw starship, so users got the stock bash prompt no matter what.
+        let boot = config_dir.join("zeroterm/bashrc");
+        if let Some(parent) = boot.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = r#"# ZeroTerm bootstrap: login-equivalent env + user rc + starship
+if [ -f /etc/profile ]; then . /etc/profile; fi
+profile_loaded=0
+for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -f "$f" ]; then . "$f"; profile_loaded=1; break; fi
+done
+# Source ~/.bashrc directly only if no login profile handled it: profiles
+# commonly source ~/.bashrc themselves, and sourcing it twice re-runs
+# aliases/exports/banners and can corrupt starship's precmd ordering.
+if [ "$profile_loaded" -eq 0 ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+eval "$(starship init bash)"
+"#;
+        let _ = std::fs::write(&boot, content);
+        Some(vec![r"--rcfile".into(), boot.to_string_lossy().into_owned()])
     } else if shell.ends_with("zsh") {
-        Some(r#"eval "$(starship init zsh)"; exec zsh -l"#)
+        // zsh has no --rcfile; ZDOTDIR points at a directory whose .zshrc
+        // reproduces the login env (.zprofile), sources the user's real
+        // .zshrc, then enables starship.
+        let zdotdir = config_dir.join("zeroterm/zdotdir");
+        if let Some(parent) = zdotdir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let content = r#"# ZeroTerm bootstrap: login-equivalent env + user rc + starship
+if [ -f /etc/zprofile ]; then . /etc/zprofile; fi
+if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile"; fi
+if [ -f "$HOME/.zshrc" ]; then . "$HOME/.zshrc"; fi
+eval "$(starship init zsh)"
+"#;
+        let _ = std::fs::write(zdotdir.join(".zshrc"), content);
+        env.push(("ZDOTDIR", zdotdir.to_string_lossy().into_owned()));
+        Some(vec![])
     } else {
         None
     };
     match init {
-        Some(init) => (shell.to_string(), vec!["-c".into(), init.into()], env),
+        Some(args) => (shell.to_string(), args, env),
         None => (shell.to_string(), shell_args.to_vec(), env),
     }
 }
@@ -746,6 +806,7 @@ mod tests {
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
+            last_resize: None,
         }
     }
 

@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::dpi::PhysicalSize;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
@@ -17,7 +18,6 @@ use winit::window::{CursorIcon, Window, WindowAttributes};
 use zeroterm_ai::client::{AiClient, AiError};
 use zeroterm_config::{Config, KeybindingsConfig};
 use zeroterm_core::parser::MouseTrackingMode;
-use zeroterm_core::screen::Size as PtySize;
 use zeroterm_core::Parser;
 use zeroterm_mux::session::{PaneSpec, Session, SessionLayout};
 use zeroterm_mux::split::SplitDir;
@@ -165,6 +165,19 @@ fn should_focus_follow(
 }
 
 #[allow(dead_code)]
+/// cols/rows for a window of `size` at `cell_w` x `cell_h`, mirroring the
+/// renderer's resize_panes_to_rects math exactly: 2 tab-bar rows + 1 status
+/// row of chrome, 16px padding per side, floor, clamp to >= 1. Every PTY
+/// spawn site shares this so the shell starts at its final size and the
+/// PaneState resize dedupe never re-sends — bash prints its prompt exactly
+/// once instead of reprinting on a resize storm.
+fn cells_for_size(cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
+    let content_h = (size.height as f32 - 3.0 * cell_h).max(0.0);
+    let cols = ((size.width as f32 - 32.0) / cell_w).floor().max(1.0) as usize;
+    let rows = ((content_h - 32.0) / cell_h).floor().max(1.0) as usize;
+    (cols, rows)
+}
+
 impl App {
     fn new() -> Self {
         Self {
@@ -376,13 +389,18 @@ impl App {
         self.renderer_rx = Some(render_rx);
 
         let size = window.inner_size();
-        // Estimate cells until the renderer is ready; check_renderer_ready()
-        // resizes the parser + PTY to the measured glyph metrics. The rough
-        // 8.4x15px cells scale with the device pixel ratio so the pre-renderer
-        // PTY size is in the right ballpark on HiDPI displays.
+        // Spawn the PTY at the EXACT size the renderer will use once ready:
+        // estimate_cell_size mirrors the atlas's font metrics (row height from
+        // ascent/descent/leading, column width from 'W' ink), and the cols/rows
+        // math below matches resize_panes_to_rects (padding + chrome rows
+        // subtracted). Because the renderer-ready resize then computes the
+        // same size, the PaneState dedupe skips it — no SIGWINCH, and bash
+        // prints its prompt exactly once instead of reprinting on a startup
+        // resize storm (was 8.4x15px guess -> three resizes -> three prompts).
         let dpr = window.scale_factor().max(1.0) as f32;
-        let cols = (((size.width as f32) / (8.4 * dpr)).max(20.0)) as usize;
-        let rows = (((size.height as f32) / (15.0 * dpr)).max(10.0)) as usize;
+        let (cell_w, cell_h) =
+            zeroterm_render::estimate_cell_size(font_size * dpr, self.font_path.as_deref());
+        let (cols, rows) = cells_for_size(cell_w, cell_h, size);
 
         let shell = config.shell.program.clone();
         let shell_args = config.shell.args.clone();
@@ -419,6 +437,7 @@ impl App {
                 title: VERSION_LABEL.into(),
                 pane_cmd: shell.clone(),
                 pty_dead: false,
+                last_resize: Some((cols, rows)),
             },
         );
 
@@ -463,6 +482,7 @@ impl App {
                                 title: spec.title.clone(),
                                 pane_cmd: cmd,
                                 pty_dead: false,
+                                last_resize: Some((cols, rows)),
                             },
                         );
                         self.session.tabs.push(Tab::new(id));
@@ -578,15 +598,20 @@ impl App {
     fn create_new_tab(&mut self) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            let cell_size = self
-                .renderer
-                .as_ref()
-                .map(|r| r.cell_size())
-                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
-            let cell_w = cell_size[0];
-            let cell_h = cell_size[1];
-            let cols = (size.width as f32 / cell_w) as usize;
-            let rows = (size.height as f32 / cell_h) as usize;
+            let (cell_w, cell_h) = match self.renderer.as_ref() {
+                Some(r) => {
+                    let c = r.cell_size();
+                    (c[0], c[1])
+                }
+                None => {
+                    let dpr = window.scale_factor().max(1.0) as f32;
+                    zeroterm_render::estimate_cell_size(
+                        self.font_size * dpr,
+                        self.font_path.as_deref(),
+                    )
+                }
+            };
+            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
 
             let (pty_rx, pty_tx) = {
                 let (shell, shell_args, starship_env) =
@@ -614,6 +639,7 @@ impl App {
                     title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
+                    last_resize: Some((cols, rows)),
                 },
                 SplitDir::Vertical,
                 true,
@@ -625,15 +651,20 @@ impl App {
     fn create_split_pane(&mut self, dir: SplitDir) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            let cell_size = self
-                .renderer
-                .as_ref()
-                .map(|r| r.cell_size())
-                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
-            let cell_w = cell_size[0];
-            let cell_h = cell_size[1];
-            let cols = (size.width as f32 / cell_w) as usize;
-            let rows = (size.height as f32 / cell_h) as usize;
+            let (cell_w, cell_h) = match self.renderer.as_ref() {
+                Some(r) => {
+                    let c = r.cell_size();
+                    (c[0], c[1])
+                }
+                None => {
+                    let dpr = window.scale_factor().max(1.0) as f32;
+                    zeroterm_render::estimate_cell_size(
+                        self.font_size * dpr,
+                        self.font_path.as_deref(),
+                    )
+                }
+            };
+            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
 
             let (pty_rx, pty_tx) = {
                 let (shell, shell_args, starship_env) =
@@ -661,6 +692,7 @@ impl App {
                     title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
+                    last_resize: Some((cols, rows)),
                 },
                 dir,
                 false,
@@ -707,8 +739,7 @@ impl App {
                     let content_h = (window.inner_size().height as f32 - tab_h - status_h).max(0.0);
                     let cols = renderer.cols_for(window.inner_size().width as f32 * 0.7);
                     let rows = renderer.rows_for(content_h * 0.7);
-                    pane.parser.screen_mut().resize(cols, rows);
-                    let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+                    pane.resize(cols, rows);
                 }
             }
             window.request_redraw();
@@ -747,15 +778,20 @@ impl App {
     fn connect_ssh(&mut self, host: &str, user: &str, port: u16) -> Result<()> {
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            let cell_size = self
-                .renderer
-                .as_ref()
-                .map(|r| r.cell_size())
-                .unwrap_or([self.font_size * 0.6, self.font_size * 1.2]);
-            let cell_w = cell_size[0];
-            let cell_h = cell_size[1];
-            let cols = (size.width as f32 / cell_w) as usize;
-            let rows = (size.height as f32 / cell_h) as usize;
+            let (cell_w, cell_h) = match self.renderer.as_ref() {
+                Some(r) => {
+                    let c = r.cell_size();
+                    (c[0], c[1])
+                }
+                None => {
+                    let dpr = window.scale_factor().max(1.0) as f32;
+                    zeroterm_render::estimate_cell_size(
+                        self.font_size * dpr,
+                        self.font_path.as_deref(),
+                    )
+                }
+            };
+            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
 
             let key_path = self
                 .config
@@ -791,6 +827,7 @@ impl App {
                     title: format!("SSH: {}@{}", user, host),
                     pane_cmd: format!("ssh {}@{}", user, host),
                     pty_dead: false,
+                    last_resize: Some((cols, rows)),
                 },
             );
             self.session.active_pane = id;
@@ -1016,16 +1053,18 @@ impl App {
         };
         let mut renderer = renderer;
         let size = window.inner_size();
-        let cols = renderer.cols_for(size.width as f32);
-        let rows = renderer.rows_for(size.height as f32);
         renderer.resize(size.width, size.height);
-        for pane in self.session.panes.values_mut() {
-            pane.parser.screen_mut().resize(cols, rows);
-            let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
-        }
         self.renderer = Some(renderer);
+        // One resize path: resize_panes_to_rects (content-height rows, per-pane
+        // rects, deduped via PaneState::resize). The PTY was spawned at exactly
+        // this size, so the dedupe means NO resize is sent — bash prints its
+        // prompt exactly once. The old code computed full-height rows here
+        // (rows_for on the whole window height) which disagreed with
+        // resize_panes_to_rects' content-height math, forcing a second resize
+        // and a second prompt reprint.
+        self.resize_panes_to_rects();
         zt("renderer received on main");
-        info!("GPU renderer ready: {}x{}", cols, rows);
+        info!("GPU renderer ready");
         // The async config load may have been consumed while the renderer was
         // still initializing on the background thread (its try_recv above was
         // a no-op then); re-apply so window.opacity/blur and fonts actually
@@ -1267,8 +1306,7 @@ impl App {
             let cols = renderer.cols_for(nw * size.width as f32);
             let rows = renderer.rows_for(nh * content_h);
             if let Some(pane) = self.session.panes.get_mut(&id) {
-                pane.parser.screen_mut().resize(cols, rows);
-                let _ = pane.pty_tx.send(PtyCommand::Resize(PtySize { cols, rows }));
+                pane.resize(cols, rows);
             }
         }
     }
@@ -3067,6 +3105,7 @@ mod tests {
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
+            last_resize: None,
         };
         tx.send(b"abc".to_vec()).unwrap();
         drop(tx);
@@ -3091,6 +3130,7 @@ mod tests {
                 title: String::new(),
                 pane_cmd: String::new(),
                 pty_dead: false,
+                last_resize: None,
             },
         );
         app.session.active_pane = 0;

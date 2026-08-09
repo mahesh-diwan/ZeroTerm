@@ -99,6 +99,7 @@ mod tests {
                 title: format!("pane {}", id),
                 pane_cmd: "/bin/sh".into(),
                 pty_dead: false,
+                last_resize: None,
             },
         )
     }
