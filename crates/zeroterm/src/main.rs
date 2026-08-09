@@ -1260,8 +1260,9 @@ impl App {
             .session
             .active_pane()
             .map_or_else(String::new, |p| p.title.clone());
+        let status_left = format!("{} — {} tabs", active_title, self.session.panes.len());
         renderer.draw_status_bar(
-            &active_title,
+            &status_left,
             &frame::status_right(max_scroll, self.session.scroll_offset),
         )?;
 
@@ -1893,12 +1894,43 @@ impl App {
     }
 
     fn apply_config_to_renderer(&mut self) {
+        // Copy the config values first so no borrow of self.config outlives
+        // the mutable self calls below (resize_panes_to_rects borrows all of
+        // self, which the old nested borrows rejected at compile time).
+        let (font_path, font_size, opacity, blink, blink_interval) = {
+            let Some(config) = &self.config else {
+                return;
+            };
+            (
+                config.font.path.clone(),
+                config.font.size,
+                config.window.opacity,
+                config.cursor.blink,
+                config.cursor.blink_interval_ms,
+            )
+        };
+        self.opacity = opacity;
+        // A config `font.path` / `font.size` change must reach the glyph
+        // atlas at runtime: reload_font swaps the file AND re-rasterizes at
+        // the new size, then we re-layout the panes for the new cell metrics
+        // (previously the path was only stored, never applied).
+        if font_path != self.font_path || (font_size - self.font_size).abs() > f32::EPSILON {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.reload_font(font_path.clone(), font_size);
+            }
+            self.font_path = font_path;
+            self.font_size = font_size;
+            self.resize_panes_to_rects();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        // reload_config wants the whole config; re-borrow it now that no
+        // mutable self borrow is live.
         if let Some(config) = &self.config {
-            self.opacity = config.window.opacity;
-            self.font_path = config.font.path.clone();
             if let Some(renderer) = &mut self.renderer {
                 renderer.reload_config(config);
-                renderer.set_cursor_blink(config.cursor.blink, config.cursor.blink_interval_ms);
+                renderer.set_cursor_blink(blink, blink_interval);
             }
         }
     }

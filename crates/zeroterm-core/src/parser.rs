@@ -1,6 +1,6 @@
 //! VT100/ANSI parser - hand-written state machine
 
-use crate::cell::UnderlineStyle;
+use crate::cell::{CursorShape, UnderlineStyle};
 use crate::image_decode::{self, FrameData};
 
 const MAX_CSI_PARAMS: usize = 32;
@@ -573,6 +573,19 @@ impl Parser {
                 self.screen.cursor_pos(row, col);
             } // CUP, HVP
             ('d', false, "") => self.screen.cursor_row(self.csi.get(0, 1) as usize), // VPA
+
+            // DECSCUSR — cursor style: 0/1 blink block, 2 steady block,
+            // 3 blink underline, 4 steady underline, 5 blink bar, 6 steady
+            // bar. nvim/vi flip between block (normal) and bar (insert);
+            // without this the cursor stayed a block everywhere.
+            ('q', false, " ") => {
+                match self.csi.get(0, 0) {
+                    0..=2 => self.screen.set_cursor_shape(CursorShape::Block),
+                    3 | 4 => self.screen.set_cursor_shape(CursorShape::Underline),
+                    5 | 6 => self.screen.set_cursor_shape(CursorShape::Bar),
+                    _ => {}
+                }
+            }
 
             // Scrolling
             ('S', false, "") => self.screen.scroll_up(self.csi.get(0, 1) as usize), // SU

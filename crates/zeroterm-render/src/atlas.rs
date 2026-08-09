@@ -374,17 +374,43 @@ impl GlyphAtlas {
         }
     }
 
-    /// Swap in a different font file (config `font.path` change) and repack
-    /// the ASCII cache. A failed load leaves the previous font in place.
-    pub(crate) fn reload_font(
+    /// Change the rasterization size (and/or font file) at runtime: recomputes
+    /// the cell metrics from the (possibly new) font, clears every cached
+    /// glyph, and repacks the ASCII set at the new size. A failed font load
+    /// keeps the previous font/size in place.
+    pub(crate) fn set_font(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         font_path: Option<String>,
+        font_size: f32,
     ) -> Result<()> {
         let data = load_font_bytes(font_path.as_deref())?;
         self.font_path = font_path;
         self.font_data = data;
+        self.font_size = font_size;
+        self.cell_width = font_size * 0.5;
+        self.cell_height = font_size * 1.2;
+        if let Some(font) = FontRef::from_index(&self.font_data, 0) {
+            let metrics = font.metrics(&[]);
+            let scale = font_size / metrics.units_per_em as f32;
+            let ascent = metrics.ascent * scale;
+            let descent = metrics.descent * scale;
+            let leading = metrics.leading * scale;
+            self.cell_height = (ascent + descent + leading).ceil();
+            self.baseline = ascent;
+            let mut scaler = self.scale_context.builder(font).size(font_size).build();
+            let charmap = font.charmap();
+            if let Some(img) = Render::new(&[Source::Outline])
+                .format(swash::zeno::Format::Alpha)
+                .render(&mut scaler, charmap.map(0x57u32))
+            {
+                self.cell_width = img.placement.width as f32;
+            }
+        }
+        // Every cached bitmap was rasterized at the old size; drop them all
+        // (non-ASCII glyphs too — repack_ascii only refreshes the ASCII set).
+        self.glyph_cache.clear();
         self.repack_ascii(device, queue);
         Ok(())
     }

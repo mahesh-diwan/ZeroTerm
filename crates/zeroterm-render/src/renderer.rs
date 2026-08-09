@@ -1082,8 +1082,14 @@ impl Renderer {
                 (bar_bg, fg, ATTR_DIM)
             };
 
-            // Pill background across both rows (title row + indicator row).
+            // Pill background. Row 0 carries the pill + title; row 1 is a
+            // "connected" underline that only the active tab extends to the
+            // bottom edge — the strip reads as ONE bar with an active
+            // indicator instead of two stacked rows ("double tab bar").
             for r in 0..TAB_BAR_ROWS {
+                if r == 1 && !tab.active {
+                    continue;
+                }
                 let base = r * cols;
                 for cell in batch.iter_mut().take(base + end).skip(base + col) {
                     cell.bg = pill;
@@ -1656,12 +1662,22 @@ fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
         }
     }
 
-    pub fn reload_font(&mut self, font_path: Option<String>) {
-        if let Err(e) = self
-            .glyph_atlas
-            .reload_font(&self.device, &self.queue, font_path)
-        {
-            log::warn!("Failed to reload font: {}", e);
+    /// Apply a config font change (file and/or size) at runtime. Cell metrics
+    /// are recomputed from the atlas; the caller re-lays-out panes and redraws.
+    pub fn reload_font(&mut self, font_path: Option<String>, font_size: f32) {
+        match self.glyph_atlas.set_font(
+            &self.device,
+            &self.queue,
+            font_path,
+            font_size,
+        ) {
+            Ok(()) => {
+                let (cw, ch) = self.glyph_atlas.cell_metrics();
+                self.cell_width = cw;
+                self.cell_height = ch;
+                self.cell_size = [cw, ch];
+            }
+            Err(e) => log::warn!("Failed to reload font: {}", e),
         }
     }
 

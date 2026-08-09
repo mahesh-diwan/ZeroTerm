@@ -1021,3 +1021,17 @@ fn test_multi_char_utf8_burst_emits_all() {
     assert_eq!(screen.cell(0, 0).unwrap().ch, '\u{e9}');
     assert_eq!(screen.cell(0, 1).unwrap().ch, '\u{20ac}');
 }
+
+#[test]
+fn decscusr_sets_cursor_shape() {
+    // Regression: nvim/vi send DECSCUSR (CSI Ps SP q) to switch the cursor
+    // between block (normal) and bar/underline (insert). The parser ignored
+    // it, so the cursor stayed a block everywhere.
+    let mut p = setup(20, 5);
+    p.parse(b"\x1b[5 q"); // blink bar (insert mode)
+    assert_eq!(p.screen().cursor().shape, CursorShape::Bar);
+    p.parse(b"\x1b[2 q"); // steady block (normal mode)
+    assert_eq!(p.screen().cursor().shape, CursorShape::Block);
+    p.parse(b"\x1b[4 q"); // steady underline
+    assert_eq!(p.screen().cursor().shape, CursorShape::Underline);
+}

@@ -1,6 +1,6 @@
 //! Screen buffer with scrollback, cursor, and rendering support
 
-use crate::cell::{Attributes, Cell, Color, Cursor, UnderlineStyle};
+use crate::cell::{Attributes, Cell, Color, Cursor, CursorShape, UnderlineStyle};
 use crate::highlight::highlight_line;
 use crate::image_decode::{FrameData, MAX_ANIM_FRAMES};
 use std::collections::{HashMap, VecDeque};
@@ -814,6 +814,11 @@ impl Screen {
     }
     pub fn set_cursor_visible(&mut self, v: bool) {
         self.cursor.visible = v;
+    }
+    /// Set the cursor's drawn shape (DECSCUSR). The renderer draws block,
+    /// underline, and bar variants from this.
+    pub fn set_cursor_shape(&mut self, shape: CursorShape) {
+        self.cursor.shape = shape;
     }
     pub fn set_cursor_keys_mode(&mut self, v: bool) {
         self.cursor_keys_mode = v;
