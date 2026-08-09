@@ -1229,7 +1229,13 @@ impl App {
         let tab_infos = frame::tab_infos(
             &tab_ids,
             active_tab_id,
-            |id| self.session.tab_title(id),
+            |id| {
+                // Field-path only (never a `self` method call): the closure
+                // runs while `self.renderer` is mutably borrowed below, and
+                // method calls borrow all of `self`.
+                let title = self.session.tab_title(id);
+                frame::tab_display_title(&title, self.session.tab_pane_count(id))
+            },
             edit_display.as_deref(),
             self.hovered_tab,
             self.hovered_tab_close,
@@ -1322,7 +1328,9 @@ impl App {
             .session
             .active_pane()
             .map_or_else(String::new, |p| p.title.clone());
-        let status_left = format!("{} — {} tabs", active_title, self.session.tabs.len());
+        // Status bar: active pane title plus the tab's position (i/N), so the
+        // current tab is identifiable at a glance in a multi-tab session.
+        let status_left = frame::status_left(&active_title, self.session.active_tab, self.session.tabs.len());
         renderer.draw_status_bar(
             &status_left,
             &frame::status_right(max_scroll, self.session.scroll_offset),
@@ -1735,13 +1743,22 @@ impl App {
 
     /// Sorted (pane id, title) pairs for tab hit-testing (mirrors draw_tab_bar).
     /// (tab id, title) pairs for tab-bar hit-testing (mirrors draw_tab_bar:
-    /// one pill per classic tab, in tab order).
+    /// one pill per classic tab, in tab order). Uses the SAME display title as
+    /// the draw loop (title + split badge), so hover/click land on the exact
+    /// cells the pill paints.
     fn sorted_tab_titles(&self) -> Vec<(usize, String)> {
         self.session
             .tabs
             .iter()
-            .map(|t| (t.id, self.session.tab_title(t.id)))
+            .map(|t| (t.id, self.tab_display_title(t.id)))
             .collect()
+    }
+
+    /// Title shown on a tab's pill: the tab's pane title plus a " ▦N" split
+    /// badge when the tab holds more than one pane.
+    fn tab_display_title(&self, tab_id: usize) -> String {
+        let title = self.session.tab_title(tab_id);
+        frame::tab_display_title(&title, self.session.tab_pane_count(tab_id))
     }
 
     fn keybindings(&self) -> KeybindingsConfig {

@@ -62,6 +62,14 @@ pub fn scrollbar_policy(
     }
 }
 
+/// Left-hand status-bar text: the active pane title plus the tab's position
+/// (i/N) so the current tab is identifiable at a glance in a multi-tab
+/// session. The tab count is clamped to ≥ 1 so an empty session can never
+/// print "1/0".
+pub fn status_left(title: &str, tab_index: usize, tab_count: usize) -> String {
+    format!("{title} — tab {}/{}", tab_index + 1, tab_count.max(1))
+}
+
 /// Right-hand status-bar text: scroll position as a percent while there is
 /// scrollback, empty otherwise.
 pub fn status_right(max_scroll: usize, scroll_offset: usize) -> String {
@@ -74,6 +82,18 @@ pub fn status_right(max_scroll: usize, scroll_offset: usize) -> String {
         )
     } else {
         String::new()
+    }
+}
+
+/// Tab-bar display title: the tab's title plus a split badge (" ▦N") when the
+/// tab holds more than one pane, so split tabs are identifiable at a glance.
+/// The tab-bar draw loop and the hit-testing (tab_at_point / tab_bar_hover)
+/// must agree on the exact string — this is the single source for both.
+pub fn tab_display_title(title: &str, pane_count: usize) -> String {
+    if pane_count > 1 {
+        format!("{title} ▦{pane_count}")
+    } else {
+        title.to_string()
     }
 }
 
@@ -140,6 +160,14 @@ mod tests {
     }
 
     #[test]
+    fn status_left_shows_tab_position() {
+        assert_eq!(status_left("bash", 0, 3), "bash — tab 1/3");
+        assert_eq!(status_left("ssh host", 2, 3), "ssh host — tab 3/3");
+        // Degenerate empty session cannot print a 0 denominator.
+        assert_eq!(status_left("bash", 0, 0), "bash — tab 1/1");
+    }
+
+    #[test]
     fn status_right_percent_and_empty() {
         assert_eq!(status_right(0, 0), "");
         assert_eq!(status_right(100, 25), "[25%]");
@@ -162,6 +190,19 @@ mod tests {
         assert!(infos[1].active);
         assert!(infos[2].hovered && infos[2].close_hovered);
         assert!(!infos[0].hovered);
+    }
+
+    #[test]
+    fn tab_display_title_adds_split_badge_only_for_splits() {
+        assert_eq!(tab_display_title("bash", 1), "bash");
+        assert_eq!(tab_display_title("bash", 3), "bash ▦3");
+        assert_eq!(tab_display_title("", 2), " ▦2");
+        // The badge must survive truncation limits the same way as the title
+        // (draw and hit-test both cap at 20 chars).
+        let long = "a".repeat(18);
+        let badged = tab_display_title(&long, 5);
+        assert!(badged.starts_with(&long));
+        assert!(badged.contains("▦5"));
     }
 
     #[test]

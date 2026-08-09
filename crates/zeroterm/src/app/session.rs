@@ -462,6 +462,15 @@ impl SessionManager {
         pane.map_or_else(String::new, |p| p.title.clone())
     }
 
+    /// Number of panes in the tab with `tab_id` (1 for a plain tab). Used to
+    /// build the split badge on the tab pill.
+    pub fn tab_pane_count(&self, tab_id: usize) -> usize {
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map_or(1, |t| t.panes.len())
+    }
+
     fn active_tree(&self) -> Option<&SplitNode> {
         self.tabs.get(self.active_tab).map(|t| &t.tree)
     }
