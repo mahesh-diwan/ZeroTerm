@@ -85,7 +85,7 @@ pub struct TabInfo {
 /// Chrome rows reserved above the grid: tab bar plus status bar. These are
 /// the single source of truth for spawn-time size estimates in the app crate
 /// (cells_for_size) so they can never drift from this layout.
-pub const TAB_BAR_ROWS: usize = 2;
+pub const TAB_BAR_ROWS: usize = 1;
 pub const STATUS_BAR_ROWS: usize = 1;
 /// Grid padding in physical pixels, ordered [left, right, top, bottom].
 pub const PADDING: [f32; 4] = [16.0, 16.0, 16.0, 16.0];
@@ -616,7 +616,7 @@ impl Renderer {
             &device,
             &uniform_bind_group_layout,
             "Tab Bar",
-            (cols as usize) * 2,
+            (cols as usize) * TAB_BAR_ROWS,
             uniforms,
         );
 
@@ -707,7 +707,7 @@ impl Renderer {
             self.content_pass
                 .resize(&self.device, &layout, "Content", new_cols * new_rows);
             self.tab_bar_pass
-                .resize(&self.device, &layout, "Tab Bar", new_cols * 2);
+                .resize(&self.device, &layout, "Tab Bar", new_cols * TAB_BAR_ROWS);
             self.status_bar_pass
                 .resize(&self.device, &layout, "Status Bar", new_cols.max(512));
             self.scrollbar_pass
@@ -994,11 +994,11 @@ impl Renderer {
         Ok(())
     }
 
-    /// Render a horizontal tab strip at the top of the window (two cell rows
-    /// tall, ~40px — Ghostty/Kitty proportions). Runs as its own instanced
-    /// pass after the pane(s); shader is unchanged. Row 0 carries the tab
-    /// titles and close buttons; both rows carry the pill backgrounds so the
-    /// bar reads as a solid strip with an active tab that stands out.
+    /// Render a horizontal tab strip at the top of the window (one cell row
+    /// tall — a single bar, not two stacked rows). Runs as its own instanced
+    /// pass after the pane(s); shader is unchanged. Every tab is a visible
+    /// pill (inactive = surface_highlight, active = accent-tinted) and the
+    /// bar-bg gap cell after each pill is the tab separator.
     pub fn draw_tab_bar(&mut self, tabs: &[TabInfo]) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
             return Ok(());
@@ -1011,21 +1011,50 @@ impl Renderer {
             t.surface.b as f32 / 255.0,
             1.0,
         ];
-        // Active tab pill: surface_highlight tinted ~40% toward accent so the
-        // active tab clearly separates from the bar and from hover states.
-        let active_bg: [f32; 4] = [
-            (t.accent.r as f32 * 0.4 + t.surface_highlight.r as f32 * 0.6) / 255.0,
-            (t.accent.g as f32 * 0.4 + t.surface_highlight.g as f32 * 0.6) / 255.0,
-            (t.accent.b as f32 * 0.4 + t.surface_highlight.b as f32 * 0.6) / 255.0,
+        // Pills form a clear brightness ladder so tabs read as separate
+        // buttons: inactive < hovered < active. Inactive pills are
+        // surface_highlight pulled ~25% toward the accent — surface_highlight
+        // alone is nearly the bar color, which made tabs run together with no
+        // visible separator.
+        let mix = |f: f32| {
+            [
+                (t.accent.r as f32 * f + t.surface_highlight.r as f32 * (1.0 - f)) / 255.0,
+                (t.accent.g as f32 * f + t.surface_highlight.g as f32 * (1.0 - f)) / 255.0,
+                (t.accent.b as f32 * f + t.surface_highlight.b as f32 * (1.0 - f)) / 255.0,
+                1.0,
+            ]
+        };
+        let inactive_bg: [f32; 4] = mix(0.25);
+        let hover_bg: [f32; 4] = mix(0.4);
+        let active_bg: [f32; 4] = mix(0.55);
+        // Tab separator: a 1-cell line in the border color between adjacent
+        // pills, so the boundary is explicit even on low-contrast displays.
+        let sep: [f32; 4] = [
+            t.border.r as f32 / 255.0,
+            t.border.g as f32 / 255.0,
+            t.border.b as f32 / 255.0,
             1.0,
         ];
-        // Hovered (inactive) tab pill: one step above the bar background.
-        let hover_bg: [f32; 4] = [
-            t.surface_highlight.r as f32 / 255.0,
-            t.surface_highlight.g as f32 / 255.0,
-            t.surface_highlight.b as f32 / 255.0,
-            1.0,
-        ];
+        if self.diag.enabled() {
+            let p = |c: [f32; 4]| {
+                format!(
+                    "#{:02x}{:02x}{:02x}",
+                    (c[0] * 255.0) as u8,
+                    (c[1] * 255.0) as u8,
+                    (c[2] * 255.0) as u8
+                )
+            };
+            self.diag.probe(
+                "tab_bar",
+                &format!(
+                    "inactive={} hover={} active={} sep={}",
+                    p(inactive_bg),
+                    p(hover_bg),
+                    p(active_bg),
+                    p(sep)
+                ),
+            );
+        }
         let accent_fg: [f32; 4] = [
             t.accent.r as f32 / 255.0,
             t.accent.g as f32 / 255.0,
@@ -1079,27 +1108,25 @@ impl Renderer {
             } else if tab.hovered {
                 (hover_bg, fg, 0)
             } else {
-                // Inactive titles: full fg passed to the shader, dimmed there
-                // (ATTR_DIM = 0x10) so they recede without muddying colors.
-                (bar_bg, fg, ATTR_DIM)
+                // Inactive tab: a clearly elevated pill with a dimmed title.
+                // ATTR_DIM = 0x10 dims the glyph in the shader.
+                (inactive_bg, fg, ATTR_DIM)
             };
 
-            // Pill background. Row 0 carries the pill + title; row 1 is a
-            // "connected" underline that only the active tab extends to the
-            // bottom edge — the strip reads as ONE bar with an active
-            // indicator instead of two stacked rows ("double tab bar").
-            for r in 0..TAB_BAR_ROWS {
-                if r == 1 && !tab.active {
-                    continue;
-                }
-                let base = r * cols;
-                for cell in batch.iter_mut().take(base + end).skip(base + col) {
-                    cell.bg = pill;
-                    cell.attrs = if r == 0 { title_attrs } else { 0 };
-                }
+            // Pill background — a single row (one bar, not two stacked rows).
+            for cell in batch.iter_mut().take(end).skip(col) {
+                cell.bg = pill;
+                cell.attrs = title_attrs;
             }
 
-            // Title text on row 0.
+            // Explicit separator: the gap cell after each pill painted in the
+            // border color, so adjacent tabs read as distinct buttons.
+            let sep_c = col + span;
+            if sep_c < cols {
+                batch[sep_c].bg = sep;
+            }
+
+            // Title text.
             for (k, ch) in title.chars().enumerate() {
                 let c = col + 1 + k;
                 if c >= cols {
@@ -1167,7 +1194,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Height of the tab bar in pixels (two cell rows). main.rs uses this for
+    /// Height of the tab bar in pixels (one cell row). main.rs uses this for
     /// the content viewport offset; must stay in sync with draw_tab_bar.
     pub fn tab_bar_height(&self) -> f32 {
         TAB_BAR_ROWS as f32 * self.cell_height

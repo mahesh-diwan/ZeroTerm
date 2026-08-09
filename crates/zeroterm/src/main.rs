@@ -3151,11 +3151,11 @@ mod tests {
     #[test]
     fn cells_for_size_matches_renderer_math() {
         // Pins the exact pair the renderer produced at runtime (verified
-        // live: 946x501 at 10x22 cells -> 91 cols x 18 rows). Chrome = 3 rows
-        // (2 tab + 1 status), padding 16px per side. If the shared constants
+        // live: 946x501 at 10x22 cells -> 91 cols x 19 rows). Chrome = 2 rows
+        // (1 tab + 1 status), padding 16px per side. If the shared constants
         // drift, this fails.
         let (cols, rows) = cells_for_size(10.0, 22.0, PhysicalSize::new(946, 501));
-        assert_eq!((cols, rows), (91, 18));
+        assert_eq!((cols, rows), (91, 19));
         // Degenerate windows clamp to >= 1 col/row like cols_for/rows_for.
         assert_eq!(cells_for_size(10.0, 22.0, PhysicalSize::new(5, 5)), (1, 1));
     }
