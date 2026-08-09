@@ -275,7 +275,7 @@ impl App {
         zt("config loaded");
         info!("keybindings: vim_mode={}", config.keybindings.vim_mode);
 
-        let window_attrs = WindowAttributes::default()
+        let mut window_attrs = WindowAttributes::default()
             .with_title(VERSION_LABEL)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 config.window.width,
@@ -286,6 +286,18 @@ impl App {
             // window.opacity < 1.0 to actually show the desktop through the
             // terminal instead of a black void.
             .with_transparent(true);
+        // Stable app-id (Wayland) / WM_CLASS (X11): compositor window rules —
+        // e.g. an "opaque-zeroterm" dim/opacity exemption — need a class to
+        // match. The previous build left the class empty, so Hyprland matched
+        // no rule and dimmed the unfocused window, washing out the tab pills.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            window_attrs =
+                WindowAttributesExtWayland::with_name(window_attrs, "zeroterm", "ZeroTerm");
+            window_attrs = WindowAttributesExtX11::with_name(window_attrs, "ZeroTerm", "zeroterm");
+        }
 
         let window = Arc::new(event_loop.create_window(window_attrs)?);
         zt("window created");

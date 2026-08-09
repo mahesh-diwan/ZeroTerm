@@ -1024,9 +1024,13 @@ impl Renderer {
                 1.0,
             ]
         };
-        let inactive_bg: [f32; 4] = mix(0.25);
-        let hover_bg: [f32; 4] = mix(0.4);
-        let active_bg: [f32; 4] = mix(0.55);
+        // Strong brightness ladder that survives compositor dimming of
+        // unfocused windows (Hyprland dim_inactive multiplies ~0.85x, which
+        // used to push the old inactive pills down toward the bar color and
+        // made every tab look like one flat blob with no separators).
+        let inactive_bg: [f32; 4] = mix(0.42);
+        let hover_bg: [f32; 4] = mix(0.52);
+        let active_bg: [f32; 4] = mix(0.66);
         // Tab separator: a 1-cell line in the border color between adjacent
         // pills, so the boundary is explicit even on low-contrast displays.
         let sep: [f32; 4] = [
@@ -1054,6 +1058,30 @@ impl Renderer {
                     p(sep)
                 ),
             );
+            // Ground truth for "can't see all tabs": every pill this frame
+            // (title + col span + active flag + whether a separator cell is
+            // painted after it), using the same col-advance math as the draw
+            // loop below.
+            let bar_cols = (self.size.width as f32 / self.cell_size[0])
+                .floor()
+                .max(1.0) as usize;
+            let mut pills: Vec<String> = Vec::new();
+            let mut pcol = 1usize;
+            for tab in tabs {
+                let span = tab_span(&tab.title, 20);
+                let sep = pcol + span < bar_cols;
+                pills.push(format!(
+                    "{}\"{}\"c{}span{}{}{}",
+                    if tab.active { "*" } else { "" },
+                    truncate_title(&tab.title, 20),
+                    pcol,
+                    span,
+                    if tab.hovered { "h" } else { "" },
+                    if sep { "s" } else { "" }
+                ));
+                pcol += span + 1;
+            }
+            self.diag.probe("tab_pills", &pills.join(" | "));
         }
         let accent_fg: [f32; 4] = [
             t.accent.r as f32 / 255.0,
