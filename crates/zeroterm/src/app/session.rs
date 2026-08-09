@@ -854,6 +854,31 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_pane_has_a_visible_rect() {
+        // Multiplexing invariant behind the "old tabs blank" bug: the tiled
+        // render loop only draws panes found in rects(), so a pane whose rect
+        // is missing or degenerate silently goes blank. Every pane in the map
+        // must have a non-zero rect after any number of tab/split insertions.
+        let mut m = SessionManager::new();
+        m.panes.insert(0, pane_state());
+        m.active_pane = 0;
+        m.register_pane(pane_state(), SplitDir::Vertical, true);
+        m.register_pane(pane_state(), SplitDir::Horizontal, true);
+        m.register_pane(pane_state(), SplitDir::Vertical, true);
+        let rects = m.rects();
+        assert_eq!(
+            rects.len(),
+            m.panes.len(),
+            "every pane is present in the split tree"
+        );
+        for id in m.pane_ids() {
+            let (x, y, w, h) = rects.get(&id).copied().expect("pane has a rect");
+            assert!(w > 0.001 && h > 0.001, "pane {id} rect must be visible");
+            assert!(x >= 0.0 && y >= 0.0, "pane {id} rect in-bounds");
+        }
+    }
+
+    #[test]
     fn register_pane_without_tab_keeps_tabs_empty() {
         let mut m = SessionManager::new();
         m.panes.insert(0, pane_state());

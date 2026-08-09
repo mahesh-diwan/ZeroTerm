@@ -27,6 +27,8 @@ pub enum RendererError {
     NoAdapter,
     #[error("font not found: {0}")]
     FontNotFound(String),
+    #[error("font file could not be parsed: {0}")]
+    FontInvalid(String),
     /// The surface could not present a frame (occluded, timed out, OOM). The
     /// caller must NOT treat this as success: no frame was acquired, so the
     /// redraw loop must stay alive and retry once the surface is presentable
@@ -1663,22 +1665,27 @@ fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
     }
 
     /// Apply a config font change (file and/or size) at runtime. Cell metrics
-    /// are recomputed from the atlas; the caller re-lays-out panes and redraws.
-    pub fn reload_font(&mut self, font_path: Option<String>, font_size: f32) {
-        match self.glyph_atlas.set_font(
-            &self.device,
-            &self.queue,
-            font_path,
-            font_size,
-        ) {
-            Ok(()) => {
-                let (cw, ch) = self.glyph_atlas.cell_metrics();
-                self.cell_width = cw;
-                self.cell_height = ch;
-                self.cell_size = [cw, ch];
-            }
-            Err(e) => log::warn!("Failed to reload font: {}", e),
-        }
+    /// are recomputed from the atlas, the GPU cell grid is rebuilt for the new
+    /// cell size, and the caller re-lays-out panes and redraws. Returns the
+    /// error on a failed load/parse so the caller keeps its font_path/size
+    /// bookkeeping in sync with what actually rendered (a rejected font must
+    /// not trigger a pane re-layout at metrics that were never applied).
+    pub fn reload_font(
+        &mut self,
+        font_path: Option<String>,
+        font_size: f32,
+    ) -> Result<()> {
+        self.glyph_atlas
+            .set_font(&self.device, &self.queue, font_path, font_size)?;
+        let (cw, ch) = self.glyph_atlas.cell_metrics();
+        self.cell_width = cw;
+        self.cell_height = ch;
+        self.cell_size = [cw, ch];
+        // The GPU cell grid (content_pass capacity + shader cols/rows) was
+        // sized from the OLD cell metrics; rebuild it for the new size so
+        // render_screen never clamps a grid whose shape just changed.
+        self.resize(self.size.width, self.size.height);
+        Ok(())
     }
 
 }

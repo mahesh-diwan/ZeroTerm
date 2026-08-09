@@ -82,29 +82,60 @@ pub(crate) struct GlyphAtlas {
 /// the right size kills the startup resize storm: every PTY resize delivers
 /// SIGWINCH, and bash reprints its prompt on each — three startup resizes
 /// stacked three prompts.
-pub fn estimate_cell_size(font_size: f32, font_path: Option<&str>) -> (f32, f32) {
+/// Font metrics derived from a font blob at a size: the cell (row) height
+/// comes from ascent + descent + leading, the cell width from the 'W' ink,
+/// and `baseline` (ascent) anchors glyph bitmaps inside their cell. Shared by
+/// `estimate_cell_size`, `GlyphAtlas::new`, and `set_font` so the three metric
+/// computations can never drift. Returns `None` when the blob is not a
+/// parseable font (callers then fall back to size-derived estimates).
+struct FontMetrics {
+    cell_width: f32,
+    cell_height: f32,
+    baseline: f32,
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+fn compute_metrics(
+    font_data: &[u8],
+    font_size: f32,
+    scale_ctx: &mut ScaleContext,
+) -> Option<FontMetrics> {
+    let font = FontRef::from_index(font_data, 0)?;
+    let metrics = font.metrics(&[]);
+    let scale = font_size / metrics.units_per_em as f32;
+    let ascent = metrics.ascent * scale;
+    let descent = metrics.descent * scale;
+    let leading = metrics.leading * scale;
+    let cell_height = (ascent + descent + leading).ceil();
+    let mut scaler = scale_ctx.builder(font).size(font_size).build();
+    let charmap = font.charmap();
     let mut cell_width = font_size * 0.5;
-    let mut cell_height = font_size * 1.2;
+    if let Some(img) = Render::new(&[Source::Outline])
+        .format(swash::zeno::Format::Alpha)
+        .render(&mut scaler, charmap.map(0x57u32))
+    {
+        cell_width = img.placement.width as f32;
+    }
+    Some(FontMetrics {
+        cell_width,
+        cell_height,
+        baseline: ascent,
+        ascent,
+        descent,
+        leading,
+    })
+}
+
+pub fn estimate_cell_size(font_size: f32, font_path: Option<&str>) -> (f32, f32) {
     if let Ok(data) = load_font_bytes(font_path) {
-        if let Some(font) = FontRef::from_index(&data, 0) {
-            let metrics = font.metrics(&[]);
-            let scale = font_size / metrics.units_per_em as f32;
-            let ascent = metrics.ascent * scale;
-            let descent = metrics.descent * scale;
-            let leading = metrics.leading * scale;
-            cell_height = (ascent + descent + leading).ceil();
-            let mut scale_ctx = ScaleContext::new();
-            let mut scaler = scale_ctx.builder(font).size(font_size).build();
-            let charmap = font.charmap();
-            if let Some(img) = Render::new(&[Source::Outline])
-                .format(swash::zeno::Format::Alpha)
-                .render(&mut scaler, charmap.map(0x57u32))
-            {
-                cell_width = img.placement.width as f32;
-            }
+        let mut scale_ctx = ScaleContext::new();
+        if let Some(m) = compute_metrics(&data, font_size, &mut scale_ctx) {
+            return (m.cell_width, m.cell_height);
         }
     }
-    (cell_width, cell_height)
+    (font_size * 0.5, font_size * 1.2)
 }
 
 impl GlyphAtlas {
@@ -162,36 +193,27 @@ impl GlyphAtlas {
             cell_height: font_size * 1.2,
         };
 
-        // Compute cell metrics from font
-        if let Some(font) = FontRef::from_index(&atlas.font_data, 0) {
-            let metrics = font.metrics(&[]);
-            let scale = atlas.font_size / metrics.units_per_em as f32;
-            let ascent = metrics.ascent * scale;
-            let descent = metrics.descent * scale;
-            let leading = metrics.leading * scale;
-            atlas.cell_height = (ascent + descent + leading).ceil();
-            atlas.baseline = ascent;
-            let mut scaler = atlas
-                .scale_context
-                .builder(font)
-                .size(atlas.font_size)
-                .build();
-            let charmap = font.charmap();
-            if let Some(img) = Render::new(&[Source::Outline])
-                .format(swash::zeno::Format::Alpha)
-                .render(&mut scaler, charmap.map(0x57u32))
-            {
-                atlas.cell_width = img.placement.width as f32;
-            }
+        // Compute cell metrics from font (shared with estimate_cell_size /
+        // set_font so the three computations can never drift). new() cannot
+        // fail here: the bytes came from a successful load, so a parse miss
+        // keeps the size-derived estimates.
+        if let Some(m) = compute_metrics(
+            &atlas.font_data,
+            atlas.font_size,
+            &mut atlas.scale_context,
+        ) {
+            atlas.cell_width = m.cell_width;
+            atlas.cell_height = m.cell_height;
+            atlas.baseline = m.baseline;
             log::info!(
                 "Cell metrics: {:.2}x{:.2} (ascent {:.2}, descent {:.2}, leading {:.2}, 'W' ink {}x{})",
-                atlas.cell_width,
-                atlas.cell_height,
-                ascent,
-                descent,
-                leading,
-                atlas.cell_width as u32,
-                atlas.cell_height as u32
+                m.cell_width,
+                m.cell_height,
+                m.ascent,
+                m.descent,
+                m.leading,
+                m.cell_width as u32,
+                m.cell_height as u32
             );
         }
 
@@ -386,28 +408,25 @@ impl GlyphAtlas {
         font_size: f32,
     ) -> Result<()> {
         let data = load_font_bytes(font_path.as_deref())?;
+        // Compute the new metrics BEFORE committing any state: a blob that
+        // loads but cannot be parsed keeps the previous font, size, and
+        // metrics — and the caller's font_path/size bookkeeping stays in sync
+        // with what actually rendered.
+        let metrics = compute_metrics(&data, font_size, &mut self.scale_context).ok_or_else(
+            || {
+                RendererError::FontInvalid(
+                    font_path
+                        .clone()
+                        .unwrap_or_else(|| "<default font>".to_string()),
+                )
+            },
+        )?;
         self.font_path = font_path;
         self.font_data = data;
         self.font_size = font_size;
-        self.cell_width = font_size * 0.5;
-        self.cell_height = font_size * 1.2;
-        if let Some(font) = FontRef::from_index(&self.font_data, 0) {
-            let metrics = font.metrics(&[]);
-            let scale = font_size / metrics.units_per_em as f32;
-            let ascent = metrics.ascent * scale;
-            let descent = metrics.descent * scale;
-            let leading = metrics.leading * scale;
-            self.cell_height = (ascent + descent + leading).ceil();
-            self.baseline = ascent;
-            let mut scaler = self.scale_context.builder(font).size(font_size).build();
-            let charmap = font.charmap();
-            if let Some(img) = Render::new(&[Source::Outline])
-                .format(swash::zeno::Format::Alpha)
-                .render(&mut scaler, charmap.map(0x57u32))
-            {
-                self.cell_width = img.placement.width as f32;
-            }
-        }
+        self.cell_width = metrics.cell_width;
+        self.cell_height = metrics.cell_height;
+        self.baseline = metrics.baseline;
         // Every cached bitmap was rasterized at the old size; drop them all
         // (non-ASCII glyphs too — repack_ascii only refreshes the ASCII set).
         self.glyph_cache.clear();

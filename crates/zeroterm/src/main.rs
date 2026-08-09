@@ -654,6 +654,13 @@ impl App {
                 SplitDir::Vertical,
                 true,
             );
+            // The new tab is a tiled pane; size every pane to its rect NOW
+            // (create_split_pane already does this). Without it the new pane
+            // keeps its full-window grid, whose left-anchored draw covers the
+            // older tab until the first PTY drain happens to resize it — the
+            // "new tab shown, old tabs blank" flicker. The PaneState::resize
+            // dedupe makes this a no-op once sizes agree.
+            self.resize_panes_to_rects();
         }
         Ok(())
     }
@@ -1915,14 +1922,25 @@ impl App {
         // the new size, then we re-layout the panes for the new cell metrics
         // (previously the path was only stored, never applied).
         if font_path != self.font_path || (font_size - self.font_size).abs() > f32::EPSILON {
-            if let Some(renderer) = &mut self.renderer {
-                renderer.reload_font(font_path.clone(), font_size);
-            }
-            self.font_path = font_path;
-            self.font_size = font_size;
-            self.resize_panes_to_rects();
-            if let Some(window) = &self.window {
-                window.request_redraw();
+            // A rejected font (missing file / unparseable) must NOT commit the
+            // new path/size or re-layout: the renderer kept the old metrics,
+            // so committing would desync pane sizing from what actually
+            // renders. No renderer yet: the values are consumed at init.
+            let applied = match &mut self.renderer {
+                Some(renderer) => {
+                    renderer.reload_font(font_path.clone(), font_size).is_ok()
+                }
+                None => true,
+            };
+            if applied {
+                self.font_path = font_path;
+                self.font_size = font_size;
+                self.resize_panes_to_rects();
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            } else {
+                warn!("Font change rejected: keeping the current font and metrics");
             }
         }
         // reload_config wants the whole config; re-borrow it now that no
