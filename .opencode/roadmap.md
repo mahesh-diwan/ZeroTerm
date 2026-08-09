@@ -139,6 +139,8 @@ This is the hardest part. Get this right first — everything else is applicatio
 > Ollama/LM Studio client, explain/suggest, and editor completion were
 > deleted. Terminal-native productivity (blocks, palette, notifications)
 > replaces it without a network dependency.
+> Note: existing configs that set `[ai] endpoint` are unaffected — the
+> unknown section is silently ignored, so no config edit is required.
 
 ### Milestone 3.5: GUI Settings Panel
 

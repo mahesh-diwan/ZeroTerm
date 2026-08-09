@@ -43,7 +43,7 @@ const sections = [
     items: [
       {
         label: 'What is implemented',
-        content: '- **Tabs & split panes** — tiling splits, floating-pane overlay, session restore\n- **Scrollback** — search overlay, output-block navigation, syntax highlighting\n- **Graphics protocols** — Kitty, Sixel, and iTerm2 inline images\n- **SSH** — native client with persistent sessions (Unix)\n- **Local AI** — optional Ollama / LM Studio integration for explain & suggest (`ai` feature)\n- **Encrypted sync** — ChaCha20-Poly1305 settings sync (`sync` feature)\n- **Plugins** — WASM sandbox via wasmtime (`plugins` feature)\n- **Line editor** — readline-style multi-line editing with history\n\nAll claims on this site correspond to code in the repository; features are feature-gated in `crates/zeroterm/Cargo.toml`.',
+        content: '- **Tabs & split panes** — tiling splits, floating-pane overlay, session restore\n- **Scrollback** — search overlay, output-block navigation, syntax highlighting\n- **Graphics protocols** — Kitty, Sixel, and iTerm2 inline images\n- **SSH** — native client with persistent sessions (Unix)\n- **Encrypted sync** — ChaCha20-Poly1305 settings sync (`sync` feature)\n- **Plugins** — WASM sandbox via wasmtime (`plugins` feature)\n- **Line editor** — readline-style multi-line editing with history\n\nAll claims on this site correspond to code in the repository; features are feature-gated in `crates/zeroterm/Cargo.toml`.',
       },
     ],
   },

@@ -17,7 +17,7 @@ const features = [
 ];
 
 const stats = [
-  { value: '9', suffix: '', label: 'Rust crates' },
+  { value: '8', suffix: '', label: 'Rust crates' },
   { value: '348+', suffix: '', label: 'tests passing' },
   { value: '0', suffix: '', label: 'JS runtime' },
   { value: 'MIT', suffix: '', label: 'open source' },

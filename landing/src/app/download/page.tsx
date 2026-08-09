@@ -35,7 +35,7 @@ const platforms = [
 
 const releaseNotes = [
   { tag: 'v0.3.0', date: '2026-08-06', notes: ['Fixed split panes never appearing in the split tree', '`clear` no longer wipes scrollback', 'Window resizes preserve scrollback', 'Invalid UTF-8 no longer swallows following text', 'Release pipeline publishes prebuilt binaries to GitHub Releases', '`scripts/install.sh` resolves the latest tag and installs prebuilt packages'] },
-  { tag: 'v0.2.0', date: '2026-07-30', notes: ['GPU-accelerated rendering with wgpu', 'Native multiplexing (tabs + splits)', 'SSH integration with persistent sessions', 'Kitty/Sixel/iTerm2 image protocols', 'Local AI integration (Ollama/LM Studio)', 'TOML + Lua configuration', 'E2E-encrypted sync, WASM plugins'] },
+  { tag: 'v0.2.0', date: '2026-07-30', notes: ['GPU-accelerated rendering with wgpu', 'Native multiplexing (tabs + splits)', 'SSH integration with persistent sessions',    'Kitty/Sixel/iTerm2 image protocols', 'Output-block navigation', 'TOML + Lua configuration', 'E2E-encrypted sync, WASM plugins'] },
 ];
 
 function CommandCopy({ cmd, label }: { cmd: string; label: string }) {

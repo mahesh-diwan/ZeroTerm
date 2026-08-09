@@ -18,7 +18,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: 'ZeroTerm — GPU-Accelerated Terminal Emulator',
   description:
-    'GPU-accelerated terminal emulator written in Rust with wgpu. Tabs, splits, SSH, image protocols, and optional local AI — no Electron, no JS runtime.',
+    'GPU-accelerated terminal emulator written in Rust with wgpu. Tabs, splits, SSH, image protocols, and output-block navigation — no Electron, no JS runtime.',
   keywords: [
     'terminal', 'rust', 'gpu', 'wgpu', 'multiplexer', 'pty',
     'ssh', 'developer-tools', 'terminal-emulator',
@@ -32,7 +32,7 @@ export const metadata: Metadata = {
     siteName: 'ZeroTerm',
     title: 'ZeroTerm — GPU-Accelerated Terminal Emulator',
     description:
-      'GPU-accelerated terminal emulator written in Rust with wgpu. Tabs, splits, SSH, image protocols, and optional local AI.',
+      'GPU-accelerated terminal emulator written in Rust with wgpu. Tabs, splits, SSH, image protocols, and output-block navigation.',
     images: [{ url: '/og-image.png', width: 1200, height: 630, alt: 'ZeroTerm' }],
   },
   twitter: {

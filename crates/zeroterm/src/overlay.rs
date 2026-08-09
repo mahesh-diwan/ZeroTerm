@@ -65,12 +65,6 @@ impl ScreenScratch {
         }
     }
 
-    /// Drop any saved region without touching the screen.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn clear(&mut self) {
-        self.saved = None;
-    }
-
     /// Whether a region is currently saved (i.e. an overlay is covering it).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_active(&self) -> bool {
@@ -123,16 +117,6 @@ mod tests {
         let mut scratch = ScreenScratch::default();
         scratch.restore(&mut screen); // must not panic
         assert!(!scratch.is_active());
-    }
-
-    #[test]
-    fn clear_drops_saved_region() {
-        let mut screen = Screen::new(80, 10);
-        let mut scratch = ScreenScratch::default();
-        scratch.save_region(&screen, 0, 2);
-        scratch.clear();
-        assert!(!scratch.is_active());
-        scratch.restore(&mut screen); // no-op, must not panic
     }
 
     #[test]
