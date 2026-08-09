@@ -14,8 +14,6 @@ use winit::dpi::PhysicalSize;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
-#[cfg(feature = "ai")]
-use zeroterm_ai::client::{AiClient, AiError};
 use zeroterm_config::{Config, KeybindingsConfig};
 use zeroterm_core::parser::MouseTrackingMode;
 use zeroterm_core::Parser;
@@ -30,9 +28,6 @@ use crate::app::layout::Layout;
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
-#[cfg(feature = "ai")]
-use crate::ai_overlay::{explain_prompt, suggest_context, AiKind, AiState};
-use crate::ai_overlay::AiOverlay;
 #[cfg(feature = "plugins")]
 use crate::app::load_plugins;
 #[cfg(all(unix, feature = "ssh"))]
@@ -47,7 +42,6 @@ use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
 use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
 
-mod ai_overlay;
 mod app;
 mod frame;
 mod overlay;
@@ -61,7 +55,6 @@ use overlay::Overlay;
 enum OverlayKind {
     Search,
     Settings,
-    Ai,
     HostPicker,
 }
 // Retained for the legacy session.json format + its tests; session layout
@@ -105,8 +98,6 @@ struct App {
     clipboard: Option<Clipboard>,
     shell: String,
     shell_args: Vec<String>,
-    #[cfg(feature = "ai")]
-    ai_client: Option<Arc<AiClient>>,
     #[cfg(feature = "sync")]
     sync_daemon: Option<SyncDaemon>,
     config_changed: Arc<AtomicBool>,
@@ -118,7 +109,6 @@ struct App {
     settings: SettingsMenu,
     host_picker: HostPicker,
     search: SearchState,
-    ai: AiOverlay,
     sync_active: bool,
     last_sync_clear: std::time::Instant,
     last_anim_frame: std::time::Instant,
@@ -217,8 +207,6 @@ impl App {
             clipboard: Clipboard::new().ok(),
             shell: String::new(),
             shell_args: vec![],
-            #[cfg(feature = "ai")]
-            ai_client: None,
             #[cfg(feature = "sync")]
             sync_daemon: None,
             config_changed: Arc::new(AtomicBool::new(false)),
@@ -230,7 +218,6 @@ impl App {
             settings: SettingsMenu::new(&SettingsContext::default()),
             host_picker: HostPicker::new(),
             search: SearchState::default(),
-            ai: AiOverlay::default(),
             sync_active: false,
             last_sync_clear: std::time::Instant::now(),
             last_anim_frame: std::time::Instant::now(),
@@ -473,13 +460,6 @@ impl App {
             },
         );
 
-        #[cfg(feature = "ai")]
-        let ai_client = if config.ai.endpoint.is_empty() {
-            None
-        } else {
-            Some(Arc::new(AiClient::new(&config.ai.endpoint)))
-        };
-
         self.window = Some(window);
         // The pre-spawned shell becomes the first classic tab. `tabs` is never
         // empty after init, so every SessionManager op has a live tab.
@@ -570,11 +550,6 @@ impl App {
             self.session.sync_active();
         }
 
-        #[cfg(feature = "ai")]
-        {
-            self.ai_client = ai_client.clone();
-            self.editor.set_ai_client(ai_client);
-        }
         #[cfg(feature = "sync")]
         {
             self.sync_daemon = if config.sync.server_url.is_empty() {
@@ -991,62 +966,6 @@ impl App {
         }
     }
 
-    #[cfg(feature = "ai")]
-    fn open_ai(&mut self, kind: AiKind) {
-        let Some(ai_client) = self.ai_client.clone() else {
-            self.ai.open(kind);
-            self.ai.state = AiState::Error(
-                "AI not configured (set ai.endpoint in config, e.g. http://localhost:11434)"
-                    .to_string(),
-            );
-            self.redraw();
-            return;
-        };
-        let Some(prompt) = self.ai_prompt(kind) else {
-            self.ai.open(kind);
-            self.ai.state = AiState::Error("no command context in the current pane".to_string());
-            self.redraw();
-            return;
-        };
-        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            Overlay::snapshot(&mut self.ai, pane.parser.screen());
-        }
-        self.ai.open(kind);
-        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-        self.ai.pending = Some(rx);
-        // Fire-and-poll: the request runs on a fresh runtime in a background
-        // thread; the result lands on the channel and is picked up by
-        // AiOverlay::poll from the render loop. Never blocks the window.
-        std::thread::spawn(move || {
-            let result = match tokio::runtime::Runtime::new() {
-                Ok(rt) => match kind {
-                    AiKind::Explain => rt.block_on(ai_client.explain(&prompt)),
-                    AiKind::Suggest => rt.block_on(ai_client.suggest(&prompt)),
-                },
-                Err(e) => Err(AiError::RequestFailed(e.to_string())),
-            };
-            let _ = tx.send(result.map_err(|e| e.to_string()));
-        });
-        self.redraw();
-    }
-
-    #[cfg(feature = "ai")]
-    fn ai_prompt(&self, kind: AiKind) -> Option<String> {
-        let screen = self.session.active_pane()?.parser.screen();
-        match kind {
-            AiKind::Explain => explain_prompt(screen),
-            AiKind::Suggest => suggest_context(screen),
-        }
-    }
-
-    fn close_ai(&mut self) {
-        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-            Overlay::restore(&mut self.ai, pane.parser.screen_mut());
-        }
-        self.ai.close();
-        self.redraw();
-    }
-
     fn drain_pty(&mut self) -> bool {
         let mut got_data = false;
         let active = self.session.active_pane;
@@ -1218,26 +1137,9 @@ impl App {
             }
             self.apply_config_to_renderer();
         }
-        if self.ai.open {
-            // Fire-and-poll: collect the finished AI result before drawing,
-            // so the panel paints the response (or error) this frame.
-            self.ai.poll();
-        }
         if let Some(kind) = self.active_overlay() {
             self.draw_overlay(kind);
         }
-        // Collect an in-flight AI line completion only while the editor is
-        // open; closing the editor discards the pending request.
-        if self.editor.is_active() {
-            self.editor.poll_ai();
-        }
-        // Ghost completion string for the editor title; computed before the
-        // renderer borrow below.
-        let edit_ghost = if self.editor.is_active() {
-            self.editor.completion_ghost()
-        } else {
-            None
-        };
         let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
             return Ok(());
         };
@@ -1256,10 +1158,7 @@ impl App {
         // pending AI completion appends a ghost suffix after the cursor marker.
         let tab_ids: Vec<usize> = self.session.tabs.iter().map(|t| t.id).collect();
         let active_tab_id = tab_ids.get(self.session.active_tab).copied().unwrap_or(0);
-        let edit_display = self
-            .editor
-            .is_active()
-            .then(|| self.editor.display_line(edit_ghost.as_deref()));
+        let edit_display = self.editor.is_active().then(|| self.editor.display_line());
         let tab_infos = frame::tab_infos(
             &tab_ids,
             active_tab_id,
@@ -2102,7 +2001,6 @@ impl App {
         let bytes = match kind {
             OverlayKind::Search => Overlay::draw_bytes(&self.search, cols, rows),
             OverlayKind::Settings => Overlay::draw_bytes(&self.settings, cols, rows),
-            OverlayKind::Ai => Overlay::draw_bytes(&self.ai, cols, rows),
             OverlayKind::HostPicker => Overlay::draw_bytes(&self.host_picker, cols, rows),
         };
         pane.parser.parse(&bytes);
@@ -2114,7 +2012,6 @@ impl App {
         match kind {
             OverlayKind::Search => Overlay::is_open(&self.search),
             OverlayKind::Settings => Overlay::is_open(&self.settings),
-            OverlayKind::Ai => Overlay::is_open(&self.ai),
             OverlayKind::HostPicker => Overlay::is_open(&self.host_picker),
         }
     }
@@ -2125,8 +2022,6 @@ impl App {
     fn active_overlay(&self) -> Option<OverlayKind> {
         if self.search.open {
             Some(OverlayKind::Search)
-        } else if self.ai.open {
-            Some(OverlayKind::Ai)
         } else if self.settings.open {
             Some(OverlayKind::Settings)
         } else if self.host_picker.open {
@@ -2254,17 +2149,7 @@ impl App {
             return;
         }
 
-        // 2. AI overlay owns every key while open.
-        if self.ai.open {
-            if let Some(code) = code {
-                if let Some(key_router::AiKey::Close) = key_router::ai_key(code, mods) {
-                    self.close_ai();
-                }
-            }
-            return;
-        }
-
-        // 3. Local line editor owns keys while active (Pass falls through to
+        // 2. Local line editor owns keys while active (Pass falls through to
         //    the global bindings below).
         if let Some(code) = code {
             if self.editor.is_active() {
@@ -2356,11 +2241,6 @@ impl App {
                 }
                 key_router::GlobalAction::JumpBlock(delta) => {
                     self.jump_to_block(delta);
-                    return;
-                }
-                #[cfg(feature = "ai")]
-                key_router::GlobalAction::OpenAi(kind) => {
-                    self.open_ai(kind);
                     return;
                 }
                 #[cfg(all(unix, feature = "ssh"))]
@@ -3101,7 +2981,6 @@ mod tests {
             EditAction::Handled
         );
         assert_eq!(app.editor.line(), "\tab");
-        assert!(app.editor.ai_completion.is_none());
     }
 
     #[test]

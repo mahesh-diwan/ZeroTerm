@@ -98,7 +98,7 @@ pub fn tab_display_title(title: &str, pane_count: usize) -> String {
 }
 
 /// Tab strip content. While the line editor is open the active tab shows the
-/// live buffer (plus any AI ghost) instead of the shell title.
+/// live buffer instead of the shell title.
 pub fn tab_infos(
     ids: &[usize],
     active_pane: usize,

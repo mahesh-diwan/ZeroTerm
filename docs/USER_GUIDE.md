@@ -48,8 +48,6 @@ directory. See the config reference.
 - **Search overlay** — `Ctrl+Shift+F`, in-terminal regex search across the screen
 - **Clipboard** — OSC 52 read/write, native copy/paste, copy-on-select
 - **URL detection** — URLs are highlighted inline; hover/copy affordances
-- **Local AI** — `Ctrl+Shift+I` asks an Ollama/LM Studio endpoint to explain the
-  current screen
 - **SSH sessions** — native SSH client, one key to connect to a configured host
 - **Settings sync** — E2E encrypted (ChaCha20-Poly1305) push/pull of config
 - **Plugins** — sandboxed WASM/WASI command plugins (see [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md))
@@ -73,7 +71,6 @@ directory. See the config reference.
 | `Alt+Arrow`         | Focus adjacent pane            |
 | `Ctrl+Shift+F`      | Toggle search overlay          |
 | `Esc`               | Close search overlay           |
-| `Ctrl+Shift+I`      | Ask local AI to explain screen |
 | `Ctrl+Shift+O`      | Cycle window opacity           |
 | `Ctrl+Shift+S`      | Connect SSH (config.ssh.host)  |
 | `Ctrl+Shift+C`      | Copy selection                 |
@@ -159,10 +156,6 @@ It is watched and hot-reloaded.
 The TOML file is deserialized as a whole. Missing a non-optional key rejects
 the file, and ZeroTerm falls back to defaults. Use the full template in
 `CONFIG_REFERENCE.md`.
-
-**How do I set up the AI explain feature?**
-Point `[ai] endpoint` at an Ollama or LM Studio server, e.g. `http://localhost:11434`,
-then press `Ctrl+Shift+I`. The hardcoded model is `llama3.2`.
 
 **How do I SSH from ZeroTerm?**
 Fill in `[ssh]` in config.toml (host/user/port/key_path) and press

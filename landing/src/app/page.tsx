@@ -11,7 +11,7 @@ const features = [
   { title: 'Native Multiplexing', desc: 'Tabs, splits, sessions built in. No tmux or screen config needed.', tag: 'UX' },
   { title: 'SSH First', desc: 'Native SSH client. Persistent sessions survive disconnects.', tag: 'Network' },
   { title: 'Graphics Protocols', desc: 'Kitty, Sixel, iTerm2 inline images in your terminal.', tag: 'Graphics' },
-  { title: 'Local AI', desc: 'Ollama and LM Studio integration. Explain output and suggest commands.', tag: 'AI' },
+  { title: 'Block Output', desc: 'Every command becomes a block — copy it, rerun it, see its exit status.', tag: 'UX' },
   { title: 'Cross-Platform', desc: 'Metal on macOS, Vulkan on Linux — Windows builds are still experimental.', tag: 'Platform' },
   { title: 'Zero Config', desc: 'Works out of the box. TOML and Lua for power users.', tag: 'Setup' },
 ];
@@ -35,7 +35,7 @@ const installers = [
 ];
 
 const faqs = [
-  { q: 'What is ZeroTerm?', a: 'ZeroTerm is a GPU-accelerated terminal emulator built from scratch in Rust. It uses wgpu for rendering and supports native multiplexing, SSH, image protocols, and optional local AI integration.' },
+  { q: 'What is ZeroTerm?', a: 'ZeroTerm is a GPU-accelerated terminal emulator built from scratch in Rust. It uses wgpu for rendering and supports native multiplexing, SSH, image protocols, and output-block navigation.' },
   { q: 'How do I install it?', a: 'Run the install script or build from source. ZeroTerm is not yet on crates.io, Homebrew, or Flathub; prebuilt binaries are attached to GitHub Releases.' },
   { q: 'Does it support tmux?', a: 'ZeroTerm has built-in multiplexing — tabs, splits, and session management. No tmux or screen needed, though tmux works if you prefer it.' },
   { q: 'Is it available on Windows?', a: 'Linux and macOS are the primary targets and run the full CI suite. A Windows build target exists, but it is not yet verified in CI — treat it as experimental.' },
@@ -46,7 +46,7 @@ const faqs = [
 const roadmap = [
   { phase: 1, title: 'The Engine', status: 'Complete', items: ['PTY Integration', 'VT100 Parser', 'Screen Buffer', 'wgpu Rendering', 'Input Handling'] },
   { phase: 2, title: 'Multiplexing', status: 'Complete', items: ['Tab System', 'Splits (Tiling)', 'SSH Integration', 'Session Restore'] },
-  { phase: 3, title: 'Modern UX', status: 'Complete', items: ['Block Output', 'Graphics Protocols', 'Local AI', 'GUI Settings'] },
+  { phase: 3, title: 'Modern UX', status: 'Complete', items: ['Block Output', 'Graphics Protocols', 'Line Editor', 'GUI Settings'] },
   { phase: 4, title: 'Ecosystem', status: 'In Progress', items: ['macOS Native', 'Linux Native', 'Encrypted Sync', 'WASM Plugins', 'Windows Native (unverified)'] },
 ];
 
@@ -214,7 +214,7 @@ function Hero() {
             </h1>
             <p className="mt-5 text-lg text-fg-muted max-w-xl leading-relaxed text-balance">
               GPU-accelerated terminal emulator built in Rust. 120 FPS at 4K, under 50MB RAM, native
-              multiplexing, SSH, and local AI — all in one binary.
+              multiplexing, SSH, and image protocols — all in one binary.
             </p>
             <div className="mt-8 flex flex-col sm:flex-row gap-3">
               <Link
@@ -284,7 +284,7 @@ function About() {
                   'Native multiplexing — tabs, splits, session management',
                   'Built-in SSH client with persistent sessions',
                   'Kitty / Sixel / iTerm2 image protocol support',
-                  'Local AI integration via Ollama and LM Studio',
+                  'Output-block navigation and search',
                   'TOML + Lua config for power users',
                 ].map((item, i) => (
                   <div key={i} className="flex items-start gap-3 text-sm text-fg leading-relaxed">
@@ -308,7 +308,7 @@ function Features() {
         <AnimatedSection className="max-w-2xl mb-16">
           <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">Everything you need, nothing you don&apos;t.</h2>
           <p className="mt-4 text-fg-muted leading-relaxed text-balance">
-            From GPU-accelerated rendering to local AI. ZeroTerm ships every feature as a single, native binary.
+            From GPU-accelerated rendering to native multiplexing. ZeroTerm ships every feature as a single, native binary.
           </p>
         </AnimatedSection>
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">

@@ -300,8 +300,9 @@ impl EditingState {
         self.cursor = self.buffer.len();
     }
 
-    /// Insert `suffix` at the cursor and advance past it (accept a completion).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    /// Insert `suffix` at the cursor and advance past it. Retained as a test
+    /// utility (the editor inserts chars one at a time via `insert`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn accept_suffix(&mut self, suffix: &str) {
         for c in suffix.chars() {
             self.buffer.insert(self.cursor, c);

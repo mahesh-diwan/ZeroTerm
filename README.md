@@ -7,7 +7,7 @@
 
 ZeroTerm is a GPU-accelerated terminal emulator written in Rust. Rendering is
 done with [wgpu](https://wgpu.rs) (Metal on macOS, DX12/Vulkan on Windows and
-Linux), and the project is organized as a Cargo workspace of nine crates.
+Linux), and the project is organized as a Cargo workspace of eight crates.
 
 ## Status
 
@@ -28,7 +28,6 @@ Linux), and the project is organized as a Cargo workspace of nine crates.
 - 🔭 Scrollback with search, output-block navigation, and syntax highlighting
 - 🖼️ Kitty, Sixel, and iTerm2 inline image protocols
 - 🖥️ Native SSH client with persistent sessions (Unix, feature-gated)
-- 🤖 Optional local AI integration (Ollama / LM Studio) for explain & suggest
 - 🔒 End-to-end encrypted settings sync (ChaCha20-Poly1305)
 - 🔌 WASM plugin sandbox (wasmtime)
 - ⚙️ TOML configuration with optional Lua scripting
@@ -81,6 +80,8 @@ optional `~/.zeroterm.lua` Lua script for advanced customization.
 - [User guide](docs/USER_GUIDE.md)
 - [Plugin development guide](docs/PLUGIN_DEV_GUIDE.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Competitor analysis](docs/COMPETITOR_ANALYSIS.md)
+- [Feature opportunities](docs/FEATURE_OPPORTUNITIES.md)
 
 ## Keyboard Shortcuts
 
@@ -98,7 +99,6 @@ optional `~/.zeroterm.lua` Lua script for advanced customization.
 | `Ctrl+Shift+F`           | Toggle search overlay                 |
 | `Esc`                    | Close search overlay                  |
 | `Ctrl+Shift+J`/`K`       | Jump to next/previous output block    |
-| `Ctrl+Shift+I`           | Ask local AI to explain screen (`ai`) |
 | `Ctrl+Shift+P`           | Open settings overlay                 |
 | `Ctrl+Shift+O`           | Cycle window opacity                  |
 | `Ctrl+Shift+S`           | Connect SSH (`ssh` feature)           |
@@ -120,7 +120,6 @@ optional `~/.zeroterm.lua` Lua script for advanced customization.
 │   ├── zeroterm-render    — wgpu GPU renderer, glyph atlas, themes
 │   ├── zeroterm-mux       — tabs, split tree, session management
 │   ├── zeroterm-config    — TOML + Lua configuration
-│   ├── zeroterm-ai        — local AI integration (Ollama / LM Studio)
 │   ├── zeroterm-sync      — E2E-encrypted settings sync
 │   ├── zeroterm-ssh       — native SSH client
 │   ├── zeroterm-plugin    — WASM plugin sandbox

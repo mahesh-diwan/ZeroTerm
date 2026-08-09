@@ -18,10 +18,8 @@ zeroterm-core = { path = "../zeroterm-core" }
 zeroterm-render = { path = "../zeroterm-render" }
 zeroterm-mux = { path = "../zeroterm-mux" }
 zeroterm-config = { path = "../zeroterm-config" }
-zeroterm-ai = { path = "../zeroterm-ai", optional = true }
 zeroterm-sync = { path = "../zeroterm-sync", optional = true }
 zeroterm-plugin = { path = "../zeroterm-plugin", optional = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread"], optional = true }
 notify = { version = "7", features = ["macos_kqueue"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -30,7 +28,6 @@ serde_json = { workspace = true }
 default = ["gpu", "themes"]
 gpu = []
 themes = []
-ai = ["dep:zeroterm-ai", "dep:tokio"]
 sync = ["dep:zeroterm-sync"]
 ssh = ["dep:zeroterm-ssh"]
 plugins = ["dep:zeroterm-plugin"]

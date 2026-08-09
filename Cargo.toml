@@ -5,7 +5,6 @@ members = [
     "crates/zeroterm-render",
     "crates/zeroterm-mux",
     "crates/zeroterm-config",
-    "crates/zeroterm-ai",
     "crates/zeroterm-sync",
     "crates/zeroterm-ssh",
     "crates/zeroterm-plugin",

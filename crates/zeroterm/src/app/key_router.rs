@@ -11,7 +11,6 @@
 //!   - `console_key` : scroll keys, selection extend, copy/paste, escape seqs
 //!   - `key_sequence`: keycode -> terminal escape bytes (pure, tested)
 //!   - `search_key`  : keys a SearchState overlay consumes
-//!   - `ai_key`      : keys an AiOverlay consumes
 //!
 //! The App keeps only the stateful glue: a thin `apply` match that calls the
 //! same methods the old arm called, plus the editor handle (which is itself a
@@ -20,9 +19,6 @@
 use winit::keyboard::{KeyCode, ModifiersState};
 
 use zeroterm_mux::split::SplitDir;
-
-#[cfg(feature = "ai")]
-use crate::ai_overlay::AiKind;
 
 /// Modifier state condensed to the three bits the keybindings care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,12 +68,6 @@ pub enum SearchKey {
     Text(String),
 }
 
-/// Keys the AI overlay consumes (Escape or the toggle chord closes it).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AiKey {
-    Close,
-}
-
 /// Global keybinding actions. These mutate App state and are applied by App.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalAction {
@@ -94,8 +84,6 @@ pub enum GlobalAction {
     FocusPane(KeyCode),
     CycleOpacity,
     JumpBlock(i32),
-    #[cfg(feature = "ai")]
-    OpenAi(AiKind),
     #[cfg(all(unix, feature = "ssh"))]
     Ssh,
     #[cfg(feature = "plugins")]
@@ -176,10 +164,6 @@ pub fn global_key(code: KeyCode, mods: Mods, ctx: KeyCtx) -> GlobalAction {
             KeyCode::KeyW => GlobalAction::CloseTab,
             KeyCode::KeyE => GlobalAction::Split(SplitDir::Vertical),
             KeyCode::KeyD => GlobalAction::Split(SplitDir::Horizontal),
-            #[cfg(feature = "ai")]
-            KeyCode::KeyI => GlobalAction::OpenAi(AiKind::Explain),
-            #[cfg(feature = "ai")]
-            KeyCode::KeyA => GlobalAction::OpenAi(AiKind::Suggest),
             KeyCode::KeyO => GlobalAction::CycleOpacity,
             #[cfg(all(unix, feature = "ssh"))]
             KeyCode::KeyS => GlobalAction::Ssh,
@@ -367,21 +351,6 @@ pub fn search_key(code: KeyCode, mods: Mods, text: Option<&str>) -> SearchKey {
             SearchKey::Text(t.to_string())
         }
         _ => SearchKey::Text(String::new()),
-    }
-}
-
-/// Keys that close the AI overlay while it is open. Any other key is swallowed
-/// by the overlay (the caller returns without forwarding it) but does NOT close
-/// the panel — only Escape or the toggle chords do.
-#[cfg_attr(not(feature = "ai"), allow(unused_variables))]
-pub fn ai_key(code: KeyCode, mods: Mods) -> Option<AiKey> {
-    match code {
-        KeyCode::Escape => Some(AiKey::Close),
-        #[cfg(feature = "ai")]
-        KeyCode::KeyI if mods.ctrl_shift() => Some(AiKey::Close),
-        #[cfg(feature = "ai")]
-        KeyCode::KeyA if mods.ctrl_shift() => Some(AiKey::Close),
-        _ => None,
     }
 }
 
@@ -638,14 +607,5 @@ mod tests {
             search_key(KeyCode::KeyA, m(false, false, false), Some("a")),
             SearchKey::Text("a".to_string())
         );
-    }
-
-    #[test]
-    fn ai_escape_closes_other_keys_do_not() {
-        assert_eq!(
-            ai_key(KeyCode::Escape, m(false, false, false)),
-            Some(AiKey::Close)
-        );
-        assert_eq!(ai_key(KeyCode::KeyA, m(false, false, false)), None);
     }
 }

@@ -38,7 +38,6 @@ pub struct Config {
     pub mouse: MouseConfig,
     #[serde(default)]
     pub session: SessionConfig,
-    pub ai: AiConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
     pub keybindings: KeybindingsConfig,
@@ -68,11 +67,6 @@ impl Default for KeybindingsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncConfig {
     pub server_url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AiConfig {
-    pub endpoint: String,
 }
 
 impl Config {
@@ -138,7 +132,6 @@ impl Config {
                         self.window.opacity = v;
                     }
                 }
-                "ai_endpoint" | "ai.endpoint" => self.ai.endpoint = value,
                 "ssh_host" | "ssh.host" => self.ssh.host = value,
                 "ssh_user" | "ssh.user" => self.ssh.user = value,
                 "ssh_port" | "ssh.port" => {
@@ -205,7 +198,6 @@ impl Config {
         self.cursor = new_config.cursor;
         self.mouse = new_config.mouse;
         self.session = new_config.session;
-        self.ai = new_config.ai;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
         self.keybindings = new_config.keybindings;

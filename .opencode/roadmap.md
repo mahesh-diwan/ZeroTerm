@@ -106,7 +106,7 @@ This is the hardest part. Get this right first — everything else is applicatio
 
 ## Phase 3: Modern UX (Months 4–6)
 
-**Goal**: Block-based output, modern input, AI integration, graphics protocols.
+**Goal**: Block-based output, modern input, graphics protocols.
 
 ### Milestone 3.1: Block-Based Output
 
@@ -132,14 +132,13 @@ This is the hardest part. Get this right first — everything else is applicatio
 - [x] Render images to GPU textures
 - [x] Animated image support (GIF, WebP)
 
-### Milestone 3.4: AI Integration (Optional)
+### Milestone 3.4: AI Integration (Optional) — REMOVED
 
-- [x] Ollama/LM Studio client
-- [x] Local-only by default (no network calls)
-- [x] Explain command output
-- [x] Suggest commands
-- [x] Code completion in prompt
-- [x] **Security**: No data leaves the machine
+> Decision: all AI/LLM features were removed from the product (see
+> `docs/FEATURE_OPPORTUNITIES.md`). The zeroterm-ai crate, AI overlay,
+> Ollama/LM Studio client, explain/suggest, and editor completion were
+> deleted. Terminal-native productivity (blocks, palette, notifications)
+> replaces it without a network dependency.
 
 ### Milestone 3.5: GUI Settings Panel
 

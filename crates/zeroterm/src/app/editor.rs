@@ -1,25 +1,15 @@
 //! Local line editor (Alt+E): the readline-style Emacs and minimal Vi-normal
-//! key rules over [`EditingState`], plus history navigation and AI Tab
-//! completion.
+//! key rules over [`EditingState`], plus history navigation.
 //!
-//! The editor owns everything about editing — the buffer state, history
-//! navigation, and any in-flight AI completion. It never touches the App or
-//! the PTY: instead `handle()` returns an [`EditAction`] describing the shell
-//! effect the App should execute (e.g. [`EditAction::Submit`]), so every key
-//! rule here is testable without a window, a session, or a display.
+//! The editor owns everything about editing — the buffer state and history
+//! navigation. It never touches the App or the PTY: instead `handle()` returns
+//! an [`EditAction`] describing the shell effect the App should execute (e.g.
+//! [`EditAction::Submit`]), so every key rule here is testable without a
+//! window, a session, or a display.
 
 use winit::keyboard::KeyCode;
 
-#[cfg(feature = "ai")]
-use std::sync::Arc;
-
 use super::input::{EditMode, EditingState, PromptHistory};
-use crate::ai_overlay::AiCompletion;
-
-#[cfg(feature = "ai")]
-use crate::ai_overlay::completion_tab;
-#[cfg(feature = "ai")]
-use zeroterm_ai::client::AiClient;
 
 /// What the App should do after the editor consumed a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,17 +24,13 @@ pub enum EditAction {
 
 /// The line editor session. Inactive (no editing) when `state` is `None`.
 pub struct LineEditor {
-    // `state` / `history` / `ai_completion` are `pub(crate)` as a TEST-ONLY
-    // seam: the crate's unit tests drive the editor state directly. App code
-    // uses the methods above, never the fields.
+    // `state` / `history` are `pub(crate)` as a TEST-ONLY seam: the crate's
+    // unit tests drive the editor state directly. App code uses the methods
+    // above, never the fields.
     /// Current editing session. `None` while not editing.
     pub(crate) state: Option<EditingState>,
     /// Command history for Up/Down recall.
     pub(crate) history: PromptHistory,
-    /// Staged / in-flight AI Tab completion.
-    pub(crate) ai_completion: Option<AiCompletion>,
-    #[cfg(feature = "ai")]
-    ai_client: Option<Arc<AiClient>>,
 }
 
 impl Default for LineEditor {
@@ -52,9 +38,6 @@ impl Default for LineEditor {
         Self {
             state: None,
             history: PromptHistory::new(),
-            ai_completion: None,
-            #[cfg(feature = "ai")]
-            ai_client: None,
         }
     }
 }
@@ -100,52 +83,18 @@ impl LineEditor {
     pub fn start(&mut self, line: &str) {
         let state = EditingState::from_line(line);
         self.history.reset();
-        self.ai_completion = None;
         self.state = Some(state);
     }
 
     /// Close the session without submitting (buffer discarded).
     pub fn cancel(&mut self) {
         self.state = None;
-        self.ai_completion = None;
     }
 
-    /// Register the AI client used by Tab completion. `None` disables it.
-    /// Only called by the App in builds with AI support.
-    #[cfg(feature = "ai")]
-    pub fn set_ai_client(&mut self, client: Option<Arc<AiClient>>) {
-        self.ai_client = client;
-    }
-
-    /// Poll for a finished AI completion result. True when the staged suffix
-    /// changed so the caller can redraw.
-    pub fn poll_ai(&mut self) -> bool {
-        self.ai_completion.as_mut().map(|c| c.poll()).unwrap_or(false)
-    }
-
-    /// Ghost suffix for the tab title: the staged completion, or a
-    /// "completing…" indicator while a request is in flight.
-    pub fn completion_ghost(&self) -> Option<String> {
-        let comp = self.ai_completion.as_ref()?;
-        if comp.pending.is_some() {
-            Some(" completing\u{2026} ".to_string())
-        } else if comp.ready() {
-            Some(comp.text.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Tab-title text for the active pane while editing: the live buffer plus
-    /// the optional ghost suffix (or the bare buffer when inactive).
-    pub fn display_line(&self, ghost: Option<&str>) -> String {
-        let Some(state) = self.state.as_ref() else {
-            return String::new();
-        };
-        match ghost {
-            Some(g) => state.display_with_suffix(g),
-            None => state.display(),
-        }
+    /// Tab-title text for the active pane while editing: the live buffer, or
+    /// empty when inactive.
+    pub fn display_line(&self) -> String {
+        self.state.as_ref().map(|s| s.display()).unwrap_or_default()
     }
 
     /// Insert printable text into the buffer (the IME/text-input path).
@@ -236,7 +185,6 @@ impl LineEditor {
         };
         let line = state.line();
         self.history.push(&line);
-        self.ai_completion = None;
         EditAction::Submit(line)
     }
 
@@ -288,8 +236,7 @@ impl LineEditor {
         EditAction::Handled
     }
 
-    /// Recall the previous history entry into the buffer. A stale AI ghost is
-    /// dropped since the buffer changed.
+    /// Recall the previous history entry into the buffer.
     fn history_prev(&mut self) -> EditAction {
         let current = self
             .state
@@ -298,7 +245,6 @@ impl LineEditor {
             .unwrap_or_default();
         if let Some(line) = self.history.prev(&current) {
             self.state.as_mut().unwrap().set_line(&line);
-            self.ai_completion = None;
         }
         EditAction::Handled
     }
@@ -308,34 +254,12 @@ impl LineEditor {
     fn history_next(&mut self) -> EditAction {
         if let Some(line) = self.history.next() {
             self.state.as_mut().unwrap().set_line(&line);
-            self.ai_completion = None;
         }
         EditAction::Handled
     }
 
-    /// Tab: accept a staged AI completion, fire a new completion request for
-    /// the current buffer, or insert a literal tab.
+    /// Tab: insert a literal tab character.
     fn tab(&mut self) -> EditAction {
-        #[cfg(feature = "ai")]
-        {
-            if let Some(suffix) = completion_tab(self.ai_completion.as_ref()) {
-                self.state.as_mut().unwrap().accept_suffix(&suffix);
-                self.ai_completion = None;
-                return EditAction::Handled;
-            }
-            let idle = match self.ai_completion.as_ref() {
-                Some(c) => c.pending.is_none(),
-                None => true,
-            };
-            if idle {
-                if let Some(client) = self.ai_client.clone() {
-                    let buffer = self.state.as_ref().unwrap().buffer_text();
-                    let comp = self.ai_completion.get_or_insert_with(AiCompletion::default);
-                    comp.request(client, buffer);
-                    return EditAction::Handled;
-                }
-            }
-        }
         self.state.as_mut().unwrap().insert('\t');
         EditAction::Handled
     }

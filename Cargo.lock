@@ -6134,12 +6134,10 @@ dependencies = [
  "portable-pty",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "wgpu",
  "winit",
- "zeroterm-ai",
  "zeroterm-config",
  "zeroterm-core",
  "zeroterm-mux",
@@ -6147,16 +6145,6 @@ dependencies = [
  "zeroterm-render",
  "zeroterm-ssh",
  "zeroterm-sync",
-]
-
-[[package]]
-name = "zeroterm-ai"
-version = "0.3.4"
-dependencies = [
- "criterion",
- "reqwest",
- "serde",
- "serde_json",
 ]
 
 [[package]]

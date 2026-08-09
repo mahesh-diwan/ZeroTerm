@@ -66,6 +66,7 @@ impl ScreenScratch {
     }
 
     /// Drop any saved region without touching the screen.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear(&mut self) {
         self.saved = None;
     }

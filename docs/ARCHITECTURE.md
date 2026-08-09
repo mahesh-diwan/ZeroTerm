@@ -1,6 +1,6 @@
 # ZeroTerm Architecture
 
-GPU-accelerated terminal emulator in Rust. Workspace of 9 crates under
+GPU-accelerated terminal emulator in Rust. Workspace of 8 crates under
 `crates/`, a single binary in `crates/zeroterm`.
 
 ## Crate Layout
@@ -11,7 +11,6 @@ crates/
 ├── zeroterm-render    — wgpu renderer, glyph atlas, block divider overlays
 ├── zeroterm-mux       — tab / pane / split-tree model
 ├── zeroterm-config    — TOML + Lua config loading
-├── zeroterm-ai        — Ollama/LM Studio client (explain)
 ├── zeroterm-sync      — E2E encrypted settings sync daemon
 ├── zeroterm-ssh       — native SSH client (libssh2)
 ├── zeroterm-plugin    — wasmtime/WASI sandboxed plugin runtime (stdio ABI)
@@ -189,10 +188,6 @@ later opt-in also starts clean.
 - **zeroterm-config** — loads TOML, then evaluates `.zeroterm.lua` in a
   sandboxed VM (`io`/`require`/`package`/`debug` stripped, safe `os`) and applies
   `set(key, value)` overrides. Hot-reloaded via a `notify` watcher thread.
-- **zeroterm-ai** — `POST /api/generate` to Ollama-compatible endpoints with
-  `model = llama3.2`, streaming disabled. `Ctrl+Shift+I` feeds the raw screen
-  text to `explain()` on a background tokio runtime and writes the reply to the
-  PTY.
 - **zeroterm-sync** — `SyncDaemon` marks config dirty every 300 redraws; a tokio
   task pulls `GET /api/sync/latest` and pushes `POST /api/sync`, encrypting the
   serialized config with a per-launch ChaCha20-Poly1305 key (nonce-prefixed).

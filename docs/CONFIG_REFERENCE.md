@@ -44,9 +44,6 @@ blur_radius = 8.0            # optional; blur intensity in px
 blink = true
 blink_interval_ms = 530
 
-[ai]
-endpoint = ""                # e.g. http://localhost:11434
-
 [sync]
 server_url = ""              # e.g. https://sync.example.com
 
@@ -126,12 +123,6 @@ feature and is not reimplemented here.
 | `blink_interval_ms` | int  | `530`   | Cursor blink period (ms) |
 
 The whole `[cursor]` section is optional and may be omitted entirely.
-
-### `[ai]`
-
-| Key        | Type   | Default | Notes                                                                     |
-| ---------- | ------ | ------- | ------------------------------------------------------------------------- |
-| `endpoint` | string | `""`    | Ollama/LM Studio base URL. Empty disables AI. Hardcoded model: `llama3.2` |
 
 ### `[sync]`
 
@@ -214,7 +205,6 @@ Predefined globals:
 | `window_width`        | `window.width`                    | `window.width`                    | u32       |
 | `window_height`       | `window.height`                   | `window.height`                   | u32       |
 | `opacity`             | `window.opacity`                  | `window.opacity`                  | f64       |
-| `ai_endpoint`         | `ai.endpoint`                     | `ai.endpoint`                     | string    |
 | `ssh_host`            | `ssh.host`                        | `ssh.host`                        | string    |
 | `ssh_user`            | `ssh.user`                        | `ssh.user`                        | string    |
 | `ssh_port`            | `ssh.port`                        | `ssh.port`                        | u16       |
