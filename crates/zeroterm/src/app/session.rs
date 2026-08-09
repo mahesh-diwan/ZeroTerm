@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(all(unix, feature = "ssh"))]
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use anyhow::Result;

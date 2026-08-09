@@ -774,10 +774,6 @@ impl App {
         }
     }
 
-    fn compute_split_rects(&self) -> HashMap<usize, (f32, f32, f32, f32)> {
-        self.session.rects()
-    }
-
     fn focus_adjacent_pane(&mut self, dir: KeyCode) {
         if self.session.focus_adjacent_pane(dir) {
             self.redraw();
@@ -848,19 +844,17 @@ impl App {
         Ok(())
     }
 
+    #[cfg(all(unix, feature = "ssh"))]
     fn open_host_picker(&mut self) {
-        #[cfg(all(unix, feature = "ssh"))]
-        {
-            let aliases = zeroterm_ssh::client::ssh_aliases();
-            if aliases.is_empty() {
-                return;
-            }
-            self.host_picker.open(aliases);
-            if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
-                Overlay::snapshot(&mut self.host_picker, pane.parser.screen());
-            }
-            self.draw_host_picker();
+        let aliases = zeroterm_ssh::client::ssh_aliases();
+        if aliases.is_empty() {
+            return;
         }
+        self.host_picker.open(aliases);
+        if let Some(pane) = self.session.panes.get_mut(&self.session.active_pane) {
+            Overlay::snapshot(&mut self.host_picker, pane.parser.screen());
+        }
+        self.draw_host_picker();
     }
 
     fn draw_host_picker(&mut self) {
@@ -951,13 +945,6 @@ impl App {
         }
         self.ai.close();
         self.redraw();
-    }
-
-    fn draw_ai_overlay(&mut self) {
-        if !self.ai.open {
-            return;
-        }
-        self.draw_overlay(OverlayKind::Ai);
     }
 
     fn drain_pty(&mut self) -> bool {
@@ -2325,6 +2312,12 @@ impl App {
                 key_router::ConsoleAction::Pty(seq) => {
                     self.clear_selection();
                     self.write_pty(&seq);
+                    // The key was fully handled as a terminal escape sequence
+                    // (Enter -> CR, Tab -> HT, arrows, ...). Returning here
+                    // prevents the printable-text step from ALSO writing
+                    // event.text (e.g. "\r" for Enter), which double-sent the
+                    // byte and made readline see two newlines per Enter.
+                    return;
                 }
                 key_router::ConsoleAction::None => {}
             }
