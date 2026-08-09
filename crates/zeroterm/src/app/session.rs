@@ -874,7 +874,12 @@ mod tests {
         for id in m.pane_ids() {
             let (x, y, w, h) = rects.get(&id).copied().expect("pane has a rect");
             assert!(w > 0.001 && h > 0.001, "pane {id} rect must be visible");
+            // Rects tile the unit square: in-bounds and never overflowing.
             assert!(x >= 0.0 && y >= 0.0, "pane {id} rect in-bounds");
+            assert!(
+                x + w <= 1.001 && y + h <= 1.001,
+                "pane {id} rect overflows the content area"
+            );
         }
     }
 
