@@ -145,7 +145,29 @@ install_binary() {
 	trap 'rm -rf "${temp_dir:-}"' EXIT
 
 	if ! show_progress "${temp_dir}/${asset_name}" "${download_url}"; then
-		log_error "Failed to download ${download_url}"
+		log_error "Packaged asset not found: ${download_url}"
+		# CI ships the linux x86_64 binary as an AppImage, not as the
+		# -vVERSION.tar.gz above. Extract it (no FUSE needed) and install
+		# the embedded ELF, so `curl | bash` skips a multi-minute source
+		# build. Any failure here falls through to a source build.
+		if [ "$platform" = "linux-x86_64" ]; then
+			local appimage="ZeroTerm-x86_64.AppImage"
+			local appurl="${GITHUB_RELEASES}/download/${version}/${appimage}"
+			if show_progress "${temp_dir}/${appimage}" "${appurl}" && \
+			   verify_checksum "${temp_dir}/${appimage}" "${appurl}"; then
+				chmod +x "${temp_dir}/${appimage}"
+				( cd "${temp_dir}" && ./"${appimage}" --appimage-extract ) >/dev/null 2>&1 || true
+				local extracted
+				extracted=$(find "${temp_dir}/squashfs-root" -type f -name "${BINARY_NAME}" -perm -u+x 2>/dev/null | head -1)
+				if [[ -n "$extracted" ]]; then
+					mkdir -p "${INSTALL_DIR}"
+					cp "${extracted}" "${INSTALL_DIR}/${BINARY_NAME}"
+					chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+					log_success "Installed prebuilt ${appimage} to ${INSTALL_DIR}/${BINARY_NAME}"
+					return
+				fi
+			fi
+		fi
 		log_info "Building from source instead..."
 		build_from_source
 		return
