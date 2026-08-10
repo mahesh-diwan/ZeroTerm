@@ -145,24 +145,7 @@ install_binary() {
 	trap 'rm -rf "${temp_dir:-}"' EXIT
 
 	if ! show_progress "${temp_dir}/${asset_name}" "${download_url}"; then
-		log_error "Packaged asset not found: ${download_url}"
-		# CI ships a bare ${BINARY_NAME} binary for linux/macos (not a
-		# -vVERSION.tar.gz). Try it before falling back to a source build,
-		# so `curl install.sh | bash` works on a box with no Rust toolchain.
-		local bare_name
-		case "$platform" in
-		windows-*) bare_name="${BINARY_NAME}.exe" ;;
-		*) bare_name="${BINARY_NAME}" ;;
-		esac
-		local bare_url="${GITHUB_RELEASES}/download/${version}/${bare_name}"
-		if show_progress "${temp_dir}/${bare_name}" "${bare_url}" && \
-		   verify_checksum "${temp_dir}/${bare_name}" "${bare_url}"; then
-			mkdir -p "${INSTALL_DIR}"
-			cp "${temp_dir}/${bare_name}" "${INSTALL_DIR}/${BINARY_NAME}"
-			chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-			log_success "Installed prebuilt ${bare_name} to ${INSTALL_DIR}/${BINARY_NAME}"
-			return
-		fi
+		log_error "Failed to download ${download_url}"
 		log_info "Building from source instead..."
 		build_from_source
 		return
