@@ -8,6 +8,10 @@ use unicode_width::UnicodeWidthChar;
 
 const MAX_IMAGES: usize = 64;
 const MAX_IMAGE_BYTES: usize = 100 << 20;
+/// OSC 8 hyperlink registry cap. Ids wrap ring-style so a hostile or runaway
+/// app cannot grow the registry unboundedly; scrollback cells keep stale ids
+/// (hover just won't resolve) but memory stays flat.
+const MAX_LINKS: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct CommandBlock {
@@ -74,12 +78,20 @@ pub struct Screen {
     ident_callback: Option<Box<dyn Fn() + Send + Sync>>,
     status_callback: Option<Box<dyn Fn() + Send + Sync>>,
     cursor_callback: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Latched bell activity: set on BEL, drained by the app to flag an
+    /// inactive tab that produced a bell (kitty renders 🔔 on such tabs).
+    bell_rung: bool,
     blocks: Vec<CommandBlock>,
     block_id_counter: usize,
     current_block_command: String,
     pub image_registry: HashMap<u32, ImageData>,
     pub image_cells: HashMap<(usize, usize), u32>,
     next_image_id: u32,
+    /// OSC 8 hyperlink registry: link_id -> uri (id 0 = none).
+    links: Vec<Option<String>>,
+    link_ids: HashMap<String, u32>,
+    current_link: u32,
+    next_link_id: u32,
 }
 
 impl Screen {
@@ -116,6 +128,7 @@ impl Screen {
             tabs,
             bell_callback: None,
             title_callback: None,
+            bell_rung: false,
             ident_callback: None,
             status_callback: None,
             cursor_callback: None,
@@ -125,6 +138,10 @@ impl Screen {
             image_registry: HashMap::new(),
             image_cells: HashMap::new(),
             next_image_id: 0,
+            links: Vec::new(),
+            link_ids: HashMap::new(),
+            current_link: 0,
+            next_link_id: 1,
         }
     }
 
@@ -272,6 +289,7 @@ impl Screen {
         cell.fg = self.fg;
         cell.bg = self.bg;
         cell.attrs = self.attrs;
+        cell.link_id = self.current_link;
 
         let cursor_row = self.cursor.row;
         let cursor_col = self.cursor.col;
@@ -654,8 +672,22 @@ impl Screen {
         }
     }
 
+    /// RIS: a full terminal reset. Preserves the registered callbacks
+    /// (bell/title/cursor/status/ident) — the old `*self = Self::new(...)`
+    /// rebuilt them as `None`, silently dropping bell and title callbacks
+    /// after any `ESC c` from the shell. `bell_rung` is latched per-reset.
     pub fn reset(&mut self) {
+        let bell_cb = self.bell_callback.take();
+        let title_cb = self.title_callback.take();
+        let ident_cb = self.ident_callback.take();
+        let status_cb = self.status_callback.take();
+        let cursor_cb = self.cursor_callback.take();
         *self = Self::new(self.size.cols, self.size.rows);
+        self.bell_callback = bell_cb;
+        self.title_callback = title_cb;
+        self.ident_callback = ident_cb;
+        self.status_callback = status_cb;
+        self.cursor_callback = cursor_cb;
     }
 
     /// DECALN — screen alignment test: fill the display with 'E' and home the cursor.
@@ -765,9 +797,18 @@ impl Screen {
     }
 
     pub fn bell(&mut self) {
+        self.bell_rung = true;
         if let Some(cb) = &self.bell_callback {
             cb();
         }
+    }
+
+    /// Pop the latched bell flag. The app calls this after each drain to
+    /// surface 🔔 on the tab whose pane rung the bell and clear it once the
+    /// tab is focused (mirrors kitty's per-window bell/activity). Returns
+    /// the previous flag so the caller can record it before it is cleared.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_rung)
     }
 
     pub fn set_title(&mut self, title: &str) {
@@ -779,6 +820,53 @@ impl Screen {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    /// Set the OSC 8 hyperlink for subsequent writes. An empty uri closes the
+    /// active link (cells written after this carry id 0). Ids are deduplicated
+    /// by uri and capped ring-style at MAX_LINKS.
+    pub fn set_hyperlink(&mut self, uri: &str) {
+        if uri.is_empty() {
+            self.current_link = 0;
+            return;
+        }
+        if let Some(&id) = self.link_ids.get(uri) {
+            self.current_link = id;
+            return;
+        }
+        let id = self.next_link_id;
+        if self.links.len() < id as usize {
+            self.links.resize(id as usize, None);
+        }
+        // Ring reuse: the slot may already hold an older uri — drop its map
+        // entry so the registry stays a bijection.
+        if let Some(old) = &self.links[id as usize - 1] {
+            self.link_ids.remove(old);
+        }
+        self.links[id as usize - 1] = Some(uri.to_string());
+        self.link_ids.insert(uri.to_string(), id);
+        self.current_link = id;
+        self.next_link_id = if id >= MAX_LINKS { 1 } else { id + 1 };
+    }
+
+    /// URI for a cell's link id, or None for id 0 / evicted ids.
+    pub fn link_uri(&self, id: u32) -> Option<&str> {
+        if id == 0 {
+            return None;
+        }
+        self.links.get(id as usize - 1).and_then(|s| s.as_deref())
+    }
+
+    /// Cell at a global row (scrollback + visible) and column, matching the
+    /// mapping the renderer uses (see CellBatch::build). Needed for hit-testing
+    /// a hovered/clicked point against a scrolled view.
+    pub fn cell_at_global(&self, row: usize, col: usize) -> Option<&Cell> {
+        let sb = self.scrollback.len();
+        if row < sb {
+            self.scrollback.get(sb - 1 - row).and_then(|r| r.get(col))
+        } else {
+            self.current_buffer().get(row - sb).and_then(|r| r.get(col))
+        }
     }
 
     pub fn report_status(&mut self) {

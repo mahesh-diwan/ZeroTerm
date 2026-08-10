@@ -188,6 +188,9 @@ pub struct Cell {
     /// Highlight class index (0 = none/auto, see `highlight` module).
     #[serde(default)]
     pub syntax_color: u8,
+    /// OSC 8 hyperlink id (0 = none). Indexes `Screen::link_uri`.
+    #[serde(default)]
+    pub link_id: u32,
 }
 
 impl Default for Cell {
@@ -198,6 +201,7 @@ impl Default for Cell {
             bg: Color::DEFAULT_BG,
             attrs: Attributes::default(),
             syntax_color: 0,
+            link_id: 0,
         }
     }
 }
@@ -220,6 +224,7 @@ impl Cell {
             && self.bg == Color::DEFAULT_BG
             && self.attrs == Attributes::default()
             && self.syntax_color == 0
+            && self.link_id == 0
     }
 }
 

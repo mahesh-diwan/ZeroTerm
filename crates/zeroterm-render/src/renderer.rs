@@ -77,6 +77,9 @@ pub struct TabInfo {
     pub active: bool,
     pub hovered: bool,
     pub close_hovered: bool,
+    /// Latched bell on an inactive pane in this tab (kitty renders 🔔).
+    /// The tab bar draws a bell glyph when true.
+    pub activity: bool,
 }
 
 /// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
@@ -1152,6 +1155,23 @@ impl Renderer {
             let sep_c = col + span;
             if sep_c < cols {
                 batch[sep_c].bg = sep;
+            }
+
+            // Activity (bell) indicator: a small dot on the left padding
+            // cell of an inactive tab whose pane rung a bell. Painted as a
+            // glyph (not woven into `title`) so `tab_span` stays identical
+            // for hit-testing. Active tabs never show it (the bell is
+            // consumed by focusing the tab).
+            if tab.activity {
+                let g = self.glyph_atlas.get_or_insert_glyph('●', &self.device, &self.queue);
+                let (u0, v0, u1, v1) = g.uv();
+                let cell = &mut batch[col];
+                cell.glyph_uv_min = [u0, v0];
+                cell.glyph_uv_max = [u1, v1];
+                cell.glyph_size = [g.width as f32, g.height as f32];
+                cell.glyph_offset = [g.offset_x, g.offset_y];
+                cell.fg = accent_fg;
+                cell.attrs = 0;
             }
 
             // Title text.

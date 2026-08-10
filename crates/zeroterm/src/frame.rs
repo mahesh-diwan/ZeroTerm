@@ -62,28 +62,7 @@ pub fn scrollbar_policy(
     }
 }
 
-/// Left-hand status-bar text: the active pane title plus the tab's position
-/// (i/N) so the current tab is identifiable at a glance in a multi-tab
-/// session. The tab count is clamped to ≥ 1 so an empty session can never
-/// print "1/0".
-pub fn status_left(title: &str, tab_index: usize, tab_count: usize) -> String {
-    format!("{title} — tab {}/{}", tab_index + 1, tab_count.max(1))
-}
 
-/// Right-hand status-bar text: scroll position as a percent while there is
-/// scrollback, empty otherwise.
-pub fn status_right(max_scroll: usize, scroll_offset: usize) -> String {
-    if max_scroll > 0 {
-        format!(
-            "[{}%]",
-            (100 * scroll_offset)
-                .checked_div(max_scroll)
-                .unwrap_or(0)
-        )
-    } else {
-        String::new()
-    }
-}
 
 /// Tab-bar display title: the tab's title plus a split badge (" ▦N") when the
 /// tab holds more than one pane, so split tabs are identifiable at a glance.
@@ -97,12 +76,57 @@ pub fn tab_display_title(title: &str, pane_count: usize) -> String {
     }
 }
 
+/// Left-hand status-bar text. Shows a `[N/M]` tab badge (kitty's `{index}`
+/// convention, 1-based, clamped so an empty session never prints `1/0`), the
+/// active pane's title, and the short launch command in parentheses — so in a
+/// split the status line names both the tab and what it is. Example:
+/// `[2/4] bash (ssh host)`.
+pub fn status_left(title: &str, cmd: &str, tab_index: usize, tab_count: usize) -> String {
+    let badge = format!("[{}/{}]", tab_index + 1, tab_count.max(1));
+    if cmd.is_empty() {
+        format!("{badge} {title}")
+    } else {
+        // Drop argv noise (e.g. "bash -l" -> "bash") so the badge stays short.
+        let short = cmd.split_whitespace().next().unwrap_or(cmd);
+        format!("{badge} {title}  {short}")
+    }
+}
+
+/// Right-hand status-bar text. Emits a mode marker when a modal overlay is
+/// active (kitty renders `-- SEARCH --` etc. via its status line), then the
+/// scroll position as a percent while there is scrollback. Modes surfaced:
+/// `editor` (Alt+E line editor), `search`, `settings`.
+pub fn status_right(mode: Option<&str>, max_scroll: usize, scroll_offset: usize) -> String {
+    let mode_part = match mode {
+        Some(m) if !m.is_empty() => format!(" -- {} --", m.to_uppercase()),
+        _ => String::new(),
+    };
+    let scroll_part = if max_scroll > 0 {
+        format!(
+            "  [{}%]",
+            (100 * scroll_offset)
+                .checked_div(max_scroll)
+                .unwrap_or(0)
+        )
+    } else {
+        String::new()
+    };
+    format!("{mode_part}{scroll_part}")
+}
+
 /// Tab strip content. While the line editor is open the active tab shows the
-/// live buffer instead of the shell title.
+/// live buffer instead of the shell title. `activity` reports whether the
+/// tab's (inactive) pane has latched a bell since it last had focus — the tab
+/// bar renders a bell glyph for it (kitty's `tab_activity_symbol`).
+///
+/// The bell glyph is painted by `draw_tab_bar` from `TabInfo.activity`, NOT
+/// woven into `title`, so the title string and `tab_span` stay byte-identical
+/// for hit-testing (a wide bell glyph would skew the cell-count layout).
 pub fn tab_infos(
     ids: &[usize],
     active_pane: usize,
     titles: impl Fn(usize) -> String,
+    activity: impl Fn(usize) -> bool,
     edit_display: Option<&str>,
     hovered: Option<usize>,
     close_hovered: bool,
@@ -115,6 +139,7 @@ pub fn tab_infos(
             },
             active: id == active_pane,
             hovered: hovered == Some(id),
+            activity: id != active_pane && activity(id),
             close_hovered,
         })
         .collect()
@@ -160,19 +185,25 @@ mod tests {
     }
 
     #[test]
-    fn status_left_shows_tab_position() {
-        assert_eq!(status_left("bash", 0, 3), "bash — tab 1/3");
-        assert_eq!(status_left("ssh host", 2, 3), "ssh host — tab 3/3");
-        // Degenerate empty session cannot print a 0 denominator.
-        assert_eq!(status_left("bash", 0, 0), "bash — tab 1/1");
+    fn status_left_shows_badge_title_cmd() {
+        assert_eq!(status_left("bash", "bash -l", 0, 3), "[1/3] bash  bash");
+        assert_eq!(status_left("ssh host", "ssh", 2, 3), "[3/3] ssh host  ssh");
+        // Empty cmd drops the parenthetical; empty session never divides by zero.
+        assert_eq!(status_left("bash", "", 0, 0), "[1/1] bash");
     }
 
     #[test]
-    fn status_right_percent_and_empty() {
-        assert_eq!(status_right(0, 0), "");
-        assert_eq!(status_right(100, 25), "[25%]");
-        // Mirrors the original scroll-percent semantics (no clamp).
-        assert_eq!(status_right(3, 7), "[233%]");
+    fn status_right_mode_scroll_and_empty() {
+        // Idle, no scrollback: empty.
+        assert_eq!(status_right(None, 0, 0), "");
+        // Scroll position only.
+        assert_eq!(status_right(None, 100, 25), "  [25%]");
+        // Mode marker + scroll.
+        assert_eq!(status_right(Some("search"), 100, 25), " -- SEARCH --  [25%]");
+        // Mode marker without scrollback.
+        assert_eq!(status_right(Some("editor"), 0, 0), " -- EDITOR --");
+        // Empty mode string is treated as no mode.
+        assert_eq!(status_right(Some(""), 100, 25), "  [25%]");
     }
 
     #[test]
@@ -181,6 +212,7 @@ mod tests {
             &[1, 2, 3],
             2,
             |id| format!("title{id}"),
+            |_| false,
             None,
             Some(3),
             true,
@@ -190,6 +222,14 @@ mod tests {
         assert!(infos[1].active);
         assert!(infos[2].hovered && infos[2].close_hovered);
         assert!(!infos[0].hovered);
+    }
+
+    #[test]
+    fn tab_infos_marks_inactive_bell_activity() {
+        // ids [1, 2], active pane 2: tab 1 is inactive and rung the bell.
+        let infos = tab_infos(&[1, 2], 2, |id| format!("t{id}"), |id| id == 1, None, None, false);
+        assert!(infos[0].activity, "inactive tab with bell should show activity");
+        assert!(!infos[1].activity, "active tab never shows activity");
     }
 
     #[test]
@@ -207,7 +247,15 @@ mod tests {
 
     #[test]
     fn tab_infos_edit_display_overrides_active_title() {
-        let infos = tab_infos(&[1, 2], 2, |id| format!("title{id}"), Some("ls foo"), None, false);
+        let infos = tab_infos(
+            &[1, 2],
+            2,
+            |id| format!("title{id}"),
+            |_| false,
+            Some("ls foo"),
+            None,
+            false,
+        );
         assert_eq!(infos[1].title, "ls foo", "active tab shows the editor buffer");
         assert_eq!(infos[0].title, "title1");
     }

@@ -38,9 +38,36 @@ pub struct Config {
     pub mouse: MouseConfig,
     #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
     pub sync: SyncConfig,
     pub ssh: SshConfig,
     pub keybindings: KeybindingsConfig,
+}
+
+/// Protocol / interaction features.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalConfig {
+    /// Kitty keyboard protocol: advertise support and emit CSI-u sequences for
+    /// modified functional keys to apps that push `CSI > 1 u` (nvim, readline
+    /// 8.2+, fish, zsh). Legacy apps are unaffected — the protocol is opt-in.
+    pub kitty_keyboard: bool,
+    /// OSC 9 desktop notifications (emitted by `notify-send`-style shell
+    /// integrations) surface as native notifications.
+    pub notifications: bool,
+    /// OSC 8 hyperlinks: hover shows the URL in the status bar and click opens
+    /// it with the system handler (xdg-open).
+    pub hyperlinks: bool,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            kitty_keyboard: true,
+            notifications: true,
+            hyperlinks: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +187,15 @@ impl Config {
                 "restore_session" | "session.restore" => {
                     self.session.restore = value.parse().unwrap_or(false);
                 }
+                "kitty_keyboard" | "terminal.kitty_keyboard" => {
+                    self.terminal.kitty_keyboard = value.parse().unwrap_or(true);
+                }
+                "notifications" | "terminal.notifications" => {
+                    self.terminal.notifications = value.parse().unwrap_or(true);
+                }
+                "hyperlinks" | "terminal.hyperlinks" => {
+                    self.terminal.hyperlinks = value.parse().unwrap_or(true);
+                }
                 _ => {}
             }
         }
@@ -198,6 +234,7 @@ impl Config {
         self.cursor = new_config.cursor;
         self.mouse = new_config.mouse;
         self.session = new_config.session;
+        self.terminal = new_config.terminal;
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
         self.keybindings = new_config.keybindings;
@@ -322,6 +359,47 @@ mod tests {
         table.remove("mouse");
         let parsed: Config = table.try_into().unwrap();
         assert!(parsed.mouse.focus_follows_mouse);
+    }
+
+    #[test]
+    fn terminal_config_defaults_all_on() {
+        let t = TerminalConfig::default();
+        assert!(t.kitty_keyboard);
+        assert!(t.notifications);
+        assert!(t.hyperlinks);
+    }
+
+    #[test]
+    fn terminal_config_absent_in_toml_uses_defaults() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("terminal");
+        let parsed: Config = table.try_into().unwrap();
+        assert!(parsed.terminal.kitty_keyboard);
+        assert!(parsed.terminal.hyperlinks);
+    }
+
+    #[test]
+    fn terminal_config_deserializes_roundtrip() {
+        let mut config = Config::default();
+        config.terminal.kitty_keyboard = false;
+        config.terminal.notifications = false;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.terminal.kitty_keyboard);
+        assert!(!parsed.terminal.notifications);
+        assert!(parsed.terminal.hyperlinks);
+    }
+
+    #[test]
+    fn terminal_overrides_apply_from_lua_style_keys() {
+        let mut config = Config::default();
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("kitty_keyboard".to_string(), "false".to_string());
+        overrides.insert("terminal.hyperlinks".to_string(), "false".to_string());
+        config.apply_overrides(overrides);
+        assert!(!config.terminal.kitty_keyboard);
+        assert!(!config.terminal.hyperlinks);
     }
 
     #[test]

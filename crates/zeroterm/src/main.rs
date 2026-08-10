@@ -92,6 +92,12 @@ struct App {
     // that tab's close button. Drives pill/close-glyph rendering + click hit-test.
     hovered_tab: Option<usize>,
     hovered_tab_close: bool,
+    // OSC 8 hyperlink URI under the cursor, shown in the status bar and opened
+    // on click. Rebuilt on every CursorMoved; None clears the status hint.
+    hover_link: Option<String>,
+    // Where the last left-press landed, to distinguish a click (open link) from
+    // a drag (select text) on release.
+    press_pos: Option<(f32, f32)>,
     // Sub-line remainder of pixel-wheel deltas (|fraction| < 1); accumulates
     // across MouseWheel events so trackpad scrolling glides line-by-line.
     scroll_fraction: f32,
@@ -203,6 +209,8 @@ impl App {
             mouse_pos: (0.0, 0.0),
             hovered_tab: None,
             hovered_tab_close: false,
+            hover_link: None,
+            press_pos: None,
             scroll_fraction: 0.0,
             clipboard: Clipboard::new().ok(),
             shell: String::new(),
@@ -445,7 +453,7 @@ impl App {
         // lands in the pty line discipline pre-readline and leaks as literal `2004h` text.
         // So we do NOT send it — the parser handles the shell's own advertisement.
 
-        let parser = Parser::new(cols, rows);
+        let parser = self.new_parser(cols, rows);
         let mut panes = HashMap::new();
         panes.insert(
             0,
@@ -456,6 +464,7 @@ impl App {
                 title: VERSION_LABEL.into(),
                 pane_cmd: shell.clone(),
                 pty_dead: false,
+                bell_rung: false,
                 last_resize: Some((cols, rows)),
             },
         );
@@ -510,6 +519,7 @@ impl App {
                                     title: spec.title.clone(),
                                     pane_cmd: cmd,
                                     pty_dead: false,
+                                    bell_rung: false,
                                     last_resize: Some((cols, rows)),
                                 },
                             );
@@ -688,7 +698,7 @@ impl App {
                     self.wake_proxy(),
                 )?
             };
-            let parser = Parser::new(cols, rows);
+            let parser = self.new_parser(cols, rows);
             // A new tab is another pane in the global tree; insert it next to
             // the active pane instead of replacing the whole tree (which hid
             // every existing split and orphaned the other panes).
@@ -700,6 +710,7 @@ impl App {
                     title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
+                    bell_rung: false,
                     last_resize: Some((cols, rows)),
                 },
                 SplitDir::Vertical,
@@ -748,7 +759,7 @@ impl App {
                     self.wake_proxy(),
                 )?
             };
-            let parser = Parser::new(cols, rows);
+            let parser = self.new_parser(cols, rows);
             // The split only exists once the pane is in the tree: Ctrl+Shift+E/D
             // inserts the new pane as a split of the active pane. Split panes
             // are not tabs.
@@ -760,6 +771,7 @@ impl App {
                     title: VERSION_LABEL.into(),
                     pane_cmd: self.shell.clone(),
                     pty_dead: false,
+                    bell_rung: false,
                     last_resize: Some((cols, rows)),
                 },
                 dir,
@@ -899,7 +911,7 @@ impl App {
                 rows,
                 self.wake_proxy(),
             )?;
-            let parser = Parser::new(cols, rows);
+            let parser = self.new_parser(cols, rows);
             // An SSH session is a new classic tab (full-window pane).
             self.session.register_pane(
                 PaneState {
@@ -909,6 +921,7 @@ impl App {
                     title: format!("SSH: {}@{}", user, host),
                     pane_cmd: format!("ssh {}@{}", user, host),
                     pty_dead: false,
+                    bell_rung: false,
                     last_resize: Some((cols, rows)),
                 },
                 SplitDir::Vertical,
@@ -972,6 +985,7 @@ impl App {
         let mut title_changed = None;
         let mut dead_panes = Vec::new();
         let pane_count = self.session.panes.len();
+        let mut notifications = Vec::new();
         for (&id, pane) in &mut self.session.panes {
             if pane.pty_dead {
                 continue;
@@ -984,6 +998,32 @@ impl App {
                             warn!("clipboard error: {}", e);
                         }
                     }
+                }
+                // Kitty protocol replies (CSI ? u) go back to the pane that
+                // asked; the parser can't write itself, so the app relays.
+                if let Some(resp) = pane.parser.take_response() {
+                    let _ = pane.pty_tx.send(PtyCommand::Write(resp));
+                }
+                // OSC 9 notification -> desktop notification (notify-send).
+                if let Some(msg) = pane.parser.take_notification() {
+                    let enabled =
+                        self.config.as_ref().map_or(true, |c| c.terminal.notifications);
+                    if enabled {
+                        notifications.push(msg);
+                    }
+                }
+                // Bell activity: latch on the pane so the tab bar can flag
+                // the inactive tab it belongs to (kitty's 🔔). Cleared when
+                // that tab gains focus (see set_active_pane / switch_to_tab).
+                if pane.parser.screen_mut().take_bell() {
+                    pane.bell_rung = true;
+                }
+                // ED 2/3 (clear / clear-scrollback) invalidates the viewport:
+                // snap back to the bottom so `clear` and Ctrl+L behave like
+                // kitty (the old code left the view stranded in cleared
+                // scrollback). Only the active pane drives the shared offset.
+                if pane.parser.take_clear_flag() && id == active {
+                    self.session.scroll_offset = 0;
                 }
                 if id == active {
                     let new_title = pane.parser.screen().title().to_string();
@@ -1029,6 +1069,9 @@ impl App {
             }
         }
         self.resize_panes_to_rects();
+        for msg in notifications {
+            self.desktop_notify(&msg);
+        }
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {
                 window.set_title(&format!("{} - {}", VERSION_LABEL, title));
@@ -1159,16 +1202,23 @@ impl App {
         let tab_ids: Vec<usize> = self.session.tabs.iter().map(|t| t.id).collect();
         let active_tab_id = tab_ids.get(self.session.active_tab).copied().unwrap_or(0);
         let edit_display = self.editor.is_active().then(|| self.editor.display_line());
+        // Per-tab bell activity: any inactive pane in the tab that latched a
+        // bell since focus. Field-path only (the closure runs while
+        // self.renderer is mutably borrowed below).
+        let activity = |id: usize| {
+            self.session
+                .tab_panes(id) // pane ids in this tab
+                .iter()
+                .any(|&pid| self.session.panes.get(&pid).is_some_and(|p| p.bell_rung))
+        };
         let tab_infos = frame::tab_infos(
             &tab_ids,
             active_tab_id,
             |id| {
-                // Field-path only (never a `self` method call): the closure
-                // runs while `self.renderer` is mutably borrowed below, and
-                // method calls borrow all of `self`.
                 let title = self.session.tab_title(id);
                 frame::tab_display_title(&title, self.session.tab_pane_count(id))
             },
+            activity,
             edit_display.as_deref(),
             self.hovered_tab,
             self.hovered_tab_close,
@@ -1257,17 +1307,33 @@ impl App {
         renderer.draw_tab_bar(&tab_infos)?;
 
         let max_scroll = self.session.max_scroll_offset();
-        let active_title = self
-            .session
-            .active_pane()
-            .map_or_else(String::new, |p| p.title.clone());
-        // Status bar: active pane title plus the tab's position (i/N), so the
-        // current tab is identifiable at a glance in a multi-tab session.
-        let status_left = frame::status_left(&active_title, self.session.active_tab, self.session.tabs.len());
-        renderer.draw_status_bar(
-            &status_left,
-            &frame::status_right(max_scroll, self.session.scroll_offset),
-        )?;
+        let active_pane = self.session.active_pane();
+        let active_title = active_pane.map_or_else(String::new, |p| p.title.clone());
+        let active_cmd = active_pane.map_or_else(String::new, |p| p.pane_cmd.clone());
+        // Mode marker for the active modal overlay (kitty-style status line).
+        // Inlined here (not a self.active_overlay() call): that method takes
+        // &self and would clash with the &mut renderer borrow above. Each
+        // `self.<overlay>.open` is a disjoint field read, so it coexists.
+        let mode = if self.search.open {
+            Some("SEARCH")
+        } else if self.settings.open {
+            Some("SETTINGS")
+        } else if self.host_picker.open {
+            Some("HOST")
+        } else {
+            None
+        };
+        let status_left = frame::status_left(
+            &active_title,
+            &active_cmd,
+            self.session.active_tab,
+            self.session.tabs.len(),
+        );
+        let status_right = match &self.hover_link {
+            Some(uri) => format!("🔗 {}", uri),
+            None => frame::status_right(mode, max_scroll, self.session.scroll_offset),
+        };
+        renderer.draw_status_bar(&status_left, &status_right)?;
 
         // Policy: hide the bar while scrollback is trivial; a near-full-height
         // thumb reads as a colored strip on the right edge (the old bug
@@ -1316,9 +1382,99 @@ impl App {
         }
     }
 
+    /// Terminal reset (Ctrl+Shift+Delete, kitty's `clear_terminal reset`):
+    /// erase the visible screen (ED 2) and scrollback (ED 3), home the cursor,
+    /// and snap the viewport to the bottom. Matches the explicit reset other
+    /// terminals expose — the `clear` shell command only does ED 2 and leaves
+    /// the scroll offset pinned in cleared history (the "clear doesn't feel
+    /// right" gap).
+    fn reset_terminal(&mut self) {
+        if let Some(pane) = self.session.active_pane_mut() {
+            let screen = pane.parser.screen_mut();
+            screen.erase_display(2);
+            screen.erase_display(3);
+            // Home the cursor: cursor_pos is 1-based (subtracts 1 internally).
+            screen.cursor_pos(1, 1);
+            screen.reset_attributes();
+        }
+        self.session.scroll_offset = 0;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn write_pty(&self, data: &[u8]) {
         if let Some(pane) = self.session.panes.get(&self.session.active_pane) {
             let _ = pane.pty_tx.send(PtyCommand::Write(data.to_vec()));
+        }
+    }
+
+    /// Create a parser for a new pane, advertising kitty keyboard support
+    /// when the config asks for it (protocol is opt-in per app, so legacy
+    /// shells are unaffected).
+    fn new_parser(&self, cols: usize, rows: usize) -> Parser {
+        let mut parser = Parser::new(cols, rows);
+        parser.set_kitty_supported(
+            self.config.as_ref().map_or(false, |c| c.terminal.kitty_keyboard),
+        );
+        parser
+    }
+
+    /// Fire a desktop notification (OSC 9). Detached spawn: a missing
+    /// notify-send (or a headless session) is silently ignored.
+    #[cfg(target_os = "linux")]
+    fn desktop_notify(&self, msg: &str) {
+        let _ = std::process::Command::new("notify-send")
+            .args(["-a", "ZeroTerm", "-i", "utilities-terminal", msg])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    fn desktop_notify(&self, msg: &str) {
+        let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"ZeroTerm\"",
+            escaped
+        );
+        let _ = std::process::Command::new("osascript").arg("-e").arg(&script).spawn();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn desktop_notify(&self, _msg: &str) {}
+
+    /// OSC 8 hyperlink URI under a window point, if any. Resolves the hovered
+    /// cell through the pane's scrollback (the same mapping the renderer
+    /// uses), then looks up the link id in the screen's registry.
+    fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        if !self.config.as_ref().map_or(true, |c| c.terminal.hyperlinks) {
+            return None;
+        }
+        let pane_id = self.pane_at_point(x, y)?;
+        let (row, col) = self.screen_to_cell(pane_id, x, y)?;
+        let pane = self.session.panes.get(&pane_id)?;
+        let screen = pane.parser.screen();
+        let cell = screen.cell_at_global(row, col)?;
+        if cell.link_id == 0 {
+            return None;
+        }
+        screen.link_uri(cell.link_id).map(|u| u.to_string())
+    }
+
+    /// Open a URI with the system handler (xdg-open). Detached and silent.
+    fn open_link(&self, uri: &str) {
+        #[cfg(target_os = "linux")]
+        let cmd = "xdg-open";
+        #[cfg(target_os = "macos")]
+        let cmd = "open";
+        #[cfg(target_os = "windows")]
+        let cmd = "cmd";
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new(cmd)
+                .args(["/c", "start", "", uri])
+                .spawn();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::process::Command::new(cmd).arg(uri).spawn();
         }
     }
 
@@ -2243,6 +2399,10 @@ impl App {
                     self.jump_to_block(delta);
                     return;
                 }
+                key_router::GlobalAction::ResetTerminal => {
+                    self.reset_terminal();
+                    return;
+                }
                 #[cfg(all(unix, feature = "ssh"))]
                 key_router::GlobalAction::Ssh => {
                     if let Some(config) = &self.config {
@@ -2345,7 +2505,21 @@ impl App {
                 }
                 key_router::ConsoleAction::Pty(seq) => {
                     self.clear_selection();
-                    self.write_pty(&seq);
+                    // When the active app opted into the kitty keyboard
+                    // protocol (pushed `CSI > 1 u`), modified functional keys
+                    // and ctrl/alt letters are encoded as CSI-u sequences;
+                    // otherwise the legacy sequence (identical for bare keys)
+                    // is sent. The pane's parser tracks the negotiated flags.
+                    let kitty = self
+                        .session
+                        .active_pane()
+                        .map_or(false, |p| p.parser.kitty_disambiguate());
+                    let bytes = if kitty {
+                        key_router::kitty_sequence(code, mods).unwrap_or(seq)
+                    } else {
+                        seq
+                    };
+                    self.write_pty(&bytes);
                     // The key was fully handled as a terminal escape sequence
                     // (Enter -> CR, Tab -> HT, arrows, ...). Returning here
                     // prevents the printable-text step from ALSO writing
@@ -2555,6 +2729,12 @@ impl ApplicationHandler for App {
                     self.hovered_tab_close = hover.is_some_and(|(_, c)| c);
                     self.redraw();
                 }
+                // Hyperlink hover: rebuild the status-bar hint on change.
+                let link = self.link_at(x, y);
+                if link != self.hover_link {
+                    self.hover_link = link;
+                    self.redraw();
+                }
                 // Split divider drag: resize from last position delta, then bail.
                 if let Some(target) = self.session.dragging_divider {
                     let window = self.window.as_ref();
@@ -2685,10 +2865,25 @@ impl ApplicationHandler for App {
                     }
                 } else if button == MouseButton::Left {
                     if state == winit::event::ElementState::Pressed {
+                        self.press_pos = Some((x, y));
                         if !self.copy_block_output() {
                             self.start_selection(x, y);
                         }
                     } else {
+                        // A click (press and release within a few px, no drag)
+                        // on an OSC 8 hyperlink opens it; anything else keeps
+                        // the copy-on-select behavior below.
+                        let was_click = self.press_pos.map_or(false, |(px, py)| {
+                            (x - px).abs() < 4.0 && (y - py).abs() < 4.0
+                        });
+                        self.press_pos = None;
+                        if was_click {
+                            if let Some(uri) = self.link_at(x, y) {
+                                self.open_link(&uri);
+                                self.redraw();
+                                return;
+                            }
+                        }
                         // copy-on-select: a drag that actually selected something copies on release
                         let dragged = self.selecting;
                         self.end_selection();
@@ -3154,6 +3349,7 @@ mod tests {
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
+            bell_rung: false,
             last_resize: None,
         };
         tx.send(b"abc".to_vec()).unwrap();
@@ -3179,6 +3375,7 @@ mod tests {
                 title: String::new(),
                 pane_cmd: String::new(),
                 pty_dead: false,
+                bell_rung: false,
                 last_resize: None,
             },
         );

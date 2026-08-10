@@ -191,3 +191,72 @@ fn test_parser_sgr_reset() {
     assert_eq!(cell.fg, Color::DEFAULT_FG);
     assert_eq!(cell.bg, Color::DEFAULT_BG);
 }
+
+#[test]
+fn test_osc8_hyperlink_stamps_cells_until_closed() {
+    let mut parser = Parser::new(80, 24);
+    parser.parse(b"\x1b]8;;https://example.com\x1b\\");
+    parser.parse(b"click");
+    parser.parse(b"\x1b]8;;\x1b\\"); // close
+    parser.parse(b"plain");
+    let linked = parser.screen().cell(0, 0).unwrap();
+    assert_ne!(linked.link_id, 0);
+    assert_eq!(
+        parser.screen().link_uri(linked.link_id),
+        Some("https://example.com")
+    );
+    // After the closing OSC 8 the same id must not leak to new cells.
+    assert_eq!(parser.screen().cell(0, 5).unwrap().link_id, 0);
+}
+
+#[test]
+fn test_osc8_hyperlink_id_roundtrip_via_uri_lookup() {
+    let mut screen = Screen::new(40, 10);
+    screen.set_hyperlink("https://a.test/x");
+    screen.put_char('a');
+    screen.set_hyperlink("https://a.test/x"); // dedupe: same id
+    screen.put_char('b');
+    let id_a = screen.cell(0, 0).unwrap().link_id;
+    let id_b = screen.cell(0, 1).unwrap().link_id;
+    assert_eq!(id_a, id_b);
+    assert_eq!(screen.link_uri(id_a), Some("https://a.test/x"));
+}
+
+#[test]
+fn test_osc9_notification_is_drained() {
+    let mut parser = Parser::new(80, 24);
+    parser.parse(b"\x1b]9;build finished\x07");
+    assert_eq!(parser.take_notification().as_deref(), Some("build finished"));
+    assert_eq!(parser.take_notification(), None);
+    // Windows Terminal urgency form: 9;0;text
+    parser.parse(b"\x1b]9;0;errors\x07");
+    assert_eq!(parser.take_notification().as_deref(), Some("errors"));
+}
+
+#[test]
+fn test_kitty_query_reply_when_supported() {
+    let mut parser = Parser::new(80, 24);
+    parser.set_kitty_supported(true);
+    parser.parse(b"\x1b[?u");
+    assert_eq!(parser.take_response().as_deref(), Some(b"\x1b[?1u".as_slice()));
+}
+
+#[test]
+fn test_kitty_push_sets_disambiguate() {
+    let mut parser = Parser::new(80, 24);
+    parser.set_kitty_supported(true);
+    assert!(!parser.kitty_disambiguate());
+    parser.parse(b"\x1b[>1u"); // push disambiguate
+    assert!(parser.kitty_disambiguate());
+    parser.parse(b"\x1b[<u"); // pop -> back to 0
+    assert!(!parser.kitty_disambiguate());
+}
+
+#[test]
+fn test_kitty_ignored_when_unsupported() {
+    let mut parser = Parser::new(80, 24);
+    parser.parse(b"\x1b[?u");
+    assert_eq!(parser.take_response(), None);
+    parser.parse(b"\x1b[>1u");
+    assert!(!parser.kitty_disambiguate());
+}

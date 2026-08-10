@@ -84,6 +84,9 @@ pub enum GlobalAction {
     FocusPane(KeyCode),
     CycleOpacity,
     JumpBlock(i32),
+    /// Terminal reset: erase screen + scrollback, home the cursor. Mapped to
+    /// Ctrl+Shift+Delete (kitty's `clear_terminal reset`).
+    ResetTerminal,
     #[cfg(all(unix, feature = "ssh"))]
     Ssh,
     #[cfg(feature = "plugins")]
@@ -171,6 +174,11 @@ pub fn global_key(code: KeyCode, mods: Mods, ctx: KeyCtx) -> GlobalAction {
             KeyCode::KeyB => GlobalAction::RunPlugin,
             KeyCode::KeyK => GlobalAction::JumpBlock(-1),
             KeyCode::KeyJ => GlobalAction::JumpBlock(1),
+            // Ctrl+Shift+Delete = terminal reset (clear screen + scrollback +
+            // home cursor), matching kitty's `clear_terminal reset`. Delete
+            // alone would forward to the shell, so the Ctrl+Shift chord is
+            // required to make it a guarded, deliberate action.
+            KeyCode::Delete if !mods.alt => GlobalAction::ResetTerminal,
             KeyCode::KeyF => GlobalAction::ToggleSearch,
             KeyCode::KeyG => GlobalAction::ToggleFloating,
             KeyCode::Tab => GlobalAction::PrevTab,
@@ -296,6 +304,100 @@ pub fn key_sequence(code: KeyCode, mods: Mods) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(seq)
+}
+
+/// Kitty keyboard protocol encoding for functional keys, used when the active
+/// app has pushed the disambiguate flag (`CSI > 1 u`). With modifiers the
+/// sequences carry a modifier param (`CSI 1;5 A`, `CSI 99;5 u`); unmodified
+/// functional keys return None so the caller falls back to the legacy
+/// `key_sequence` (byte-identical in kitty mode). Enter/Tab/Backspace stay
+/// legacy per the spec's explicit exceptions.
+///
+/// Modifier bitmask: shift=1, alt=2, ctrl=4; the escape-code value is
+/// `1 + mask` (ctrl = 5, ctrl+shift = 6).
+pub fn kitty_sequence(code: KeyCode, mods: Mods) -> Option<Vec<u8>> {
+    let m = 1 + (mods.shift as u32) + ((mods.alt as u32) << 1) + ((mods.ctrl as u32) << 2);
+    if m == 1 {
+        return None; // no modifiers: legacy sequences are identical
+    }
+    let seq: Vec<u8> = match code {
+        KeyCode::Escape => format!("\x1b[27;{}u", m).into_bytes(),
+        KeyCode::ArrowUp => format!("\x1b[1;{}A", m).into_bytes(),
+        KeyCode::ArrowDown => format!("\x1b[1;{}B", m).into_bytes(),
+        KeyCode::ArrowRight => format!("\x1b[1;{}C", m).into_bytes(),
+        KeyCode::ArrowLeft => format!("\x1b[1;{}D", m).into_bytes(),
+        KeyCode::Home => format!("\x1b[1;{}H", m).into_bytes(),
+        KeyCode::End => format!("\x1b[1;{}F", m).into_bytes(),
+        KeyCode::PageUp => format!("\x1b[5;{}~", m).into_bytes(),
+        KeyCode::PageDown => format!("\x1b[6;{}~", m).into_bytes(),
+        KeyCode::Insert => format!("\x1b[2;{}~", m).into_bytes(),
+        KeyCode::Delete => format!("\x1b[3;{}~", m).into_bytes(),
+        KeyCode::F1 => format!("\x1b[11;{}~", m).into_bytes(),
+        KeyCode::F2 => format!("\x1b[12;{}~", m).into_bytes(),
+        KeyCode::F3 => format!("\x1b[13;{}~", m).into_bytes(),
+        KeyCode::F4 => format!("\x1b[14;{}~", m).into_bytes(),
+        KeyCode::F5 => format!("\x1b[15;{}~", m).into_bytes(),
+        KeyCode::F6 => format!("\x1b[17;{}~", m).into_bytes(),
+        KeyCode::F7 => format!("\x1b[18;{}~", m).into_bytes(),
+        KeyCode::F8 => format!("\x1b[19;{}~", m).into_bytes(),
+        KeyCode::F9 => format!("\x1b[20;{}~", m).into_bytes(),
+        KeyCode::F10 => format!("\x1b[21;{}~", m).into_bytes(),
+        KeyCode::F11 => format!("\x1b[23;{}~", m).into_bytes(),
+        KeyCode::F12 => format!("\x1b[24;{}~", m).into_bytes(),
+        // ctrl/alt + letter/digit -> CSI <lowercase cp>;<mods>u. This is what
+        // lets nvim/readline/fish disambiguate ctrl+c from ctrl+shift+c etc.
+        _ if mods.ctrl || mods.alt => {
+            let cp = key_codepoint(code)?;
+            format!("\x1b[{};{}u", cp, m).into_bytes()
+        }
+        _ => return None,
+    };
+    Some(seq)
+}
+
+/// Lowercase codepoint for ctrl/alt-modified letters, digits, and space
+/// (kitty reports the un-shifted key code).
+fn key_codepoint(code: KeyCode) -> Option<u32> {
+    Some(match code {
+        KeyCode::KeyA => 97,
+        KeyCode::KeyB => 98,
+        KeyCode::KeyC => 99,
+        KeyCode::KeyD => 100,
+        KeyCode::KeyE => 101,
+        KeyCode::KeyF => 102,
+        KeyCode::KeyG => 103,
+        KeyCode::KeyH => 104,
+        KeyCode::KeyI => 105,
+        KeyCode::KeyJ => 106,
+        KeyCode::KeyK => 107,
+        KeyCode::KeyL => 108,
+        KeyCode::KeyM => 109,
+        KeyCode::KeyN => 110,
+        KeyCode::KeyO => 111,
+        KeyCode::KeyP => 112,
+        KeyCode::KeyQ => 113,
+        KeyCode::KeyR => 114,
+        KeyCode::KeyS => 115,
+        KeyCode::KeyT => 116,
+        KeyCode::KeyU => 117,
+        KeyCode::KeyV => 118,
+        KeyCode::KeyW => 119,
+        KeyCode::KeyX => 120,
+        KeyCode::KeyY => 121,
+        KeyCode::KeyZ => 122,
+        KeyCode::Digit0 => 48,
+        KeyCode::Digit1 => 49,
+        KeyCode::Digit2 => 50,
+        KeyCode::Digit3 => 51,
+        KeyCode::Digit4 => 52,
+        KeyCode::Digit5 => 53,
+        KeyCode::Digit6 => 54,
+        KeyCode::Digit7 => 55,
+        KeyCode::Digit8 => 56,
+        KeyCode::Digit9 => 57,
+        KeyCode::Space => 32,
+        _ => return None,
+    })
 }
 
 /// Ctrl+A..=Z / Ctrl+Space -> the classic control code.
@@ -598,6 +700,45 @@ mod tests {
         assert_eq!(
             search_key(KeyCode::Escape, m(false, false, false), None),
             SearchKey::Close
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_c_is_csi_u_not_sigint() {
+        assert_eq!(
+            kitty_sequence(KeyCode::KeyC, m(true, false, false)),
+            Some(b"\x1b[99;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_shift_arrow_carries_modifier_param() {
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowUp, m(false, true, false)),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_alt_letter_is_csi_u() {
+        // ctrl+alt+a -> mods = 1 + 2 + 4 = 7
+        assert_eq!(
+            kitty_sequence(KeyCode::KeyA, m(true, false, true)),
+            Some(b"\x1b[97;7u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_unmodified_returns_none_so_legacy_wins() {
+        assert_eq!(kitty_sequence(KeyCode::ArrowUp, m(false, false, false)), None);
+        assert_eq!(kitty_sequence(KeyCode::Enter, m(false, false, false)), None);
+    }
+
+    #[test]
+    fn kitty_f12_with_ctrl_is_csi_24_modifier_tilde() {
+        assert_eq!(
+            kitty_sequence(KeyCode::F12, m(true, false, false)),
+            Some(b"\x1b[24;5~".to_vec())
         );
     }
 

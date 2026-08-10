@@ -27,6 +27,10 @@ pub struct PaneState {
     pub title: String,
     pub pane_cmd: String,
     pub pty_dead: bool,
+    /// Latched bell activity for an inactive pane (kitty renders 🔔 on the
+    /// tab). Drained from the screen each drain_pty and cleared when the tab
+    /// gains focus.
+    pub bell_rung: bool,
     /// Last (cols, rows) sent to the PTY. Resizes that don't change the size
     /// are skipped: every PTY resize delivers SIGWINCH, and bash reprints its
     /// prompt on each — the startup spawn-estimate → renderer-ready → Resized
@@ -433,6 +437,9 @@ impl SessionManager {
             tab.active_pane = tab.panes.first().copied().unwrap_or(0);
         }
         self.active_pane = tab.active_pane;
+        // A tab switch / structural re-focus dismisses the bell 🔔 on the
+        // now-visible tab (kitty clears activity on focus).
+        self.clear_focus_bell();
     }
 
     /// Focus a pane within the active tab (click-to-focus, focus-follow).
@@ -446,6 +453,9 @@ impl SessionManager {
         tab.active_pane = id;
         self.active_pane = id;
         self.scroll_offset = 0;
+        // Focusing a pane dismisses the bell 🔔 on its tab (kitty clears
+        // activity on focus the same way).
+        self.clear_focus_bell();
     }
 
     /// Title shown in the tab bar for the tab with `tab_id`: the title of its
@@ -469,6 +479,30 @@ impl SessionManager {
             .iter()
             .find(|t| t.id == tab_id)
             .map_or(1, |t| t.panes.len())
+    }
+
+    /// Pane ids owned by the tab with `tab_id` (empty for a missing tab).
+    /// The tab-bar/activity probe reads this to fold per-pane bell state up
+    /// into a per-tab activity flag.
+    pub fn tab_panes(&self, tab_id: usize) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map_or(Vec::new(), |t| t.panes.clone())
+    }
+
+    /// Clear latched bell activity on every pane of the ACTIVE tab. Called
+    /// whenever that tab gains focus (tab switch, focus-follow, click) so the
+    /// 🔔 indicator dismisses the moment the user looks at the tab — kitty
+    /// clears activity on focus the same way.
+    pub fn clear_focus_bell(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            for &id in &tab.panes {
+                if let Some(pane) = self.panes.get_mut(&id) {
+                    pane.bell_rung = false;
+                }
+            }
+        }
     }
 
     fn active_tree(&self) -> Option<&SplitNode> {
@@ -949,6 +983,7 @@ mod tests {
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
+            bell_rung: false,
             last_resize: None,
         }
     }
@@ -966,6 +1001,7 @@ mod tests {
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
+            bell_rung: false,
             last_resize: None,
         };
         pane.resize(80, 24);

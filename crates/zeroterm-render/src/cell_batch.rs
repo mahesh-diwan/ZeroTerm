@@ -127,6 +127,11 @@ impl CellBatch {
                     cell_attrs.underline = UnderlineStyle::Single;
                 }
             }
+            // OSC 8 hyperlinks render like URLs (accent color + underline).
+            if cell.link_id != 0 {
+                fg = theme.accent;
+                cell_attrs.underline = UnderlineStyle::Single;
+            }
 
             let is_cursor_cell = cursor_visible
                 && blink_visible

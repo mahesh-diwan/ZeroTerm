@@ -115,6 +115,25 @@ pub struct Parser {
     pub pending_images: Vec<ImageFragment>,
     apc_buffer: String,
     clipboard_text: Option<String>,
+    /// Kitty keyboard protocol: current enhancement flags (bit 0 = disambiguate)
+    /// plus a push/pop stack. Apps enable the protocol with `CSI > flags u`;
+    /// while bit 0 is set the app expects CSI-u key encodings.
+    kitty_flags: u32,
+    kitty_stack: Vec<u32>,
+    /// Whether this terminal advertises kitty keyboard support in its reply
+    /// to `CSI ? u`. Off by default; main.rs enables it per config so old
+    /// apps that expect silence for unknown queries keep working.
+    kitty_supported: bool,
+    /// Response bytes the app asked for (kitty `CSI ? u` reply, cursor/DA
+    /// reports). Drained by the app and written back to the pty.
+    pending_response: Option<Vec<u8>>,
+    /// OSC 9 desktop-notification text, drained by the app.
+    notification: Option<String>,
+    /// Latched when the parser erases the visible screen (ED 2) or clears
+    /// scrollback (ED 3). The app drains this to snap the scrollback view to
+    /// the bottom — without it, `clear`/`Ctrl+L` leave the viewport stranded in
+    /// the (now-blank or deleted) history, unlike kitty or other terminals.
+    clear_flag: bool,
     // Incomplete UTF-8 sequence accumulation (streaming PTY reads split code points)
     utf8_pending: Vec<u8>,
 }
@@ -137,8 +156,19 @@ impl Parser {
             pending_images: Vec::new(),
             apc_buffer: String::new(),
             clipboard_text: None,
+            kitty_flags: 0,
+            kitty_stack: Vec::new(),
+            kitty_supported: false,
+            pending_response: None,
+            notification: None,
+            clear_flag: false,
             utf8_pending: Vec::new(),
         }
+    }
+
+    /// Advertise kitty keyboard protocol support (config-gated in the app).
+    pub fn set_kitty_supported(&mut self, supported: bool) {
+        self.kitty_supported = supported;
     }
 
     pub fn parse(&mut self, bytes: &[u8]) {
@@ -169,6 +199,28 @@ impl Parser {
 
     pub fn sync_output(&self) -> bool {
         self.sync_output
+    }
+
+    /// Kitty keyboard disambiguation active (app pushed `CSI > 1 u`)? When
+    /// true the app expects functional keys to carry modifier params and
+    /// ctrl/alt letters to arrive as CSI-u sequences.
+    pub fn kitty_disambiguate(&self) -> bool {
+        self.kitty_flags & 1 != 0
+    }
+
+    pub fn take_response(&mut self) -> Option<Vec<u8>> {
+        self.pending_response.take()
+    }
+
+    /// Drain the latched clear flag (set when ED 2 or ED 3 erases the screen or
+    /// scrollback). The app resets its scroll offset when this is true so the
+    /// view snaps to the bottom instead of staying stranded in cleared history.
+    pub fn take_clear_flag(&mut self) -> bool {
+        std::mem::take(&mut self.clear_flag)
+    }
+
+    pub fn take_notification(&mut self) -> Option<String> {
+        self.notification.take()
     }
 
     fn handle_byte(&mut self, byte: u8) {
@@ -544,13 +596,24 @@ impl Parser {
     }
 
     fn handle_csi(&mut self, final_byte: char, intermediates: &[char]) {
-        let private = intermediates
+        let marker = intermediates
             .iter()
-            .any(|&c| c == '?' || c == '>' || c == '<' || c == '=');
+            .find(|&&c| c == '?' || c == '>' || c == '<' || c == '=')
+            .copied();
+        let private = marker.is_some();
         let intermediate: String = intermediates
             .iter()
             .filter(|&&c| c != '?' && c != '>' && c != '<' && c != '=')
             .collect();
+
+        // Kitty keyboard protocol: `CSI ? u` (query flags), `CSI > f u` (push
+        // flags), `CSI < n u` (pop n), `CSI = f;m u` (set flags with mode).
+        if final_byte == 'u' && marker.is_some() {
+            let p0 = self.csi.get(0, 0);
+            let p1 = self.csi.get(1, 1);
+            self.handle_kitty_csi(marker.unwrap(), p0, p1);
+            return;
+        }
 
         match (final_byte, private, intermediate.as_str()) {
             // Cursor movement
@@ -592,7 +655,13 @@ impl Parser {
             ('T', false, "") => self.screen.scroll_down(self.csi.get(0, 1) as usize), // SD
 
             // Erasing
-            ('J', false, "") => self.screen.erase_display(self.csi.get(0, 0)), // ED
+            ('J', false, "") => {
+                // ED 2 clears the visible screen, ED 3 clears scrollback:
+                // either means the viewport is no longer valid, so latch a
+                // flag the app drains to snap scroll to the bottom.
+                self.screen.erase_display(self.csi.get(0, 0));
+                self.clear_flag = true;
+            }
             ('K', false, "") => self.screen.erase_line(self.csi.get(0, 0)),    // EL
 
             // Insert/Delete
@@ -780,6 +849,43 @@ impl Parser {
         }
     }
 
+    /// Kitty keyboard protocol state machine (CSI ?/>/</= u). The query reply
+    /// advertises disambiguation (bit 0); push/pop/set track the app's
+    /// requested enhancements so key encoding can follow.
+    fn handle_kitty_csi(&mut self, marker: char, p0: i64, p1: i64) {
+        if !self.kitty_supported {
+            return;
+        }
+        match marker {
+            '?' => {
+                let flags = self.kitty_flags | 1; // advertise disambiguate
+                self.pending_response = Some(format!("\x1b[?{}u", flags).into_bytes());
+            }
+            '>' => {
+                self.kitty_stack.push(self.kitty_flags);
+                self.kitty_flags = p0 as u32;
+            }
+            '<' => {
+                for _ in 0..p0.max(1) {
+                    if let Some(prev) = self.kitty_stack.pop() {
+                        self.kitty_flags = prev;
+                    } else {
+                        self.kitty_flags = 0;
+                    }
+                }
+            }
+            '=' => {
+                let flags = p0 as u32;
+                self.kitty_flags = match p1 {
+                    2 => self.kitty_flags | flags,
+                    3 => self.kitty_flags & !flags,
+                    _ => flags,
+                };
+            }
+            _ => {}
+        }
+    }
+
     fn handle_dsr(&mut self) {
         let param = self.csi.get(0, 0);
         match param {
@@ -796,7 +902,27 @@ impl Parser {
         } else if osc.starts_with("4;") {
             // Color palette - ignored for now
         } else if osc.starts_with("8;") {
-            // Hyperlink - ignored for now
+            // OSC 8 hyperlink: `8;params;uri`. An empty uri closes the link.
+            let rest = &osc[2..];
+            let uri = match rest.split_once(';') {
+                Some((_, uri)) => uri,
+                None => rest, // no params: `8;uri`
+            };
+            self.screen.set_hyperlink(uri);
+        } else if let Some(payload) = osc.strip_prefix("9;") {
+            // OSC 9 desktop notification. Windows Terminal uses `9;0;text`
+            // (urgency 0..2); strip an optional leading urgency digit.
+            let text = if payload.len() >= 2
+                && payload.as_bytes()[0].is_ascii_digit()
+                && payload.as_bytes()[1] == b';'
+            {
+                &payload[2..]
+            } else {
+                payload
+            };
+            if !text.is_empty() {
+                self.notification = Some(text.to_string());
+            }
         } else if let Some(payload) = osc.strip_prefix("52;") {
             if let Some(semicolon) = payload.find(';') {
                 let base64_data = &payload[semicolon + 1..];
