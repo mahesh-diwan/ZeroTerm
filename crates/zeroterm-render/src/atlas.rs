@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::FontRef;
 
-use crate::renderer::{Result, RendererError};
+use crate::renderer::{RendererError, Result};
 
 const ATLAS_SIZE: u32 = 1024;
 
@@ -197,11 +197,9 @@ impl GlyphAtlas {
         // set_font so the three computations can never drift). new() cannot
         // fail here: the bytes came from a successful load, so a parse miss
         // keeps the size-derived estimates.
-        if let Some(m) = compute_metrics(
-            &atlas.font_data,
-            atlas.font_size,
-            &mut atlas.scale_context,
-        ) {
+        if let Some(m) =
+            compute_metrics(&atlas.font_data, atlas.font_size, &mut atlas.scale_context)
+        {
             atlas.cell_width = m.cell_width;
             atlas.cell_height = m.cell_height;
             atlas.baseline = m.baseline;
@@ -412,15 +410,14 @@ impl GlyphAtlas {
         // loads but cannot be parsed keeps the previous font, size, and
         // metrics — and the caller's font_path/size bookkeeping stays in sync
         // with what actually rendered.
-        let metrics = compute_metrics(&data, font_size, &mut self.scale_context).ok_or_else(
-            || {
+        let metrics =
+            compute_metrics(&data, font_size, &mut self.scale_context).ok_or_else(|| {
                 RendererError::FontInvalid(
                     font_path
                         .clone()
                         .unwrap_or_else(|| "<default font>".to_string()),
                 )
-            },
-        )?;
+            })?;
         self.font_path = font_path;
         self.font_data = data;
         self.font_size = font_size;
@@ -518,8 +515,11 @@ mod tests {
                 .format(swash::zeno::Format::Alpha)
                 .render(&mut scaler, charmap.map(ch as u32))
                 .unwrap_or_else(|| panic!("'{ch}' rasterizes"));
-            let (_, off_y) =
-                cell_offset(baseline, img.placement.left as f32, img.placement.top as f32);
+            let (_, off_y) = cell_offset(
+                baseline,
+                img.placement.left as f32,
+                img.placement.top as f32,
+            );
             let bottom = off_y + img.placement.height as f32;
             assert!(
                 off_y >= 0.0,

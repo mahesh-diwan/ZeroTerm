@@ -126,7 +126,10 @@ pub enum ConsoleAction {
     ScrollBottom,
     /// Shift+arrow selection extend. App falls back to the raw escape
     /// sequence when the feature is disabled.
-    ExtendSelection { code: KeyCode, ctrl: bool },
+    ExtendSelection {
+        code: KeyCode,
+        ctrl: bool,
+    },
     CopySelection,
     Paste,
     /// Raw bytes to write to the active pane's PTY.
@@ -194,10 +197,7 @@ pub fn global_key(code: KeyCode, mods: Mods, ctx: KeyCtx) -> GlobalAction {
     if mods.alt && !mods.ctrl && !mods.shift {
         if matches!(
             code,
-            KeyCode::ArrowLeft
-                | KeyCode::ArrowRight
-                | KeyCode::ArrowUp
-                | KeyCode::ArrowDown
+            KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown
         ) {
             return GlobalAction::FocusPane(code);
         }
@@ -233,10 +233,7 @@ pub fn console_key(code: KeyCode, mods: Mods) -> ConsoleAction {
             KeyCode::PageDown if !mods.ctrl => return ConsoleAction::ScrollDown(20),
             KeyCode::Home if !mods.ctrl => return ConsoleAction::ScrollTop,
             KeyCode::End if !mods.ctrl => return ConsoleAction::ScrollBottom,
-            KeyCode::ArrowLeft
-            | KeyCode::ArrowRight
-            | KeyCode::ArrowUp
-            | KeyCode::ArrowDown => {
+            KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown => {
                 return ConsoleAction::ExtendSelection {
                     code,
                     ctrl: mods.ctrl,
@@ -449,9 +446,7 @@ pub fn search_key(code: KeyCode, mods: Mods, text: Option<&str>) -> SearchKey {
         _ => {}
     }
     match text {
-        Some(t) if !t.is_empty() && !mods.ctrl && !mods.alt => {
-            SearchKey::Text(t.to_string())
-        }
+        Some(t) if !t.is_empty() && !mods.ctrl && !mods.alt => SearchKey::Text(t.to_string()),
         _ => SearchKey::Text(String::new()),
     }
 }
@@ -572,7 +567,11 @@ mod tests {
     #[test]
     fn alt_arrows_focus_adjacent_pane() {
         assert_eq!(
-            global_key(KeyCode::ArrowRight, m(false, false, true), KeyCtx::default()),
+            global_key(
+                KeyCode::ArrowRight,
+                m(false, false, true),
+                KeyCtx::default()
+            ),
             GlobalAction::FocusPane(KeyCode::ArrowRight)
         );
     }
@@ -730,7 +729,10 @@ mod tests {
 
     #[test]
     fn kitty_unmodified_returns_none_so_legacy_wins() {
-        assert_eq!(kitty_sequence(KeyCode::ArrowUp, m(false, false, false)), None);
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowUp, m(false, false, false)),
+            None
+        );
         assert_eq!(kitty_sequence(KeyCode::Enter, m(false, false, false)), None);
     }
 

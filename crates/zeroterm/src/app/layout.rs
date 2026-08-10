@@ -207,7 +207,10 @@ mod tests {
         let l = layout();
         // y=38 is the first content pixel; y=37 is the last tab-bar pixel.
         assert!(l.content_normalized(50.0, 37.0, 200.0, 200.0).is_none());
-        assert_eq!(l.content_normalized(50.0, 38.0, 200.0, 200.0), Some((0.25, 0.0)));
+        assert_eq!(
+            l.content_normalized(50.0, 38.0, 200.0, 200.0),
+            Some((0.25, 0.0))
+        );
     }
 
     #[test]
@@ -217,9 +220,11 @@ mod tests {
         screen.cursor_pos(1, 1);
         screen.put_char('A');
         screen.scroll_up(1); // scrollback = [A]; buffer rows blank
-        // Pane rect at px (0, 38), 36x57 (4 cols x 3 rows at 9x19).
-        // Global row for view row 0 with scroll_offset 1 = scrollback row 0.
-        let (row, col) = l.screen_to_cell(4.0, 38.0, (0.0, 38.0, 36.0, 57.0), &screen, 1).unwrap();
+                             // Pane rect at px (0, 38), 36x57 (4 cols x 3 rows at 9x19).
+                             // Global row for view row 0 with scroll_offset 1 = scrollback row 0.
+        let (row, col) = l
+            .screen_to_cell(4.0, 38.0, (0.0, 38.0, 36.0, 57.0), &screen, 1)
+            .unwrap();
         assert_eq!(col, 0);
         assert_eq!(row, 0); // scrollback index 0
     }

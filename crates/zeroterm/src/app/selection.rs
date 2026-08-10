@@ -13,8 +13,7 @@ use zeroterm_render::Selection;
 /// Normalize a selection rect so start <= end (both axes), matching the
 /// copy path and `Selection::contains`.
 pub fn normalize(sel: &Selection) -> (usize, usize, usize, usize) {
-    if sel.start_row < sel.end_row
-        || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
+    if sel.start_row < sel.end_row || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
     {
         (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
     } else {
@@ -64,7 +63,12 @@ mod tests {
     /// separated). The screen scrolls into scrollback only when the viewport
     /// is at least 2 rows tall (a 1-row screen never meets `top < bottom`).
     fn parser_with(rows: usize, text: &[&str]) -> Parser {
-        let cols = text.iter().map(|r| r.chars().count()).max().unwrap_or(0).max(1);
+        let cols = text
+            .iter()
+            .map(|r| r.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(1);
         let mut parser = Parser::new(cols, rows.max(2));
         let mut bytes: Vec<u8> = Vec::new();
         for (i, row) in text.iter().enumerate() {
@@ -141,7 +145,10 @@ mod tests {
         };
         // Rows are padded to the screen width (7 = "visible"); the caller
         // trims trailing whitespace before copying, matching legacy behavior.
-        assert_eq!(selection_text(&sel, parser.screen()), "line0  \nline1  \nvisible");
+        assert_eq!(
+            selection_text(&sel, parser.screen()),
+            "line0  \nline1  \nvisible"
+        );
     }
 
     #[test]

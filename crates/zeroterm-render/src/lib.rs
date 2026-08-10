@@ -1,14 +1,16 @@
 //! ZeroTerm Renderer - wgpu-based GPU renderer
 
+pub mod atlas;
 mod cell_batch;
 mod diag;
 mod pass;
-pub mod atlas;
 pub mod renderer;
 pub mod theme;
 
 pub use atlas::estimate_cell_size;
-pub use renderer::{tab_span, Renderer, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
+pub use renderer::{
+    tab_span, Renderer, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS,
+};
 
 pub struct RenderConfig {
     pub font_size: f32,

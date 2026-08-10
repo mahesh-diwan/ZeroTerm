@@ -87,7 +87,11 @@ impl Pass {
     }
 
     pub(crate) fn write_uniforms(&self, queue: &wgpu::Queue, u: &Uniforms) {
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(std::slice::from_ref(u)));
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(std::slice::from_ref(u)),
+        );
     }
 
     /// Draw `instance_count` cell quads through this pass. `clear` is the

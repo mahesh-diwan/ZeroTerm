@@ -65,11 +65,7 @@ impl SessionRegistry {
             if let Some(oldest) = self
                 .map
                 .iter()
-                .min_by(|(ka, a), (kb, b)| {
-                    a.start_ts
-                        .cmp(&b.start_ts)
-                        .then_with(|| ka.cmp(kb))
-                })
+                .min_by(|(ka, a), (kb, b)| a.start_ts.cmp(&b.start_ts).then_with(|| ka.cmp(kb)))
                 .map(|(k, _)| k.clone())
             {
                 self.map.remove(&oldest);
@@ -103,11 +99,7 @@ impl SessionRegistry {
         // Deterministic: oldest first, id as tie-breaker (stable sort would
         // otherwise leak HashMap iteration order when start_ts ties, which
         // happens on coarse clocks like macOS).
-        v.sort_by(|a, b| {
-            a.start_ts
-                .cmp(&b.start_ts)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        v.sort_by(|a, b| a.start_ts.cmp(&b.start_ts).then_with(|| a.id.cmp(&b.id)));
         v
     }
 }

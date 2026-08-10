@@ -152,7 +152,6 @@ const QUAD_VERTS: [QuadVertex; 6] = [
     },
 ];
 
-
 /// Generous max rows for the scrollbar overlay storage buffer (2 col cells each).
 const SCROLLBAR_MAX_ROWS: usize = 512;
 
@@ -361,9 +360,7 @@ impl Renderer {
         let diag = Diag::new();
         diag.probe(
             "surface",
-            &format!(
-                "format={surface_format:?} alpha={alpha_mode:?} present={present_mode:?}"
-            ),
+            &format!("format={surface_format:?} alpha={alpha_mode:?} present={present_mode:?}"),
         );
 
         let config = wgpu::SurfaceConfiguration {
@@ -775,11 +772,7 @@ impl Renderer {
                     // redraw can time out at ~2fps. Log the first couple, then
                     // every 60th, so the log stays readable.
                     if self.surface_failures <= 2 || self.surface_failures.is_multiple_of(60) {
-                        log::warn!(
-                            "Surface error (attempt {}): {}",
-                            self.surface_failures,
-                            e
-                        );
+                        log::warn!("Surface error (attempt {}): {}", self.surface_failures, e);
                     }
                     // Never swallow: the caller must know no frame was
                     // acquired so it keeps the redraw loop alive and retries
@@ -823,7 +816,8 @@ impl Renderer {
             attrs: 0,
             _pad1: [0; 3],
         };
-        self.tab_bar_pass.write_cells(&self.queue, std::slice::from_ref(&bg));
+        self.tab_bar_pass
+            .write_cells(&self.queue, std::slice::from_ref(&bg));
 
         let uniforms = Uniforms {
             screen_size: [self.size.width as f32, self.size.height as f32],
@@ -974,10 +968,9 @@ impl Renderer {
         // compositor. Finalized after submit.
         let mut readback: Option<crate::diag::DiagReadback> = None;
         if self.diag.should_dump_frame() {
-            if let (Some(enc), Some(frame)) = (
-                self.current_encoder.as_mut(),
-                self.current_frame.as_ref(),
-            ) {
+            if let (Some(enc), Some(frame)) =
+                (self.current_encoder.as_mut(), self.current_frame.as_ref())
+            {
                 readback = Diag::queue_readback(
                     &self.device,
                     enc,
@@ -1167,7 +1160,9 @@ impl Renderer {
             // for hit-testing. Active tabs never show it (the bell is
             // consumed by focusing the tab).
             if tab.activity {
-                let g = self.glyph_atlas.get_or_insert_glyph('●', &self.device, &self.queue);
+                let g = self
+                    .glyph_atlas
+                    .get_or_insert_glyph('●', &self.device, &self.queue);
                 let (u0, v0, u1, v1) = g.uv();
                 let cell = &mut batch[col];
                 cell.glyph_uv_min = [u0, v0];
@@ -1184,7 +1179,9 @@ impl Renderer {
                 if c >= cols {
                     break;
                 }
-                let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+                let g = self
+                    .glyph_atlas
+                    .get_or_insert_glyph(ch, &self.device, &self.queue);
                 let (u0, v0, u1, v1) = g.uv();
                 let cell = &mut batch[c];
                 cell.glyph_uv_min = [u0, v0];
@@ -1200,14 +1197,20 @@ impl Renderer {
             if tab.active || tab.hovered {
                 let close_c = col + span - 1;
                 if close_c < cols {
-                    let g = self.glyph_atlas.get_or_insert_glyph('×', &self.device, &self.queue);
+                    let g = self
+                        .glyph_atlas
+                        .get_or_insert_glyph('×', &self.device, &self.queue);
                     let (u0, v0, u1, v1) = g.uv();
                     let cell = &mut batch[close_c];
                     cell.glyph_uv_min = [u0, v0];
                     cell.glyph_uv_max = [u1, v1];
                     cell.glyph_size = [g.width as f32, g.height as f32];
                     cell.glyph_offset = [g.offset_x, g.offset_y];
-                    cell.fg = if tab.close_hovered { close_red } else { accent_fg };
+                    cell.fg = if tab.close_hovered {
+                        close_red
+                    } else {
+                        accent_fg
+                    };
                     cell.attrs = 0;
                 }
             }
@@ -1298,7 +1301,9 @@ impl Renderer {
             if c >= cols {
                 break;
             }
-            let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+            let g = self
+                .glyph_atlas
+                .get_or_insert_glyph(ch, &self.device, &self.queue);
             let (u0, v0, u1, v1) = g.uv();
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
@@ -1307,7 +1312,9 @@ impl Renderer {
         }
         let mut c = cols.saturating_sub(1);
         for ch in right.chars().rev() {
-            let g = self.glyph_atlas.get_or_insert_glyph(ch, &self.device, &self.queue);
+            let g = self
+                .glyph_atlas
+                .get_or_insert_glyph(ch, &self.device, &self.queue);
             let (u0, v0, u1, v1) = g.uv();
             batch[c].glyph_uv_min = [u0, v0];
             batch[c].glyph_uv_max = [u1, v1];
@@ -1348,7 +1355,6 @@ impl Renderer {
         );
         Ok(())
     }
-
 
     /// Right-edge scrollbar overlay over the active pane. `fraction` is
     /// scroll_offset/max_scroll_offset (0.0 = oldest, 1.0 = newest) and
@@ -1409,7 +1415,11 @@ impl Renderer {
         // old math was inverted: at the top of scrollback it sized the thumb
         // to the full track, painting a solid accent bar down the right edge.
         let (tstart, thumb_rows) = scrollbar_thumb(rows, thumb_fraction, fraction);
-        for row in batch.iter_mut().take((tstart + thumb_rows).min(rows)).skip(tstart) {
+        for row in batch
+            .iter_mut()
+            .take((tstart + thumb_rows).min(rows))
+            .skip(tstart)
+        {
             row.bg = thumb;
         }
 
@@ -1500,9 +1510,13 @@ impl Renderer {
                     rows_with_ink.push(r);
                 }
             }
-            eprintln!("[ZTDIAG] batch rows-with-glyphs: {:?} (of {} rows)", rows_with_ink, visible_rows);
+            eprintln!(
+                "[ZTDIAG] batch rows-with-glyphs: {:?} (of {} rows)",
+                rows_with_ink, visible_rows
+            );
             if let Some(&r) = rows_with_ink.first() {
-                let mut out = format!("[ZTDIAG] batch row {r} (cols={cols} rows={visible_rows}):\n");
+                let mut out =
+                    format!("[ZTDIAG] batch row {r} (cols={cols} rows={visible_rows}):\n");
                 for c in 0..cols.min(40) {
                     if let Some(cd) = batch.get(r * cols + c) {
                         if cd.glyph_size[0] > 0.0 {
@@ -1523,28 +1537,27 @@ impl Renderer {
         Ok(())
     }
 
-
-/// Theme background in LINEAR color space, for wgpu `LoadOp::Clear`.
-/// Theme colors are sRGB byte values (`0..255`) and the Bgra8UnormSrgb
-/// surface re-encodes anything cleared with them, so passing the sRGB
-/// floats straight through yields a lighter shade than the background quad
-/// (faint horizontal bands between cell rows on screen). Clearing with the
-/// true linear value makes every region identical to the painted background.
-fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
-    let srgb = |c: u8| f64::from(c) / 255.0;
-    let to_linear = |c: f64| {
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    [
-        to_linear(srgb(theme.bg.r)),
-        to_linear(srgb(theme.bg.g)),
-        to_linear(srgb(theme.bg.b)),
-    ]
-}
+    /// Theme background in LINEAR color space, for wgpu `LoadOp::Clear`.
+    /// Theme colors are sRGB byte values (`0..255`) and the Bgra8UnormSrgb
+    /// surface re-encodes anything cleared with them, so passing the sRGB
+    /// floats straight through yields a lighter shade than the background quad
+    /// (faint horizontal bands between cell rows on screen). Clearing with the
+    /// true linear value makes every region identical to the painted background.
+    fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
+        let srgb = |c: u8| f64::from(c) / 255.0;
+        let to_linear = |c: f64| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        [
+            to_linear(srgb(theme.bg.r)),
+            to_linear(srgb(theme.bg.g)),
+            to_linear(srgb(theme.bg.b)),
+        ]
+    }
 
     pub fn reload_config(&mut self, config: &zeroterm_config::Config) {
         self.theme = crate::theme::Theme::by_name(&config.colors.theme);
@@ -1749,11 +1762,7 @@ fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
     /// error on a failed load/parse so the caller keeps its font_path/size
     /// bookkeeping in sync with what actually rendered (a rejected font must
     /// not trigger a pane re-layout at metrics that were never applied).
-    pub fn reload_font(
-        &mut self,
-        font_path: Option<String>,
-        font_size: f32,
-    ) -> Result<()> {
+    pub fn reload_font(&mut self, font_path: Option<String>, font_size: f32) -> Result<()> {
         self.glyph_atlas
             .set_font(&self.device, &self.queue, font_path, font_size)?;
         let (cw, ch) = self.glyph_atlas.cell_metrics();
@@ -1766,7 +1775,6 @@ fn theme_linear_bg(theme: &crate::theme::Theme) -> [f64; 3] {
         self.resize(self.size.width, self.size.height);
         Ok(())
     }
-
 }
 
 /// Compute the scrollbar thumb geometry: returns `(start_row, row_count)`
@@ -1781,8 +1789,8 @@ fn scrollbar_thumb(rows: usize, thumb_fraction: f32, fraction: f32) -> (usize, u
     }
     let fraction = fraction.clamp(0.0, 1.0);
     let min_thumb = rows.min(2);
-    let thumb_rows = ((rows as f32 * thumb_fraction.clamp(0.0, 1.0)).round() as usize)
-        .clamp(min_thumb, rows);
+    let thumb_rows =
+        ((rows as f32 * thumb_fraction.clamp(0.0, 1.0)).round() as usize).clamp(min_thumb, rows);
     let max_start = rows.saturating_sub(thumb_rows);
     let tstart = ((fraction * max_start as f32).round() as usize).min(max_start);
     (tstart, thumb_rows)
@@ -1823,8 +1831,6 @@ fn latest_new_image(
         Some(img)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

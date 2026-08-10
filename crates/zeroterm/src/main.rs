@@ -8,9 +8,9 @@ use anyhow::Result;
 use arboard::Clipboard;
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::{MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::dpi::PhysicalSize;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowAttributes};
 
@@ -28,12 +28,12 @@ use crate::app::layout::Layout;
 #[cfg(feature = "sync")]
 use zeroterm_sync::daemon::SyncDaemon;
 
+use crate::app::key_router;
 #[cfg(feature = "plugins")]
 use crate::app::load_plugins;
+use crate::app::selection;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
-use crate::app::key_router;
-use crate::app::selection;
 use crate::app::{
     block_output_text, word_left, word_right, EditAction, HostPicker, LineEditor, PaneState,
     PtyCommand, SessionManager,
@@ -57,10 +57,6 @@ enum OverlayKind {
     Settings,
     HostPicker,
 }
-// Retained for the legacy session.json format + its tests; session layout
-// persistence now lives in zeroterm-mux (SessionLayout) via save_session_layout().
-#[allow(dead_code)]
-mod session;
 mod settings;
 
 const COPY_MARKER: &str = "[copy]";
@@ -160,7 +156,6 @@ fn should_focus_follow(
     follows && !selecting && hovered.is_some_and(|id| id != active)
 }
 
-#[allow(dead_code)]
 /// cols/rows for a window of `size` at `cell_w` x `cell_h`, mirroring the
 /// renderer's resize_panes_to_rects math exactly. Chrome rows (tab bar +
 /// status bar) and padding come from the renderer crate's public constants,
@@ -555,8 +550,9 @@ impl App {
                     active_pane: active,
                 });
             }
-            self.session.active_tab =
-                saved.active_tab.min(self.session.tabs.len().saturating_sub(1));
+            self.session.active_tab = saved
+                .active_tab
+                .min(self.session.tabs.len().saturating_sub(1));
             self.session.sync_active();
         }
 
@@ -1006,8 +1002,10 @@ impl App {
                 }
                 // OSC 9 notification -> desktop notification (notify-send).
                 if let Some(msg) = pane.parser.take_notification() {
-                    let enabled =
-                        self.config.as_ref().map_or(true, |c| c.terminal.notifications);
+                    let enabled = self
+                        .config
+                        .as_ref()
+                        .map_or(true, |c| c.terminal.notifications);
                     if enabled {
                         notifications.push(msg);
                     }
@@ -1415,7 +1413,9 @@ impl App {
     fn new_parser(&self, cols: usize, rows: usize) -> Parser {
         let mut parser = Parser::new(cols, rows);
         parser.set_kitty_supported(
-            self.config.as_ref().map_or(false, |c| c.terminal.kitty_keyboard),
+            self.config
+                .as_ref()
+                .map_or(false, |c| c.terminal.kitty_keyboard),
         );
         parser
     }
@@ -1435,7 +1435,10 @@ impl App {
             "display notification \"{}\" with title \"ZeroTerm\"",
             escaped
         );
-        let _ = std::process::Command::new("osascript").arg("-e").arg(&script).spawn();
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .spawn();
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn desktop_notify(&self, _msg: &str) {}
@@ -1792,10 +1795,7 @@ impl App {
     }
 
     fn screen_to_cell(&self, pane_id: usize, x: f32, y: f32) -> Option<(usize, usize)> {
-        let (Some(pane), Some(layout)) = (
-            self.session.panes.get(&pane_id),
-            self.layout(),
-        ) else {
+        let (Some(pane), Some(layout)) = (self.session.panes.get(&pane_id), self.layout()) else {
             return None;
         };
         let rect = self.session.rects().get(&pane_id).copied()?;
@@ -1982,9 +1982,9 @@ impl App {
 
     fn copy_selection(&mut self) {
         let text = self.selection.as_ref().and_then(|sel| {
-            self.session.active_pane().map(|pane| {
-                selection::selection_text(sel, pane.parser.screen())
-            })
+            self.session
+                .active_pane()
+                .map(|pane| selection::selection_text(sel, pane.parser.screen()))
         });
         if let Some(text) = text {
             if let Some(clipboard) = &mut self.clipboard {
@@ -2086,9 +2086,7 @@ impl App {
             // so committing would desync pane sizing from what actually
             // renders. No renderer yet: the values are consumed at init.
             let applied = match &mut self.renderer {
-                Some(renderer) => {
-                    renderer.reload_font(font_path.clone(), font_size).is_ok()
-                }
+                Some(renderer) => renderer.reload_font(font_path.clone(), font_size).is_ok(),
                 None => true,
             };
             if applied {
@@ -2701,7 +2699,8 @@ impl ApplicationHandler for App {
                             window.request_redraw();
                         }
                     }
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_init_poll + every));
+                    event_loop
+                        .set_control_flow(ControlFlow::WaitUntil(self.last_init_poll + every));
                 }
                 // Cursor blink drives redraws at the blink cadence (~2/s),
                 // not every vsync: redraw when the phase just toggled, else
@@ -3145,7 +3144,11 @@ mod tests {
             app.editor.handle(KeyCode::Enter, false, false, false),
             EditAction::Submit(_)
         ));
-        assert_eq!(app.editor.history.len(), 2, "repeat of last entry must be a no-op");
+        assert_eq!(
+            app.editor.history.len(),
+            2,
+            "repeat of last entry must be a no-op"
+        );
     }
 
     #[test]
@@ -3202,7 +3205,7 @@ mod tests {
         let mut app = App::new();
         app.editor.start("ab\ncd");
         app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
-        // `h` / `l` move the cursor; letters in normal mode are swallowed.
+                                                          // `h` / `l` move the cursor; letters in normal mode are swallowed.
         assert_eq!(
             app.editor.handle(KeyCode::KeyH, false, false, false),
             EditAction::Handled
@@ -3307,7 +3310,7 @@ mod tests {
         let mut app = App::new();
         app.editor.start("ab");
         app.editor.state.as_mut().unwrap().toggle_mode(); // Vi, normal
-        // Into insert, then Esc back to normal; editor stays open.
+                                                          // Into insert, then Esc back to normal; editor stays open.
         assert_eq!(
             app.editor.handle(KeyCode::KeyI, false, false, false),
             EditAction::Handled

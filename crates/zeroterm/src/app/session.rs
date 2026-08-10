@@ -144,7 +144,10 @@ if [ "$profile_loaded" -eq 0 ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"
 eval "$(starship init bash)"
 "#;
         let _ = std::fs::write(&boot, content);
-        Some(vec![r"--rcfile".into(), boot.to_string_lossy().into_owned()])
+        Some(vec![
+            r"--rcfile".into(),
+            boot.to_string_lossy().into_owned(),
+        ])
     } else if shell.ends_with("zsh") {
         // zsh has no --rcfile; ZDOTDIR points at a directory whose .zshrc
         // reproduces the login env (.zprofile), sources the user's real
@@ -913,7 +916,11 @@ mod tests {
             "stale leaf survives remove_leaf"
         );
         m.reconcile_tree();
-        assert_eq!(m.tabs[0].tree.leaves(), vec![0], "tree repaired to live pane");
+        assert_eq!(
+            m.tabs[0].tree.leaves(),
+            vec![0],
+            "tree repaired to live pane"
+        );
     }
 
     #[test]

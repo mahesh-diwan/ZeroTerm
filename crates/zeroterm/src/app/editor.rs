@@ -269,15 +269,27 @@ impl LineEditor {
 mod tests {
     use super::*;
 
-    fn handle(editor: &mut LineEditor, code: KeyCode, ctrl: bool, shift: bool, alt: bool) -> EditAction {
+    fn handle(
+        editor: &mut LineEditor,
+        code: KeyCode,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    ) -> EditAction {
         editor.handle(code, ctrl, shift, alt)
     }
 
     #[test]
     fn inactive_editor_passes_all_keys() {
         let mut editor = LineEditor::new();
-        assert_eq!(handle(&mut editor, KeyCode::KeyA, false, false, false), EditAction::Pass);
-        assert_eq!(handle(&mut editor, KeyCode::Enter, false, false, false), EditAction::Pass);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyA, false, false, false),
+            EditAction::Pass
+        );
+        assert_eq!(
+            handle(&mut editor, KeyCode::Enter, false, false, false),
+            EditAction::Pass
+        );
         assert!(!editor.is_active());
     }
 
@@ -298,7 +310,10 @@ mod tests {
     fn plain_key_passes_to_text_input() {
         let mut editor = LineEditor::new();
         editor.start("ab");
-        assert_eq!(handle(&mut editor, KeyCode::KeyX, false, false, false), EditAction::Pass);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyX, false, false, false),
+            EditAction::Pass
+        );
         // ...and the text-input path lands it in the buffer.
         editor.insert_text("x");
         assert_eq!(editor.line(), "abx");
@@ -309,19 +324,31 @@ mod tests {
         let mut editor = LineEditor::new();
         editor.start("hello");
         // Ctrl+K kills to end of line (buffer changes, key consumed).
-        assert_eq!(handle(&mut editor, KeyCode::KeyK, true, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyK, true, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "hello");
         editor.start("hello");
         editor.state.as_mut().unwrap().home();
-        assert_eq!(handle(&mut editor, KeyCode::KeyK, true, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyK, true, false, false),
+            EditAction::Handled
+        );
         assert!(editor.line().is_empty());
         // Ctrl+C cancels.
         editor.start("hello");
-        assert_eq!(handle(&mut editor, KeyCode::KeyC, true, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyC, true, false, false),
+            EditAction::Handled
+        );
         assert!(!editor.is_active());
         // Alt+E passes through so the App can exit edit mode.
         editor.start("hi");
-        assert_eq!(handle(&mut editor, KeyCode::KeyE, false, false, true), EditAction::Pass);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyE, false, false, true),
+            EditAction::Pass
+        );
         assert!(editor.is_active());
     }
 
@@ -332,19 +359,37 @@ mod tests {
         editor.history.push("echo two");
         editor.start("");
         // Up recalls the most recent entry; the in-progress line is stashed.
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "echo two");
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "echo one");
-        assert_eq!(handle(&mut editor, KeyCode::ArrowDown, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowDown, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "echo two");
         // Ctrl+P / Ctrl+N are the readline chords for Up / Down.
-        assert_eq!(handle(&mut editor, KeyCode::KeyP, true, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyP, true, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "echo one");
-        assert_eq!(handle(&mut editor, KeyCode::KeyN, true, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyN, true, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "echo two");
         // Up then Enter submits "echo one" (not the deduped last entry).
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert!(matches!(
             handle(&mut editor, KeyCode::Enter, false, false, false),
             EditAction::Submit(_)
@@ -357,24 +402,51 @@ mod tests {
     fn vi_mode_toggle_and_normal_subset() {
         let mut editor = LineEditor::new();
         editor.start("ab\ncd");
-        assert_eq!(handle(&mut editor, KeyCode::KeyM, true, true, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyM, true, true, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.mode(), EditMode::Vi);
         assert!(editor.vi_normal());
         // `h` moves; plain letters are swallowed in normal mode.
-        assert_eq!(handle(&mut editor, KeyCode::KeyH, false, false, false), EditAction::Handled);
-        assert_eq!(handle(&mut editor, KeyCode::KeyQ, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyH, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyQ, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "ab\ncd");
         // `0` -> start of line, then insert mode lets text land.
-        assert_eq!(handle(&mut editor, KeyCode::Digit0, false, false, false), EditAction::Handled);
-        assert_eq!(handle(&mut editor, KeyCode::KeyI, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::Digit0, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyI, false, false, false),
+            EditAction::Handled
+        );
         assert!(!editor.vi_normal());
         editor.insert_text("X");
         assert_eq!(editor.line(), "ab\nXcd");
         // `d d` clears the line.
-        assert_eq!(handle(&mut editor, KeyCode::KeyM, true, true, false), EditAction::Handled); // back to Emacs
-        assert_eq!(handle(&mut editor, KeyCode::KeyM, true, true, false), EditAction::Handled); // to Vi normal
-        assert_eq!(handle(&mut editor, KeyCode::KeyD, false, false, false), EditAction::Handled);
-        assert_eq!(handle(&mut editor, KeyCode::KeyD, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyM, true, true, false),
+            EditAction::Handled
+        ); // back to Emacs
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyM, true, true, false),
+            EditAction::Handled
+        ); // to Vi normal
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyD, false, false, false),
+            EditAction::Handled
+        );
+        assert_eq!(
+            handle(&mut editor, KeyCode::KeyD, false, false, false),
+            EditAction::Handled
+        );
         assert!(editor.is_empty());
     }
 
@@ -385,14 +457,23 @@ mod tests {
         editor.history.push("cmd");
         editor.history.push("last");
         editor.start("");
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "last");
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "cmd");
         // Empty history: Up must be a no-op, never a panic.
         let mut editor = LineEditor::new();
         editor.start("ls");
-        assert_eq!(handle(&mut editor, KeyCode::ArrowUp, false, false, false), EditAction::Handled);
+        assert_eq!(
+            handle(&mut editor, KeyCode::ArrowUp, false, false, false),
+            EditAction::Handled
+        );
         assert_eq!(editor.line(), "ls");
     }
 }

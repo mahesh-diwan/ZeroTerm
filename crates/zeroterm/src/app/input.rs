@@ -111,26 +111,6 @@ pub enum EditMode {
     Vi,
 }
 
-/// Shell-token kind for prompt highlighting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub enum HighlightKind {
-    Plain,
-    Command,
-    Flag,
-    Quoted,
-}
-
-/// A highlighted span of the editing buffer. Indices are char offsets into
-/// the buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub struct HighlightSpan {
-    pub start: usize,
-    pub end: usize,
-    pub kind: HighlightKind,
-}
-
 /// Local line editor state (not readline): a char buffer plus a cursor,
 /// shown in the active pane's tab title while active. The buffer is
 /// multiline — `'\n'` is an ordinary buffer char — so cursoring and kills
@@ -380,78 +360,6 @@ impl EditingState {
     pub fn set_vi_d_pending(&mut self, pending: bool) {
         self.vi_d_pending = pending;
     }
-
-    /// Cheap shell-token spans for the current buffer: the first word is the
-    /// command, `-`/`--`-prefixed tokens are flags, and single/double-quoted
-    /// strings (closed or not) are quoted; Plain spans cover the gaps so the
-    /// whole buffer is covered.
-    /// ponytail: pure fn, not yet consumed — the tab-title renderer draws
-    /// plain text only. Wire it in when titles gain markup.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn highlight(&self) -> Vec<HighlightSpan> {
-        let mut spans = Vec::new();
-        let mut i = 0;
-        while i < self.buffer.len() {
-            let c = self.buffer[i];
-            if c.is_whitespace() {
-                let start = i;
-                while i < self.buffer.len() && self.buffer[i].is_whitespace() {
-                    i += 1;
-                }
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind: HighlightKind::Plain,
-                });
-            } else if c == '-' {
-                let start = i;
-                i += 1;
-                if i < self.buffer.len() && self.buffer[i] == '-' {
-                    i += 1;
-                }
-                while i < self.buffer.len() && !self.buffer[i].is_whitespace() {
-                    i += 1;
-                }
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind: HighlightKind::Flag,
-                });
-            } else if c == '\'' || c == '"' {
-                let start = i;
-                let quote = c;
-                i += 1;
-                while i < self.buffer.len() && self.buffer[i] != quote {
-                    i += 1;
-                }
-                if i < self.buffer.len() {
-                    i += 1; // closing quote
-                }
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind: HighlightKind::Quoted,
-                });
-            } else {
-                let start = i;
-                while i < self.buffer.len() && !self.buffer[i].is_whitespace() {
-                    i += 1;
-                }
-                // The very first word is the command; later words are Plain.
-                let kind = if spans.iter().any(|s| s.kind != HighlightKind::Plain) {
-                    HighlightKind::Plain
-                } else {
-                    HighlightKind::Command
-                };
-                spans.push(HighlightSpan {
-                    start,
-                    end: i,
-                    kind,
-                });
-            }
-        }
-        spans
-    }
 }
 
 /// Start of the current or previous word in a raw char line (readline M-b).
@@ -483,10 +391,7 @@ pub fn word_right(chars: &[char], col: usize, cols: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        word_left, word_right, EditMode, EditingState, HighlightKind, HighlightSpan, PromptHistory,
-        HISTORY_CAP,
-    };
+    use super::{word_left, word_right, EditMode, EditingState, PromptHistory, HISTORY_CAP};
 
     #[test]
     fn word_movement_bounds() {
@@ -699,56 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_first_word_command_flags_and_quotes() {
-        let e = EditingState::from_line("ls -la 'foo bar'");
-        let spans = e.highlight();
-        assert_eq!(
-            spans,
-            vec![
-                HighlightSpan {
-                    start: 0,
-                    end: 2,
-                    kind: HighlightKind::Command
-                },
-                HighlightSpan {
-                    start: 2,
-                    end: 3,
-                    kind: HighlightKind::Plain
-                },
-                HighlightSpan {
-                    start: 3,
-                    end: 6,
-                    kind: HighlightKind::Flag
-                },
-                HighlightSpan {
-                    start: 6,
-                    end: 7,
-                    kind: HighlightKind::Plain
-                },
-                HighlightSpan {
-                    start: 7,
-                    end: 16,
-                    kind: HighlightKind::Quoted
-                },
-            ]
-        );
-    }
-
     #[test]
-    fn highlight_empty_and_double_quoted_and_unclosed() {
-        let e = EditingState::from_line("");
-        assert!(e.highlight().is_empty());
-        let e = EditingState::from_line("git --stat");
-        assert_eq!(e.highlight()[2].kind, HighlightKind::Flag);
-        assert_eq!(e.highlight()[2].end, e.line().len());
-        // An unterminated quote spans to the end of the buffer.
-        let e = EditingState::from_line("echo \"abc");
-        let spans = e.highlight();
-        assert_eq!(spans[0].kind, HighlightKind::Command);
-        assert_eq!(spans.last().unwrap().kind, HighlightKind::Quoted);
-        assert_eq!(spans.last().unwrap().end, 9);
-    }
-
     #[test]
     fn toggle_mode_flips_and_vi_starts_normal() {
         let mut e = EditingState::from_line("x");

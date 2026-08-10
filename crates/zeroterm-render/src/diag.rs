@@ -126,8 +126,7 @@ impl Diag {
         let h = rb.height as usize;
         let bpr = rb.bytes_per_row as usize;
         let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-        let mut alpha_counts: std::collections::HashMap<u8, u32> =
-            std::collections::HashMap::new();
+        let mut alpha_counts: std::collections::HashMap<u8, u32> = std::collections::HashMap::new();
         for row in 0..h {
             let base = row * bpr;
             for col in 0..w {

@@ -62,8 +62,6 @@ pub fn scrollbar_policy(
     }
 }
 
-
-
 /// Tab-bar display title: the tab's title plus a split badge (" ▦N") when the
 /// tab holds more than one pane, so split tabs are identifiable at a glance.
 /// The tab-bar draw loop and the hit-testing (tab_at_point / tab_bar_hover)
@@ -104,9 +102,7 @@ pub fn status_right(mode: Option<&str>, max_scroll: usize, scroll_offset: usize)
     let scroll_part = if max_scroll > 0 {
         format!(
             "  [{}%]",
-            (100 * scroll_offset)
-                .checked_div(max_scroll)
-                .unwrap_or(0)
+            (100 * scroll_offset).checked_div(max_scroll).unwrap_or(0)
         )
     } else {
         String::new()
@@ -199,7 +195,10 @@ mod tests {
         // Scroll position only.
         assert_eq!(status_right(None, 100, 25), "  [25%]");
         // Mode marker + scroll.
-        assert_eq!(status_right(Some("search"), 100, 25), " -- SEARCH --  [25%]");
+        assert_eq!(
+            status_right(Some("search"), 100, 25),
+            " -- SEARCH --  [25%]"
+        );
         // Mode marker without scrollback.
         assert_eq!(status_right(Some("editor"), 0, 0), " -- EDITOR --");
         // Empty mode string is treated as no mode.
@@ -227,8 +226,19 @@ mod tests {
     #[test]
     fn tab_infos_marks_inactive_bell_activity() {
         // ids [1, 2], active pane 2: tab 1 is inactive and rung the bell.
-        let infos = tab_infos(&[1, 2], 2, |id| format!("t{id}"), |id| id == 1, None, None, false);
-        assert!(infos[0].activity, "inactive tab with bell should show activity");
+        let infos = tab_infos(
+            &[1, 2],
+            2,
+            |id| format!("t{id}"),
+            |id| id == 1,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            infos[0].activity,
+            "inactive tab with bell should show activity"
+        );
         assert!(!infos[1].activity, "active tab never shows activity");
     }
 
@@ -256,7 +266,10 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(infos[1].title, "ls foo", "active tab shows the editor buffer");
+        assert_eq!(
+            infos[1].title, "ls foo",
+            "active tab shows the editor buffer"
+        );
         assert_eq!(infos[0].title, "title1");
     }
 }

@@ -641,14 +641,12 @@ impl Parser {
             // 3 blink underline, 4 steady underline, 5 blink bar, 6 steady
             // bar. nvim/vi flip between block (normal) and bar (insert);
             // without this the cursor stayed a block everywhere.
-            ('q', false, " ") => {
-                match self.csi.get(0, 0) {
-                    0..=2 => self.screen.set_cursor_shape(CursorShape::Block),
-                    3 | 4 => self.screen.set_cursor_shape(CursorShape::Underline),
-                    5 | 6 => self.screen.set_cursor_shape(CursorShape::Bar),
-                    _ => {}
-                }
-            }
+            ('q', false, " ") => match self.csi.get(0, 0) {
+                0..=2 => self.screen.set_cursor_shape(CursorShape::Block),
+                3 | 4 => self.screen.set_cursor_shape(CursorShape::Underline),
+                5 | 6 => self.screen.set_cursor_shape(CursorShape::Bar),
+                _ => {}
+            },
 
             // Scrolling
             ('S', false, "") => self.screen.scroll_up(self.csi.get(0, 1) as usize), // SU
@@ -662,7 +660,7 @@ impl Parser {
                 self.screen.erase_display(self.csi.get(0, 0));
                 self.clear_flag = true;
             }
-            ('K', false, "") => self.screen.erase_line(self.csi.get(0, 0)),    // EL
+            ('K', false, "") => self.screen.erase_line(self.csi.get(0, 0)), // EL
 
             // Insert/Delete
             ('L', false, "") => self.screen.insert_lines(self.csi.get(0, 1) as usize), // IL

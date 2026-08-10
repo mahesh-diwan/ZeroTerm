@@ -111,7 +111,7 @@ impl Config {
             Config::default()
         };
 
-        if let Ok(overrides) = crate::lua::LuaEngine::evaluate(".zeroterm.lua") {
+        if let Ok(overrides) = crate::lua::evaluate(".zeroterm.lua") {
             config.apply_overrides(overrides);
         }
 
@@ -432,9 +432,15 @@ mod tests {
     #[test]
     fn lua_override_toggles_session_restore() {
         let mut config = Config::default();
-        config.apply_overrides(HashMap::from([("session.restore".to_string(), "true".into())]));
+        config.apply_overrides(HashMap::from([(
+            "session.restore".to_string(),
+            "true".into(),
+        )]));
         assert!(config.session.restore);
-        config.apply_overrides(HashMap::from([("restore_session".to_string(), "false".into())]));
+        config.apply_overrides(HashMap::from([(
+            "restore_session".to_string(),
+            "false".into(),
+        )]));
         assert!(!config.session.restore);
     }
 }

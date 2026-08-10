@@ -63,11 +63,8 @@ impl CellBatch {
         mut glyphs: impl FnMut(char) -> GlyphQuad,
     ) -> Vec<CellData> {
         let buffer = screen.buffer();
-        let (visible_rows, cols) = Self::clamp_dims(
-            buffer.len(),
-            buffer.first().map_or(0, Vec::len),
-            capacity,
-        );
+        let (visible_rows, cols) =
+            Self::clamp_dims(buffer.len(), buffer.first().map_or(0, Vec::len), capacity);
 
         let cursor = screen.cursor();
         let cursor_col = cursor.col;
@@ -316,7 +313,11 @@ mod tests {
             probe_glyphs,
         );
         let text = batch_text(&batch, 4, 3);
-        assert_eq!(text[0].trim_end(), "A", "scrollback row must map to view row 0");
+        assert_eq!(
+            text[0].trim_end(),
+            "A",
+            "scrollback row must map to view row 0"
+        );
         assert_eq!(text[1].trim_end(), "B");
         assert_eq!(text[2].trim_end(), "C");
     }

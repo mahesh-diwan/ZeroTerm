@@ -226,7 +226,10 @@ fn test_osc8_hyperlink_id_roundtrip_via_uri_lookup() {
 fn test_osc9_notification_is_drained() {
     let mut parser = Parser::new(80, 24);
     parser.parse(b"\x1b]9;build finished\x07");
-    assert_eq!(parser.take_notification().as_deref(), Some("build finished"));
+    assert_eq!(
+        parser.take_notification().as_deref(),
+        Some("build finished")
+    );
     assert_eq!(parser.take_notification(), None);
     // Windows Terminal urgency form: 9;0;text
     parser.parse(b"\x1b]9;0;errors\x07");
@@ -238,7 +241,10 @@ fn test_kitty_query_reply_when_supported() {
     let mut parser = Parser::new(80, 24);
     parser.set_kitty_supported(true);
     parser.parse(b"\x1b[?u");
-    assert_eq!(parser.take_response().as_deref(), Some(b"\x1b[?1u".as_slice()));
+    assert_eq!(
+        parser.take_response().as_deref(),
+        Some(b"\x1b[?1u".as_slice())
+    );
 }
 
 #[test]
