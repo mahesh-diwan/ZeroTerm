@@ -667,7 +667,11 @@ impl Renderer {
             current_view: None,
             current_encoder: None,
             needs_clear: false,
-            clear_color: [0.102, 0.106, 0.149],
+            // Derive the initial clear color from the theme (linearized,
+            // see theme_linear_bg) so the very first frame matches the
+            // background quads — the old hardcoded sRGB value flashed
+            // lighter than the painted bg (faint bands on expose).
+            clear_color: Self::theme_linear_bg(&crate::theme::Theme::tokyo_night()),
             opacity,
             theme: crate::theme::Theme::tokyo_night(),
             image_texture: Some(placeholder_tex),
