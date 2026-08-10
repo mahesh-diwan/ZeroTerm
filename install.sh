@@ -161,6 +161,7 @@ install_binary() {
 				extracted=$(find "${temp_dir}/squashfs-root" -type f -name "${BINARY_NAME}" -perm -u+x 2>/dev/null | head -1)
 				if [[ -n "$extracted" ]]; then
 					mkdir -p "${INSTALL_DIR}"
+					rm -f "${INSTALL_DIR}/${BINARY_NAME}"
 					cp "${extracted}" "${INSTALL_DIR}/${BINARY_NAME}"
 					chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 					log_success "Installed prebuilt ${appimage} to ${INSTALL_DIR}/${BINARY_NAME}"
@@ -210,8 +211,10 @@ install_binary() {
 		exit 1
 	fi
 
-	# Install
+	# Install (rm first so an upgrade from a symlink-style install replaces
+	# the destination instead of writing through to a misnamed target).
 	mkdir -p "${INSTALL_DIR}"
+	rm -f "${INSTALL_DIR}/${BINARY_NAME}"
 	cp "${binary_path}" "${INSTALL_DIR}/${BINARY_NAME}"
 	chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
 
