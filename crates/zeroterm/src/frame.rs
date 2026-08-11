@@ -76,18 +76,31 @@ pub fn tab_display_title(title: &str, pane_count: usize) -> String {
 
 /// Left-hand status-bar text. Shows a `[N/M]` tab badge (kitty's `{index}`
 /// convention, 1-based, clamped so an empty session never prints `1/0`), the
-/// active pane's title, and the short launch command in parentheses — so in a
-/// split the status line names both the tab and what it is. Example:
-/// `[2/4] bash (ssh host)`.
-pub fn status_left(title: &str, cmd: &str, tab_index: usize, tab_count: usize) -> String {
+/// active pane's title, the short launch command, and — when the last command
+/// reported an exit code (OSC 133;D) — a status chip: `✓ 0` on success, a red
+/// `✗ N` on failure. `exit: None` means no command has reported yet (chip
+/// hidden). Example: `[2/4] bash  bash  ✗ 127`.
+pub fn status_left(
+    title: &str,
+    cmd: &str,
+    tab_index: usize,
+    tab_count: usize,
+    exit: Option<i32>,
+) -> String {
     let badge = format!("[{}/{}]", tab_index + 1, tab_count.max(1));
-    if cmd.is_empty() {
-        format!("{badge} {title}")
+    let cmd_part = if cmd.is_empty() {
+        String::new()
     } else {
         // Drop argv noise (e.g. "bash -l" -> "bash") so the badge stays short.
         let short = cmd.split_whitespace().next().unwrap_or(cmd);
-        format!("{badge} {title}  {short}")
-    }
+        format!("  {short}")
+    };
+    let exit_part = match exit {
+        Some(0) => "  \u{2713} 0".to_string(), // ✓
+        Some(code) => format!("  \u{2717} {}", code), // ✗
+        None => String::new(),
+    };
+    format!("{badge} {title}{cmd_part}{exit_part}")
 }
 
 /// Right-hand status-bar text. Emits a mode marker when a modal overlay is
@@ -118,11 +131,15 @@ pub fn status_right(mode: Option<&str>, max_scroll: usize, scroll_offset: usize)
 /// The bell glyph is painted by `draw_tab_bar` from `TabInfo.activity`, NOT
 /// woven into `title`, so the title string and `tab_span` stay byte-identical
 /// for hit-testing (a wide bell glyph would skew the cell-count layout).
+// 8 params: two closures + the two hover states; grouping them would obscure
+// the call sites more than an allow does.
+#[allow(clippy::too_many_arguments)]
 pub fn tab_infos(
     ids: &[usize],
     active_pane: usize,
     titles: impl Fn(usize) -> String,
     activity: impl Fn(usize) -> bool,
+    failed: impl Fn(usize) -> bool,
     edit_display: Option<&str>,
     hovered: Option<usize>,
     close_hovered: bool,
@@ -136,6 +153,7 @@ pub fn tab_infos(
             active: id == active_pane,
             hovered: hovered == Some(id),
             activity: id != active_pane && activity(id),
+            failed: failed(id),
             close_hovered,
         })
         .collect()
@@ -182,10 +200,30 @@ mod tests {
 
     #[test]
     fn status_left_shows_badge_title_cmd() {
-        assert_eq!(status_left("bash", "bash -l", 0, 3), "[1/3] bash  bash");
-        assert_eq!(status_left("ssh host", "ssh", 2, 3), "[3/3] ssh host  ssh");
+        assert_eq!(
+            status_left("bash", "bash -l", 0, 3, None),
+            "[1/3] bash  bash"
+        );
+        assert_eq!(
+            status_left("ssh host", "ssh", 2, 3, None),
+            "[3/3] ssh host  ssh"
+        );
         // Empty cmd drops the parenthetical; empty session never divides by zero.
-        assert_eq!(status_left("bash", "", 0, 0), "[1/1] bash");
+        assert_eq!(status_left("bash", "", 0, 0, None), "[1/1] bash");
+    }
+
+    #[test]
+    fn status_left_exit_chip() {
+        assert_eq!(
+            status_left("bash", "bash -l", 0, 1, Some(0)),
+            "[1/1] bash  bash  \u{2713} 0"
+        );
+        assert_eq!(
+            status_left("bash", "bash -l", 0, 1, Some(127)),
+            "[1/1] bash  bash  \u{2717} 127"
+        );
+        // None (no command reported yet) hides the chip.
+        assert_eq!(status_left("bash", "", 0, 1, None), "[1/1] bash");
     }
 
     #[test]
@@ -212,6 +250,7 @@ mod tests {
             2,
             |id| format!("title{id}"),
             |_| false,
+            |_| false,
             None,
             Some(3),
             true,
@@ -231,6 +270,7 @@ mod tests {
             2,
             |id| format!("t{id}"),
             |id| id == 1,
+            |_| false,
             None,
             None,
             false,
@@ -240,6 +280,23 @@ mod tests {
             "inactive tab with bell should show activity"
         );
         assert!(!infos[1].activity, "active tab never shows activity");
+    }
+
+    #[test]
+    fn tab_infos_marks_failure_dot() {
+        // ids [1, 2], active pane 2: tab 1 has a failed pane (exit != 0).
+        let infos = tab_infos(
+            &[1, 2],
+            2,
+            |id| format!("t{id}"),
+            |_| false,
+            |id| id == 1,
+            None,
+            None,
+            false,
+        );
+        assert!(infos[0].failed, "tab with failed pane gets the red dot");
+        assert!(!infos[1].failed, "healthy tab has no dot");
     }
 
     #[test]
@@ -261,6 +318,7 @@ mod tests {
             &[1, 2],
             2,
             |id| format!("title{id}"),
+            |_| false,
             |_| false,
             Some("ls foo"),
             None,

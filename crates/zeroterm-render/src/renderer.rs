@@ -80,6 +80,9 @@ pub struct TabInfo {
     /// Latched bell on an inactive pane in this tab (kitty renders 🔔).
     /// The tab bar draws a bell glyph when true.
     pub activity: bool,
+    /// A pane in this tab reported a non-zero exit code (OSC 133;D). The tab
+    /// bar draws a red dot — a failure badge that survives low contrast.
+    pub failed: bool,
 }
 
 /// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
@@ -1154,12 +1157,20 @@ impl Renderer {
                 batch[sep_c].bg = sep;
             }
 
-            // Activity (bell) indicator: a small dot on the left padding
-            // cell of an inactive tab whose pane rung a bell. Painted as a
-            // glyph (not woven into `title`) so `tab_span` stays identical
-            // for hit-testing. Active tabs never show it (the bell is
-            // consumed by focusing the tab).
-            if tab.activity {
+            // Indicators on the left padding cell: a RED dot for a pane that
+            // exited non-zero (failure badge), else the accent bell dot for a
+            // latched bell on an inactive pane. Painted as a glyph (not woven
+            // into `title`) so `tab_span` stays identical for hit-testing.
+            // Failure wins over bell (a failed command is more important than
+            // a rung bell); the bell is consumed by focusing the tab.
+            let dot = if tab.failed {
+                Some(close_red)
+            } else if tab.activity {
+                Some(accent_fg)
+            } else {
+                None
+            };
+            if let Some(dot_fg) = dot {
                 let g = self
                     .glyph_atlas
                     .get_or_insert_glyph('●', &self.device, &self.queue);
@@ -1169,7 +1180,7 @@ impl Renderer {
                 cell.glyph_uv_max = [u1, v1];
                 cell.glyph_size = [g.width as f32, g.height as f32];
                 cell.glyph_offset = [g.offset_x, g.offset_y];
-                cell.fg = accent_fg;
+                cell.fg = dot_fg;
                 cell.attrs = 0;
             }
 

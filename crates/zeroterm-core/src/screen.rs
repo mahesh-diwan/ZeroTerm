@@ -92,6 +92,14 @@ pub struct Screen {
     link_ids: HashMap<String, u32>,
     current_link: u32,
     next_link_id: u32,
+    /// Working directory announced by the shell via OSC 7 (`file://host/path`).
+    /// Used by the status bar and new-tab seeding; None until a shell with
+    /// integration emits it.
+    cwd: Option<String>,
+    /// Exit code of the most recently finished command block (OSC 133;D or
+    /// the PTY wait fallback). Independent of the block list so a failed
+    /// command stays visible after a new block opens.
+    last_exit_code: Option<i32>,
 }
 
 impl Screen {
@@ -142,6 +150,8 @@ impl Screen {
             link_ids: HashMap::new(),
             current_link: 0,
             next_link_id: 1,
+            cwd: None,
+            last_exit_code: None,
         }
     }
 
@@ -1012,14 +1022,68 @@ impl Screen {
         }
     }
 
+    /// Set the pending command text. It lands on the NEXT block opened by
+    /// `mark_block_boundary` (the heuristic prompt-sigil model: the command
+    /// typed at one prompt belongs to the block that follows it).
     pub fn set_block_command(&mut self, cmd: &str) {
         self.current_block_command = cmd.to_string();
+    }
+
+    /// OSC 133;C path: the shell tells us the running command directly, so it
+    /// lands on the CURRENT open block (unlike the pending-command heuristic).
+    pub fn set_running_block_command(&mut self, cmd: &str) {
+        if let Some(block) = self.blocks.last_mut() {
+            if block.command.is_empty() {
+                block.command = cmd.to_string();
+            }
+        }
+        self.current_block_command = cmd.to_string();
+    }
+
+    /// OSC 133;D path: close the running block (end line + duration) without
+    /// opening a new one. `has_running_block` turns false after this. The
+    /// next `mark_block_boundary` (from OSC 133;A) opens the follow-up block.
+    pub fn finalize_block(&mut self) {
+        if let Some(block) = self.blocks.last_mut() {
+            if block.end_line.is_none() {
+                block.end_line = Some(self.cursor.row);
+            }
+            block.duration_ms = Some(block.timestamp.elapsed().as_millis() as u64);
+        }
     }
 
     pub fn set_block_exit_code(&mut self, code: i32) {
         if let Some(block) = self.blocks.last_mut() {
             block.exit_code = Some(code);
         }
+        // Sticky regardless of block bookkeeping: the status chip and tab
+        // badge read this even after a new block opens.
+        self.last_exit_code = Some(code);
+    }
+
+    /// Exit code of the most recently finished command, from OSC 133;D or the
+    /// PTY wait fallback. None when no command has reported an exit yet.
+    pub fn last_exit(&self) -> Option<i32> {
+        self.last_exit_code
+    }
+
+    /// Whether the most recent command block is still running (no OSC 133;A
+    /// has opened a new block since it started). Used for the running-block
+    /// gutter marker and confirm-on-close decisions.
+    pub fn has_running_block(&self) -> bool {
+        self.blocks
+            .last()
+            .is_some_and(|b| b.end_line.is_none())
+    }
+
+    /// Working directory announced via OSC 7 (`file://host/path`). The host
+    /// component is dropped; only the path is kept.
+    pub fn set_cwd(&mut self, path: &str) {
+        self.cwd = Some(path.to_string());
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
     }
 
     pub fn place_image(&mut self, rgba_data: Vec<u8>, width: u32, height: u32) -> u32 {

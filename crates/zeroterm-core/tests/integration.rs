@@ -475,6 +475,105 @@ fn test_set_block_exit_code() {
     }
 }
 
+// OSC 133 FinalTerm shell integration: A/B open blocks, C carries the
+// command text (with optional cmdline_url= prefix), D carries the exit code.
+
+#[test]
+fn test_osc133_exit_code() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]133;D;127\x07");
+    assert_eq!(p.screen().last_exit(), Some(127));
+}
+
+#[test]
+fn test_osc133_exit_code_positive() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]133;D;0\x07");
+    assert_eq!(p.screen().last_exit(), Some(0));
+}
+
+#[test]
+fn test_osc133_exit_code_without_code_finalizes() {
+    let mut p = setup(80, 24);
+    // D without a code must not clobber the last known exit.
+    p.parse(b"\x1b]133;D;3\x07");
+    assert_eq!(p.screen().last_exit(), Some(3));
+    p.parse(b"\x1b]133;D\x07");
+    assert_eq!(p.screen().last_exit(), Some(3));
+}
+
+#[test]
+fn test_osc133_blocks_and_command() {
+    let mut p = setup(80, 24);
+    // A (prompt) -> C (command text) -> D (exit code) -> A (next prompt).
+    p.parse(b"\x1b]133;A\x07\x1b]133;C;ls -la\x07\x1b]133;D;0\x07\x1b]133;A\x07");
+    let blocks = p.screen().blocks();
+    assert!(
+        blocks.len() >= 2,
+        "expected A to open a new block, got {}",
+        blocks.len()
+    );
+    let last = blocks.last().unwrap();
+    assert_eq!(last.command, "", "new block starts with no command");
+    // The block before the final A carried the command and exit code.
+    let prev = blocks[blocks.len() - 2].clone();
+    assert_eq!(prev.command, "ls -la");
+    assert_eq!(prev.exit_code, Some(0));
+    assert!(prev.end_line.is_some(), "D finalizes the block");
+    assert_eq!(p.screen().last_exit(), Some(0));
+}
+
+#[test]
+fn test_osc133_cmdline_url_prefix() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]133;C;cmdline_url=git status\x07");
+    let blocks = p.screen().blocks();
+    assert_eq!(blocks.last().map(|b| b.command.as_str()), None);
+    // C only sets the pending command; it lands on the NEXT block boundary.
+    p.screen_mut().mark_block_boundary();
+    let blocks = p.screen().blocks();
+    assert_eq!(blocks.last().map(|b| b.command.as_str()), Some("git status"));
+}
+
+#[test]
+fn test_osc7_cwd() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]7;file://localhost/home/user/My%20Dir\x07");
+    assert_eq!(p.screen().cwd(), Some("/home/user/My Dir"));
+}
+
+#[test]
+fn test_osc7_cwd_absolute_path() {
+    let mut p = setup(80, 24);
+    // `file:///path` — empty host, path starts right after the slashes.
+    p.parse(b"\x1b]7;file:///etc/ssh/sshd_config\x07");
+    assert_eq!(p.screen().cwd(), Some("/etc/ssh/sshd_config"));
+}
+
+#[test]
+fn test_has_running_block() {
+    let mut p = setup(80, 24);
+    assert!(!p.screen().has_running_block(), "no blocks yet");
+    p.parse(b"\x1b]133;A\x07");
+    assert!(p.screen().has_running_block(), "block open, no D yet");
+    p.parse(b"\x1b]133;D;0\x07");
+    assert!(
+        !p.screen().has_running_block(),
+        "D finalizes the running block"
+    );
+}
+
+#[test]
+fn test_reset_clears_exit_and_cwd() {
+    let mut p = setup(80, 24);
+    p.parse(b"\x1b]133;D;9\x07\x1b]7;file:///tmp\x07");
+    assert_eq!(p.screen().last_exit(), Some(9));
+    assert_eq!(p.screen().cwd(), Some("/tmp"));
+    p.parse(b"\x1bc"); // RIS
+    assert_eq!(p.screen().last_exit(), None);
+    assert_eq!(p.screen().cwd(), None);
+}
+
 // --------------------- DEC private modes (test at screen level) ---------------------
 // Note: \x1b[?...h/l not parsed correctly due to intermediates bug in parser.
 // These tests verify Screen methods directly.

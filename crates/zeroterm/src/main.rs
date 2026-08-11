@@ -1047,12 +1047,29 @@ impl App {
                 // Append the exit notice exactly once: pty_dead is sticky, so
                 // future drain calls skip this pane entirely. Previously every
                 // drain re-appended the notice, flooding the buffer on each
-                // RedrawRequested / KeyboardInput.
-                pane.parser.parse(if pane_count <= 1 {
-                    b"\r\n[Process exited] - exit to quit\r\n"
-                } else {
-                    b"\r\n[Process exited]\r\n"
-                });
+                // RedrawRequested / KeyboardInput. When the last command
+                // reported an exit code via OSC 133;D the notice carries it.
+                // Note: `exit N` at the prompt does not run PROMPT_COMMAND,
+                // so the code shown is the last *command's* status — the PTY
+                // wait() code is the only exact source and is a follow-up.
+                let exit = pane.parser.screen().last_exit();
+                let notice = match exit {
+                    Some(code) => {
+                        if pane_count <= 1 {
+                            format!("\r\n[Process exited (code {})] - exit to quit\r\n", code)
+                        } else {
+                            format!("\r\n[Process exited (code {})]\r\n", code)
+                        }
+                    }
+                    None => {
+                        if pane_count <= 1 {
+                            "\r\n[Process exited] - exit to quit\r\n".to_string()
+                        } else {
+                            "\r\n[Process exited]\r\n".to_string()
+                        }
+                    }
+                };
+                pane.parser.parse(notice.as_bytes());
             }
         }
         for id in &dead_panes {
@@ -1222,6 +1239,20 @@ impl App {
                 .iter()
                 .any(|&pid| self.session.panes.get(&pid).is_some_and(|p| p.bell_rung))
         };
+        // Per-tab exit-failure badge: any pane in the tab whose last command
+        // reported a non-zero exit code (OSC 133;D). Unlike the bell latch,
+        // it reflects live state — a successful command clears the dot.
+        let failed = |id: usize| {
+            self.session
+                .tab_panes(id)
+                .iter()
+                .any(|&pid| {
+                    self.session
+                        .panes
+                        .get(&pid)
+                        .is_some_and(|p| p.parser.screen().last_exit().is_some_and(|c| c != 0))
+                })
+        };
         let tab_infos = frame::tab_infos(
             &tab_ids,
             active_tab_id,
@@ -1230,6 +1261,7 @@ impl App {
                 frame::tab_display_title(&title, self.session.tab_pane_count(id))
             },
             activity,
+            failed,
             edit_display.as_deref(),
             self.hovered_tab,
             self.hovered_tab_close,
@@ -1339,6 +1371,7 @@ impl App {
             &active_cmd,
             self.session.active_tab,
             self.session.tabs.len(),
+            active_pane.and_then(|p| p.parser.screen().last_exit()),
         );
         let status_right = match &self.hover_link {
             Some(uri) => format!("🔗 {}", uri),

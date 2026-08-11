@@ -935,6 +935,66 @@ impl Parser {
         } else if let Some(payload) = osc.strip_prefix("1337;") {
             // iTerm2 inline image protocol
             self.handle_iterm_image(payload);
+        } else if let Some(payload) = osc.strip_prefix("133;") {
+            // Shell integration (FinalTerm/WezTerm/kitty block model):
+            //   OSC 133;A  prompt start      (close current block, open new)
+            //   OSC 133;B  command start     (input area begins)
+            //   OSC 133;C  command text      (optionally `cmdline_url=` prefixed)
+            //   OSC 133;D  command finished  (optionally `;exit_code` suffixed)
+            self.handle_osc133(payload);
+        } else if let Some(payload) = osc.strip_prefix("7;") {
+            // OSC 7 cwd: `7;file://host/path` (host usually empty).
+            if let Some(rest) = payload.strip_prefix("file://") {
+                // Drop the host component; keep everything from the first '/'
+                // (kitty/WezTerm emit `file://host/path` or `file:///path`).
+                let path = match rest.find('/') {
+                    Some(i) => &rest[i..],
+                    None => rest,
+                };
+                let decoded = percent_decode(path);
+                if !decoded.is_empty() {
+                    self.screen.set_cwd(&decoded);
+                }
+            }
+        }
+    }
+
+    /// OSC 133 FinalTerm shell-integration markers. `A`/`B` start a command
+    /// block (and close the previous one), `C` carries the command text,
+    /// `D` carries the exit code of the command that just finished.
+    fn handle_osc133(&mut self, payload: &str) {
+        match payload.as_bytes().first().copied() {
+            Some(b'A') | Some(b'B') => {
+                // Clear the pending command BEFORE the boundary so the new
+                // block starts clean (the running block keeps the command
+                // OSC 133;C wrote onto it directly).
+                self.screen.set_block_command("");
+                self.screen.mark_block_boundary();
+                // NOTE: a starship-style prompt also prints `$` at line start,
+                // which trips the after-newline sigil heuristic and opens a
+                // SECOND empty block per prompt. Harmless for exit codes (the
+                // sigil block is the one that receives 133;C commands and D
+                // codes) but block-nav should expect the occasional empty
+                // boundary when both heuristics are active.
+            }
+            Some(b'C') => {
+                let cmd = payload.get(2..).unwrap_or("");
+                let cmd = cmd.strip_prefix("cmdline_url=").unwrap_or(cmd);
+                self.screen.set_running_block_command(cmd);
+            }
+            Some(b'D') => {
+                // `D` or `D;127` — the exit code is everything after the ';'.
+                let code = payload
+                    .get(2..)
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                if let Some(code) = code {
+                    self.set_exit_code(code);
+                }
+                // D always finalizes the running block, with or without a
+                // code — a code-less D still closes the block.
+                self.screen.finalize_block();
+            }
+            _ => {}
         }
     }
 
@@ -1268,6 +1328,28 @@ fn png_dimensions(data: &[u8]) -> (u32, u32) {
     let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
     let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
     (w, h)
+}
+
+/// Decode percent-escapes (OSC 7 cwd paths: `%20` -> space, `%2F` -> `/`).
+/// Invalid escapes are kept literally; non-ASCII UTF-8 survives intact via
+/// lossy-from-bytes at the end (paths are usually ASCII, but stay correct
+/// either way).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {

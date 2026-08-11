@@ -85,6 +85,7 @@ optional `~/.zeroterm.lua` Lua script for advanced customization.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Competitor analysis](docs/COMPETITOR_ANALYSIS.md)
 - [Feature opportunities](docs/FEATURE_OPPORTUNITIES.md)
+- [UX, UI & robustness practices](docs/UX_UI_AND_ROBUSTNESS.md)
 
 ## Keyboard Shortcuts
 

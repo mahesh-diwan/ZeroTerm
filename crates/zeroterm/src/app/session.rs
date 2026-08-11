@@ -142,6 +142,16 @@ done
 # aliases/exports/banners and can corrupt starship's precmd ordering.
 if [ "$profile_loaded" -eq 0 ] && [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
 eval "$(starship init bash)"
+# ZeroTerm shell integration: OSC 133 command blocks + exit codes + OSC 7 cwd.
+# Runs first in PROMPT_COMMAND so \$? still holds the last command's status
+# (starship's own hook is chained after, so it sees the same exit code).
+__zeroterm_precmd() {
+  local code=$?
+  printf '\033]133;D;%s\007' "$code"
+  printf '\033]133;A\007'
+  printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "${PWD// /%20}"
+}
+PROMPT_COMMAND="__zeroterm_precmd;${PROMPT_COMMAND:-}"
 "#;
         let _ = std::fs::write(&boot, content);
         Some(vec![
@@ -161,6 +171,17 @@ if [ -f /etc/zprofile ]; then . /etc/zprofile; fi
 if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile"; fi
 if [ -f "$HOME/.zshrc" ]; then . "$HOME/.zshrc"; fi
 eval "$(starship init zsh)"
+# ZeroTerm shell integration: OSC 133 blocks + exit codes + OSC 7 cwd.
+__zeroterm_precmd() {
+  local code=$?
+  printf '\033]133;D;%s\007' "$code"
+  printf '\033]133;A\007'
+  printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "${PWD// /%20}"
+}
+# PREPEND (not append): starship's own precmd runs `starship prompt`, which
+# executes commands and resets \$? for every later hook. Running FIRST is what
+# lets us capture the real exit status of the last command.
+precmd_functions=(__zeroterm_precmd $precmd_functions)
 "#;
         let _ = std::fs::write(zdotdir.join(".zshrc"), content);
         env.push(("ZDOTDIR", zdotdir.to_string_lossy().into_owned()));
