@@ -99,13 +99,11 @@ pub struct TabInfo {
 /// Tab bar height in cell rows. draw_tab_bar and tab_bar_height() both use
 /// this; the content viewport offset in main.rs derives from tab_bar_height(),
 /// so a mismatch would draw the bar taller than the layout reserves.
-/// Chrome rows reserved above the grid: tab bar plus status bar. These are
-/// the single source of truth for spawn-time size estimates in the app crate
-/// (cells_for_size) so they can never drift from this layout.
-pub const TAB_BAR_ROWS: usize = 1;
-pub const STATUS_BAR_ROWS: usize = 1;
-/// Grid padding in physical pixels, ordered [left, right, top, bottom].
-pub const PADDING: [f32; 4] = [16.0, 16.0, 16.0, 16.0];
+/// Chrome geometry (TAB_BAR_ROWS / STATUS_BAR_ROWS / PADDING and the
+/// cols_for/rows_for/content_dims math) lives in `crate::chrome` — the single
+/// source of truth shared with the app crate's spawn-time size estimates, so
+/// the two can never drift.
+use crate::chrome::{PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -757,13 +755,11 @@ impl Renderer {
     }
 
     pub fn cols_for(&self, width: f32) -> usize {
-        let usable = width - self.padding[1] - self.padding[3];
-        (usable / self.cell_size[0]).floor().max(1.0) as usize
+        crate::chrome::cols_for(self.cell_size[0], width)
     }
 
     pub fn rows_for(&self, height: f32) -> usize {
-        let usable = height - self.padding[0] - self.padding[2];
-        (usable / self.cell_size[1]).floor().max(1.0) as usize
+        crate::chrome::rows_for(self.cell_size[1], height)
     }
 
     pub fn begin_frame(&mut self) -> Result<()> {

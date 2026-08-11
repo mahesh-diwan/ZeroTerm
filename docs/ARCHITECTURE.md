@@ -17,6 +17,15 @@ crates/
 └── zeroterm           — main binary: event loop, PTY threads, wiring
 ```
 
+The app binary is internally modular: `app/pane.rs` owns the PaneState
+(parser + pty channels) and the typed `PaneEvent` stream its drain produces;
+`app/spawn.rs` owns shell bootstrap + PTY/SSH spawning; `app/session.rs` owns
+the SessionManager (tabs/split trees); `render_boot.rs` owns the renderer-init
+supervisor (10s timeout, fresh-Instance retries, give-up title — pure
+`retry_policy` unit-tested); the render crate's `chrome.rs` is the single
+source of truth for chrome geometry shared by spawn estimates and the
+renderer layout.
+
 Dependency direction is one-way: `zeroterm` imports everything; `render`
 imports `core` and `config`; nothing depends on `zeroterm`.
 

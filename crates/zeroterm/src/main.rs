@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -35,8 +35,8 @@ use crate::app::selection;
 #[cfg(all(unix, feature = "ssh"))]
 use crate::app::spawn_ssh_process;
 use crate::app::{
-    block_output_text, word_left, word_right, EditAction, HostPicker, LineEditor, PaneState,
-    PtyCommand, SessionManager,
+    block_output_text, word_left, word_right, EditAction, HostPicker, LineEditor, PaneEvent,
+    PaneState, PtyCommand, SessionManager,
 };
 use crate::app::{spawn_pty_process, starship_setup};
 use crate::search::SearchState;
@@ -45,6 +45,7 @@ use crate::settings::{SettingsAction, SettingsContext, SettingsMenu};
 mod app;
 mod frame;
 mod overlay;
+mod render_boot;
 mod search;
 
 use overlay::Overlay;
@@ -208,19 +209,15 @@ fn should_focus_follow(
 /// final, smaller rect after insertion — a single prompt reprint per pane
 /// creation, inherent to splits and acceptable.)
 fn cells_for_size(tab_rows: usize, cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
-    use zeroterm_render::{PADDING, STATUS_BAR_ROWS};
-    // `tab_rows` is the EFFECTIVE tab-bar height (0 with a single tab — kitty
-    // tab_bar_min_tabs=2 — else 1), so the spawn estimate can never drift from
-    // the renderer layout even when the bar hides.
-    let chrome = (tab_rows + STATUS_BAR_ROWS) as f32 * cell_h;
-    let content_h = (size.height as f32 - chrome).max(0.0);
-    let cols = ((size.width as f32 - PADDING[1] - PADDING[3]) / cell_w)
-        .floor()
-        .max(1.0) as usize;
-    let rows = ((content_h - PADDING[0] - PADDING[2]) / cell_h)
-        .floor()
-        .max(1.0) as usize;
-    (cols, rows)
+    // Delegates to the render crate's chrome module — the single source of
+    // truth for chrome geometry shared with the renderer's own layout, so the
+    // spawn estimate can never drift from it (drift = startup resize storm =
+    // "prompt printed twice"). `tab_rows` is the EFFECTIVE tab-bar height (0
+    // with a single tab — kitty tab_bar_min_tabs=2 — else 1).
+    zeroterm_render::chrome::content_dims(cell_w, cell_h, tab_rows, [
+        size.width as f32,
+        size.height as f32,
+    ])
 }
 
 /// Remove a stale session layout file, if present. Called when session
@@ -355,105 +352,15 @@ impl App {
         // Deferred GPU init (boot speed): renderer builds on a background
         // thread so the window + PTY appear immediately. check_renderer_ready()
         // polls render_rx and, once the renderer arrives, resizes panes to the
-        // real measured glyph metrics.
-        let (render_tx, render_rx) = mpsc::channel();
-        let window_clone = window.clone();
-        let opacity = self.opacity;
-        let font_path = config.font.path.clone();
-        std::thread::spawn(move || {
-            zt("renderer supervisor start");
-            // Supervisor for the deferred GPU init. Renderer::new can stall for
-            // minutes (observed: adapter/device creation blocking on a loaded
-            // Intel iGPU, blocked on a kernel futex with zero CPU) or panic
-            // (wgpu treats validation errors as fatal). A stuck attempt must
-            // not keep the window dark forever, so after a 10s timeout a
-            // FRESH attempt starts with its own Instance — a new driver
-            // round-trip usually completes even when the previous one
-            // deadlocked (fresh attempts on this machine finish in ~0.4s).
-            // First success wins; late successes pile up in render_rx and are
-            // dropped. Abandoned stuck threads are leaked in that pathological
-            // case only, and a device that never presents is inert.
-            fn spawn_attempt(
-                window: std::sync::Arc<winit::window::Window>,
-                font_size: f32,
-                opacity: f64,
-                font_path: Option<String>,
-                render_tx: mpsc::Sender<zeroterm_render::Renderer>,
-                done_tx: mpsc::Sender<bool>,
-            ) {
-                std::thread::spawn(move || {
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        pollster::block_on(Renderer::new(window, font_size, opacity, font_path))
-                    }));
-                    match result {
-                        Ok(Ok(r)) => {
-                            let _ = render_tx.send(r);
-                            let _ = done_tx.send(true);
-                        }
-                        Ok(Err(e)) => {
-                            error!("Renderer init failed: {}", e);
-                            let _ = done_tx.send(false);
-                        }
-                        Err(p) => {
-                            let msg = p
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| p.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "unknown panic".into());
-                            error!("Renderer init panicked: {}", msg);
-                            let _ = done_tx.send(false);
-                        }
-                    }
-                });
-            }
-
-            let (done_tx, done_rx) = mpsc::channel::<bool>();
-            let mut attempts = 1u32;
-            let give_up_at = std::time::Instant::now() + std::time::Duration::from_secs(90);
-            spawn_attempt(
-                window_clone.clone(),
-                font_size,
-                opacity,
-                font_path.clone(),
-                render_tx.clone(),
-                done_tx.clone(),
-            );
-            loop {
-                match done_rx.recv_timeout(std::time::Duration::from_secs(10)) {
-                    Ok(true) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        warn!("Renderer init supervisor channel closed; giving up");
-                        break;
-                    }
-                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if std::time::Instant::now() >= give_up_at || attempts >= 9 {
-                            error!(
-                                "Renderer init gave up after {} attempts; window stays dark",
-                                attempts
-                            );
-                            window_clone.set_title("ZeroTerm — GPU init failed (restart)");
-                            break;
-                        }
-                        attempts += 1;
-                        warn!(
-                            "Renderer init attempt {}: previous attempt not done in 10s, \
-                             starting a fresh one",
-                            attempts
-                        );
-                        spawn_attempt(
-                            window_clone.clone(),
-                            font_size,
-                            opacity,
-                            font_path.clone(),
-                            render_tx.clone(),
-                            done_tx.clone(),
-                        );
-                    }
-                }
-            }
-            zt("renderer supervisor done");
-        });
-        self.renderer_rx = Some(render_rx);
+        // real measured glyph metrics. The retry/deadlock policy (10s timeout,
+        // fresh Instance per attempt, 9-attempt cap, give-up title) lives in
+        // render_boot — a deep module whose policy is unit-tested.
+        self.renderer_rx = Some(render_boot::spawn_renderer(
+            window.clone(),
+            self.font_size,
+            self.opacity,
+            self.font_path.clone(),
+        ));
 
         let size = window.inner_size();
         // Spawn the PTY at the EXACT size the renderer will use once ready:
@@ -1045,103 +952,112 @@ impl App {
         let mut dead_panes = Vec::new();
         let pane_count = self.session.panes.len();
         let mut notifications = Vec::new();
+        // `drain_events` classifies each pane's drain pass into typed events;
+        // this loop only APPLIES them (clipboard, kitty replies, notifications,
+        // bell, clear-flag viewport snap, title, sync mode, exit notices). The
+        // classification is a deep, unit-tested module (app/pane.rs); the
+        // application here is thin App glue.
         for (&id, pane) in &mut self.session.panes {
             if pane.pty_dead {
                 continue;
             }
-            let got = pane.drain();
-            if got {
-                if let Some(text) = pane.parser.take_clipboard_text() {
-                    if let Some(clipboard) = &mut self.clipboard {
-                        if let Err(e) = clipboard.set_text(text) {
-                            warn!("clipboard error: {}", e);
+            let (got, events) = pane.drain_events();
+            for event in events {
+                match event {
+                    PaneEvent::Clipboard(text) => {
+                        if let Some(clipboard) = &mut self.clipboard {
+                            if let Err(e) = clipboard.set_text(text) {
+                                warn!("clipboard error: {}", e);
+                            }
                         }
                     }
-                }
-                // Kitty protocol replies (CSI ? u) go back to the pane that
-                // asked; the parser can't write itself, so the app relays.
-                if let Some(resp) = pane.parser.take_response() {
-                    let _ = pane.pty_tx.send(PtyCommand::Write(resp));
-                }
-                // OSC 9 notification -> desktop notification (notify-send).
-                if let Some(msg) = pane.parser.take_notification() {
-                    let enabled = self
-                        .config
-                        .as_ref()
-                        .map_or(true, |c| c.terminal.notifications);
-                    if enabled {
-                        notifications.push(msg);
+                    // Kitty protocol replies (CSI ? u) go back to the pane
+                    // that asked; the parser can't write itself, so the app
+                    // relays.
+                    PaneEvent::Response(resp) => {
+                        let _ = pane.pty_tx.send(PtyCommand::Write(resp));
                     }
-                }
-                // Bell activity: latch on the pane so the tab bar can flag
-                // the inactive tab it belongs to (kitty's 🔔). Cleared when
-                // that tab gains focus (see set_active_pane / switch_to_tab).
-                if pane.parser.screen_mut().take_bell() {
-                    pane.bell_rung = true;
-                    // Visual bell (kitty visual_bell_duration): flash the
-                    // window background toward the selection color. 0 disables.
-                    let ms = self
-                        .config
-                        .as_ref()
-                        .map_or(150, |c| c.terminal.visual_bell_ms);
-                    if ms > 0 {
-                        self.bell_flash = Some(BellFlash::new(ms));
+                    // OSC 9 notification -> desktop notification (notify-send).
+                    PaneEvent::Notification(msg) => {
+                        let enabled = self
+                            .config
+                            .as_ref()
+                            .map_or(true, |c| c.terminal.notifications);
+                        if enabled {
+                            notifications.push(msg);
+                        }
                     }
-                }
-                // ED 2/3 (clear / clear-scrollback) invalidates the viewport:
-                // snap back to the bottom so `clear` and Ctrl+L behave like
-                // kitty (the old code left the view stranded in cleared
-                // scrollback). Only the active pane drives the shared offset.
-                if pane.parser.take_clear_flag() && id == active {
-                    self.session.scroll_offset = 0;
-                }
-                if id == active {
-                    let new_title = pane.parser.screen().title().to_string();
-                    if new_title != pane.title {
-                        pane.title = new_title.clone();
+                    // Bell activity: latched on the pane by drain_events so
+                    // the tab bar can flag the inactive tab it belongs to
+                    // (kitty's 🔔). Cleared when that tab gains focus (see
+                    // set_active_pane / switch_to_tab). The visual bell
+                    // (kitty visual_bell_duration) flash arms here. 0 disables.
+                    PaneEvent::Bell => {
+                        let ms = self
+                            .config
+                            .as_ref()
+                            .map_or(150, |c| c.terminal.visual_bell_ms);
+                        if ms > 0 {
+                            self.bell_flash = Some(BellFlash::new(ms));
+                        }
+                    }
+                    // ED 2/3 (clear / clear-scrollback) invalidates the
+                    // viewport: snap back to the bottom so `clear` and Ctrl+L
+                    // behave like kitty. Only the active pane drives the
+                    // shared offset.
+                    PaneEvent::ClearViewport if id == active => {
+                        self.session.scroll_offset = 0;
+                    }
+                    PaneEvent::Title(new_title) if id == active => {
                         title_changed = Some(new_title);
                     }
-                    if pane.parser.sync_output() {
-                        if !self.sync_active {
-                            self.sync_active = true;
-                            self.last_sync_clear = std::time::Instant::now();
+                    PaneEvent::SyncOutput(sync) if id == active => {
+                        if sync {
+                            if !self.sync_active {
+                                self.sync_active = true;
+                                self.last_sync_clear = std::time::Instant::now();
+                            }
+                        } else {
+                            self.sync_active = false;
                         }
-                    } else {
-                        self.sync_active = false;
+                        got_data = !self.sync_active;
                     }
-                    got_data = !self.sync_active;
-                } else {
-                    got_data = true;
+                    PaneEvent::Exited(exit) => {
+                        dead_panes.push(id);
+                        // Append the exit notice exactly once: pty_dead is
+                        // sticky, so future drains skip this pane entirely.
+                        // When the last command reported an exit code via
+                        // OSC 133;D the notice carries it. Note: `exit N` at
+                        // the prompt does not run PROMPT_COMMAND, so the code
+                        // shown is the last *command's* status — the PTY
+                        // wait() code is the only exact source and is a
+                        // follow-up.
+                        let notice = match exit {
+                            Some(code) => {
+                                if pane_count <= 1 {
+                                    format!(
+                                        "\r\n[Process exited (code {})] - exit to quit\r\n",
+                                        code
+                                    )
+                                } else {
+                                    format!("\r\n[Process exited (code {})]\r\n", code)
+                                }
+                            }
+                            None => {
+                                if pane_count <= 1 {
+                                    "\r\n[Process exited] - exit to quit\r\n".to_string()
+                                } else {
+                                    "\r\n[Process exited]\r\n".to_string()
+                                }
+                            }
+                        };
+                        pane.parser.parse(notice.as_bytes());
+                    }
+                    _ => {}
                 }
             }
-            if pane.pty_dead {
-                dead_panes.push(id);
-                // Append the exit notice exactly once: pty_dead is sticky, so
-                // future drain calls skip this pane entirely. Previously every
-                // drain re-appended the notice, flooding the buffer on each
-                // RedrawRequested / KeyboardInput. When the last command
-                // reported an exit code via OSC 133;D the notice carries it.
-                // Note: `exit N` at the prompt does not run PROMPT_COMMAND,
-                // so the code shown is the last *command's* status — the PTY
-                // wait() code is the only exact source and is a follow-up.
-                let exit = pane.parser.screen().last_exit();
-                let notice = match exit {
-                    Some(code) => {
-                        if pane_count <= 1 {
-                            format!("\r\n[Process exited (code {})] - exit to quit\r\n", code)
-                        } else {
-                            format!("\r\n[Process exited (code {})]\r\n", code)
-                        }
-                    }
-                    None => {
-                        if pane_count <= 1 {
-                            "\r\n[Process exited] - exit to quit\r\n".to_string()
-                        } else {
-                            "\r\n[Process exited]\r\n".to_string()
-                        }
-                    }
-                };
-                pane.parser.parse(notice.as_bytes());
+            if got && id != active {
+                got_data = true;
             }
         }
         for id in &dead_panes {
@@ -3544,11 +3460,11 @@ mod tests {
 
     #[test]
     fn pane_drain_marks_dead_on_disconnect() {
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
         let mut pane = PaneState {
             parser: Parser::new(10, 5),
             pty_rx: rx,
-            pty_tx: mpsc::channel().0,
+            pty_tx: std::sync::mpsc::channel().0,
             title: String::new(),
             pane_cmd: String::new(),
             pty_dead: false,
@@ -3567,14 +3483,14 @@ mod tests {
     #[test]
     fn drain_pty_appends_exit_notice_exactly_once() {
         let mut app = App::new();
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
         drop(tx); // pty already gone -> Disconnected on first drain
         app.session.panes.insert(
             0,
             PaneState {
                 parser: Parser::new(10, 5),
                 pty_rx: rx,
-                pty_tx: mpsc::channel().0,
+                pty_tx: std::sync::mpsc::channel().0,
                 title: String::new(),
                 pane_cmd: String::new(),
                 pty_dead: false,

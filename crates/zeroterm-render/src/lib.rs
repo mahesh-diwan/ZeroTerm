@@ -2,15 +2,15 @@
 
 pub mod atlas;
 mod cell_batch;
+pub mod chrome;
 mod diag;
 mod pass;
 pub mod renderer;
 pub mod theme;
 
 pub use atlas::estimate_cell_size;
-pub use renderer::{
-    tab_span, Renderer, SearchMatch, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS,
-};
+pub use chrome::{PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
+pub use renderer::{tab_span, Renderer, SearchMatch, Selection, TabInfo};
 
 pub struct RenderConfig {
     pub font_size: f32,
