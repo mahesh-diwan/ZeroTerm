@@ -117,10 +117,10 @@ struct App {
     event_proxy: Option<EventLoopProxy<()>>,
     #[cfg(feature = "plugins")]
     plugins: HashMap<String, Plugin>,
-    // Local line editor for the active pane (Alt+E): owns the editing buffer,
-    // history navigation and AI completion. While active, keys are intercepted
-    // here (not forwarded to the shell) and printable text is absorbed into
-    // the buffer until Enter submits the line or Esc discards it.
+    // Local line editor for the active pane (Alt+E): owns the editing buffer
+    // and history navigation. While active, keys are intercepted here (not
+    // forwarded to the shell) and printable text is absorbed into the buffer
+    // until Enter submits the line or Esc discards it.
     editor: LineEditor,
     // When render() failed to present a frame (surface timeout / occluded),
     // schedules a bounded retry so the window repaints as soon as the surface
@@ -1248,8 +1248,7 @@ impl App {
         // One pill per CLASSIC tab (not per pane), in tab order. While
         // editing, the active tab shows the live buffer instead of the shell
         // title. Editing is bound to the active pane and cleared on any tab
-        // switch, so this is only ever the pane that owns the editor. A
-        // pending AI completion appends a ghost suffix after the cursor marker.
+        // switch, so this is only ever the pane that owns the editor.
         let tab_ids: Vec<usize> = self.session.tabs.iter().map(|t| t.id).collect();
         let active_tab_id = tab_ids.get(self.session.active_tab).copied().unwrap_or(0);
         let edit_display = self.editor.is_active().then(|| self.editor.display_line());
@@ -3248,7 +3247,7 @@ mod tests {
 
     #[test]
     fn editing_tab_inserts_tab_without_completion() {
-        // No AI client (App::new) and no staged/requested completion: Tab must
+        // No pending completion in the editor state: Tab must
         // fall back to inserting a literal tab, never a panic or a no-op.
         let mut app = App::new();
         app.editor.start("ab");

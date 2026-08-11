@@ -291,7 +291,8 @@ impl EditingState {
     }
 
     /// Tab-title rendering: prompt + buffer with a block cursor at the edit
-    /// position, optionally followed by a ghost suffix (pending completion).
+    /// position, optionally followed by a `suffix` rendered past the cursor
+    /// (production callers pass an empty suffix; tests preview text past it).
     /// Embedded newlines render as the visible escape `\n` (one line fits the
     /// tab title). Vi-normal mode tags the title `[vi]`.
     pub fn display_with_suffix(&self, suffix: &str) -> String {
