@@ -7,6 +7,7 @@
 //! as the settings overlay).
 
 use zeroterm_core::screen::Screen;
+use zeroterm_render::SearchMatch;
 
 use crate::overlay::{Overlay, ScreenScratch};
 
@@ -14,8 +15,11 @@ use crate::overlay::{Overlay, ScreenScratch};
 pub struct SearchState {
     pub open: bool,
     pub query: String,
-    /// Global row indices (0 = top of scrollback) that match `query`.
-    pub matches: Vec<usize>,
+    /// Every in-buffer occurrence of `query`: global row + column span (0 =
+    /// top of scrollback). The renderer tints these in place while search is
+    /// open (kitty-style), so the user sees all matches, not just the viewport
+    /// jump.
+    pub matches: Vec<SearchMatch>,
     /// Index into `matches` of the currently highlighted match.
     pub current: usize,
     /// Snapshot of the covered (bottom) screen row, restored on close.
@@ -41,6 +45,8 @@ impl SearchState {
     }
 
     /// Re-scan the screen for `query` and point `current` at the first match.
+    /// Records every occurrence (kitty highlights all of them in place), not
+    /// just the first per row: a row with three hits contributes three spans.
     pub fn find(&mut self, screen: &Screen) {
         self.matches.clear();
         self.current = 0;
@@ -51,9 +57,21 @@ impl SearchState {
         // Exclude the last row: the search bar itself is drawn there.
         let total_rows = (screen.scrollback().len() + screen.buffer().len()).saturating_sub(1);
         for r in 0..total_rows {
-            let line = self.row_text(screen, r);
-            if line.to_lowercase().contains(&q) {
-                self.matches.push(r);
+            let line = self.row_text(screen, r).to_lowercase();
+            let mut search_from = 0;
+            while let Some(rel) = line[search_from..].find(&q) {
+                let start = search_from + rel;
+                self.matches.push(SearchMatch {
+                    row: r,
+                    start,
+                    end: start + q.len(),
+                });
+                // Advance past this occurrence (a zero-length query already
+                // bailed above, so this always progresses).
+                search_from = start + q.len().max(1);
+                if start >= line.len() {
+                    break;
+                }
             }
         }
     }
@@ -76,7 +94,17 @@ impl SearchState {
 
     /// Global row of the currently highlighted match, if any.
     pub fn current_row(&self) -> Option<usize> {
-        self.matches.get(self.current).copied()
+        self.matches.get(self.current).map(|m| m.row)
+    }
+
+    /// Current match + its index, for the renderer's in-place highlight.
+    /// None while search is closed or nothing matches.
+    pub fn highlight(&self) -> Option<(&[SearchMatch], usize)> {
+        if self.open && !self.query.is_empty() && !self.matches.is_empty() {
+            Some((&self.matches, self.current))
+        } else {
+            None
+        }
     }
 
     fn row_text(&self, screen: &Screen, global_row: usize) -> String {
@@ -164,12 +192,41 @@ mod tests {
         let screen = screen_with(&["hello world", "goodbye", "HELLO there", "/ search bar"]);
         s.query = "hello".into();
         s.find(&screen);
-        assert_eq!(s.matches, vec![0, 2]);
+        assert_eq!(
+            s.matches,
+            vec![
+                SearchMatch { row: 0, start: 0, end: 5 },
+                SearchMatch { row: 2, start: 0, end: 5 },
+            ]
+        );
         assert_eq!(s.current_row(), Some(0));
         assert!(s.next());
         assert_eq!(s.current_row(), Some(2));
         assert!(s.next());
         assert_eq!(s.current_row(), Some(0));
+    }
+
+    #[test]
+    fn find_records_every_occurrence_per_row() {
+        let mut s = SearchState::default();
+        let screen = screen_with(&["aa aa aa", "bbb", "/ search bar"]);
+        s.query = "aa".into();
+        s.find(&screen);
+        // Three occurrences in row 0 at cols 0, 3, 6; nothing in row 1.
+        assert_eq!(
+            s.matches,
+            vec![
+                SearchMatch { row: 0, start: 0, end: 2 },
+                SearchMatch { row: 0, start: 3, end: 5 },
+                SearchMatch { row: 0, start: 6, end: 8 },
+            ]
+        );
+        assert_eq!(s.matches.len(), 3);
+        // highlight() is the render gate: it requires the overlay to be open.
+        assert!(s.highlight().is_none());
+        s.open = true;
+        assert!(s.highlight().is_some());
+        assert_eq!(s.highlight().unwrap().1, 0);
     }
 
     #[test]

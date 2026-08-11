@@ -58,6 +58,15 @@ pub struct TerminalConfig {
     /// OSC 8 hyperlinks: hover shows the URL in the status bar and click opens
     /// it with the system handler (xdg-open).
     pub hyperlinks: bool,
+    /// Visual bell (kitty `visual_bell_duration`): on BEL the terminal
+    /// background flashes toward the selection color for this many ms, fading
+    /// in and out. 0 disables. On by default so a bell is never silent.
+    #[serde(default = "default_visual_bell_ms")]
+    pub visual_bell_ms: u64,
+}
+
+fn default_visual_bell_ms() -> u64 {
+    150
 }
 
 impl Default for TerminalConfig {
@@ -66,6 +75,7 @@ impl Default for TerminalConfig {
             kitty_keyboard: true,
             notifications: true,
             hyperlinks: true,
+            visual_bell_ms: default_visual_bell_ms(),
         }
     }
 }
@@ -195,6 +205,9 @@ impl Config {
                 }
                 "hyperlinks" | "terminal.hyperlinks" => {
                     self.terminal.hyperlinks = value.parse().unwrap_or(true);
+                }
+                "visual_bell_ms" | "terminal.visual_bell_ms" => {
+                    self.terminal.visual_bell_ms = value.parse().unwrap_or(150);
                 }
                 _ => {}
             }
@@ -367,6 +380,7 @@ mod tests {
         assert!(t.kitty_keyboard);
         assert!(t.notifications);
         assert!(t.hyperlinks);
+        assert_eq!(t.visual_bell_ms, 150);
     }
 
     #[test]
@@ -384,11 +398,31 @@ mod tests {
         let mut config = Config::default();
         config.terminal.kitty_keyboard = false;
         config.terminal.notifications = false;
+        config.terminal.visual_bell_ms = 400;
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert!(!parsed.terminal.kitty_keyboard);
         assert!(!parsed.terminal.notifications);
         assert!(parsed.terminal.hyperlinks);
+        assert_eq!(parsed.terminal.visual_bell_ms, 400);
+    }
+
+    #[test]
+    fn terminal_config_without_new_keys_uses_defaults() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("terminal");
+        let parsed: Config = table.try_into().unwrap();
+        assert_eq!(parsed.terminal.visual_bell_ms, 150);
+    }
+
+    #[test]
+    fn terminal_visual_bell_override_applies() {
+        let mut config = Config::default();
+        config.apply_overrides(HashMap::from([
+            ("terminal.visual_bell_ms".to_string(), "0".into()),
+        ]));
+        assert_eq!(config.terminal.visual_bell_ms, 0);
     }
 
     #[test]

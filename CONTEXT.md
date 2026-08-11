@@ -79,7 +79,9 @@ else — prefer the canonical term.
 ## Window chrome
 
 - **Tab bar** — the single-cell strip at the top of the window: one pill per
-  tab with separators, a close glyph, and activity/failure dots.
+  tab with separators, a close glyph, and activity/failure dots. Hidden while
+  only one tab exists (kitty `tab_bar_min_tabs`), so a single pane gets the
+  full grid height.
 - **Status bar** — the single-cell strip at the bottom: active pane title,
   the exit chip (✓/✗), the hovered hyperlink URI, the scroll indicator, and
   the active overlay mode marker.
@@ -98,3 +100,10 @@ else — prefer the canonical term.
   shells are unaffected.
 - **Notifications** — desktop notifications for the notification escape
   (OSC 9); bursts are collapsed and capped.
+- **Search match** — one in-buffer occurrence of the search query: a column
+  span on a global row. While search is open, every match is highlighted in
+  place; the current match reads brighter.
+- **Visual bell** — the background flash shown when the shell rings the bell
+  (kitty `visual_bell_duration`): the background fades toward the selection
+  color and back over `[terminal] visual_bell_ms`; the tab dot still marks
+  inactive tabs.

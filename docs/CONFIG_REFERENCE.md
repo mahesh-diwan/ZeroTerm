@@ -66,6 +66,8 @@ restore = false              # re-open last session's tabs on launch
 kitty_keyboard = true        # kitty keyboard protocol (CSI-u) for nvim/readline 8.2+
 notifications = true         # OSC 9 -> native desktop notifications
 hyperlinks = true            # OSC 8 hyperlinks: hover in status bar, click to open
+visual_bell_ms = 150         # visual bell: flash the background toward the selection color
+                             # on BEL (kitty visual_bell_duration); 0 disables
 ```
 
 ## Section Reference
@@ -170,6 +172,7 @@ the window.
 | `kitty_keyboard` | bool | `true`  | Optional (serde-default); advertise + emit kitty keyboard protocol (CSI-u) sequences           |
 | `notifications`  | bool | `true`  | Optional (serde-default); OSC 9 desktop notifications (`notify-send` / `osascript`)             |
 | `hyperlinks`     | bool | `true`  | Optional (serde-default); OSC 8 hyperlinks — hover shows the URL, click opens it                |
+| `visual_bell_ms` | int  | `150`   | Optional (serde-default); visual bell (kitty `visual_bell_duration`) — on BEL the background flashes toward the theme's selection color and fades back; `0` disables |
 
 The whole `[terminal]` section is optional and may be omitted entirely; every key
 is opt-**out** (all default `true`). `kitty_keyboard` makes ZeroTerm answer

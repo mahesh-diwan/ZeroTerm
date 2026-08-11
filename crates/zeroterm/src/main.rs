@@ -130,6 +130,47 @@ struct App {
     /// ~20 Hz instead of a tight spin (a spin starves the background
     /// renderer-init thread and delays the first frame by minutes on iGPUs).
     last_init_poll: std::time::Instant,
+    /// Visual bell (kitty `visual_bell_duration`): set on BEL, the background
+    /// flashes toward the selection color until the flash elapses.
+    bell_flash: Option<BellFlash>,
+}
+
+/// Visual-bell flash state: the background lerps toward the selection color,
+/// peaking mid-flash, then fades back (kitty eases the same way).
+struct BellFlash {
+    start: std::time::Instant,
+    duration: std::time::Duration,
+}
+
+impl BellFlash {
+    fn new(ms: u64) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            duration: std::time::Duration::from_millis(ms),
+        }
+    }
+
+    /// 0 at the start/end, 1 at the midpoint — the fade in/out envelope.
+    fn alpha(&self) -> f32 {
+        let t = (self.start.elapsed().as_secs_f32() / self.duration.as_secs_f32().max(0.001))
+            .clamp(0.0, 1.0);
+        1.0 - (2.0 * t - 1.0).abs()
+    }
+
+    fn done(&self) -> bool {
+        self.start.elapsed() >= self.duration
+    }
+}
+
+/// Lerp `base` toward `flash` by `alpha` — the visual-bell background. Pure so
+/// it is unit-testable.
+fn bell_flash_color(base: [f32; 4], flash: [f32; 4], alpha: f32) -> [f32; 4] {
+    [
+        base[0] + (flash[0] - base[0]) * alpha,
+        base[1] + (flash[1] - base[1]) * alpha,
+        base[2] + (flash[2] - base[2]) * alpha,
+        base[3],
+    ]
 }
 
 // Split an accumulated pixel-wheel scroll into whole lines to apply (up/down)
@@ -166,9 +207,12 @@ fn should_focus_follow(
 /// startup resize storm. (Split/SSH panes still receive one resize to their
 /// final, smaller rect after insertion — a single prompt reprint per pane
 /// creation, inherent to splits and acceptable.)
-fn cells_for_size(cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
-    use zeroterm_render::{PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS};
-    let chrome = (TAB_BAR_ROWS + STATUS_BAR_ROWS) as f32 * cell_h;
+fn cells_for_size(tab_rows: usize, cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
+    use zeroterm_render::{PADDING, STATUS_BAR_ROWS};
+    // `tab_rows` is the EFFECTIVE tab-bar height (0 with a single tab — kitty
+    // tab_bar_min_tabs=2 — else 1), so the spawn estimate can never drift from
+    // the renderer layout even when the bar hides.
+    let chrome = (tab_rows + STATUS_BAR_ROWS) as f32 * cell_h;
     let content_h = (size.height as f32 - chrome).max(0.0);
     let cols = ((size.width as f32 - PADDING[1] - PADDING[3]) / cell_w)
         .floor()
@@ -230,6 +274,7 @@ impl App {
             editor: LineEditor::new(),
             render_failed_at: None,
             last_init_poll: std::time::Instant::now(),
+            bell_flash: None,
         }
     }
 
@@ -422,7 +467,9 @@ impl App {
         let dpr = window.scale_factor().max(0.5) as f32; // same clamp as Renderer::new
         let (cell_w, cell_h) =
             zeroterm_render::estimate_cell_size(font_size * dpr, self.font_path.as_deref());
-        let (cols, rows) = cells_for_size(cell_w, cell_h, size);
+        // First spawn with a single tab: the tab bar is hidden (kitty
+        // tab_bar_min_tabs=2), so the estimate reserves 0 chrome rows for it.
+        let (cols, rows) = cells_for_size(0, cell_w, cell_h, size);
 
         let shell = config.shell.program.clone();
         let shell_args = config.shell.args.clone();
@@ -685,7 +732,10 @@ impl App {
                     )
                 }
             };
-            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
+            // New-tab/split/SSH spawns: the tab bar is (or becomes) visible,
+            // so reserve its row in the estimate; resize_panes_to_rects is the
+            // single source of truth for the final size either way.
+            let (cols, rows) = cells_for_size(1, cell_w, cell_h, size);
 
             let (pty_rx, pty_tx) = {
                 let (shell, shell_args, starship_env) =
@@ -746,7 +796,10 @@ impl App {
                     )
                 }
             };
-            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
+            // New-tab/split/SSH spawns: the tab bar is (or becomes) visible,
+            // so reserve its row in the estimate; resize_panes_to_rects is the
+            // single source of truth for the final size either way.
+            let (cols, rows) = cells_for_size(1, cell_w, cell_h, size);
 
             let (pty_rx, pty_tx) = {
                 let (shell, shell_args, starship_env) =
@@ -890,7 +943,10 @@ impl App {
                     )
                 }
             };
-            let (cols, rows) = cells_for_size(cell_w, cell_h, size);
+            // New-tab/split/SSH spawns: the tab bar is (or becomes) visible,
+            // so reserve its row in the estimate; resize_panes_to_rects is the
+            // single source of truth for the final size either way.
+            let (cols, rows) = cells_for_size(1, cell_w, cell_h, size);
 
             let key_path = self
                 .config
@@ -1022,6 +1078,15 @@ impl App {
                 // that tab gains focus (see set_active_pane / switch_to_tab).
                 if pane.parser.screen_mut().take_bell() {
                     pane.bell_rung = true;
+                    // Visual bell (kitty visual_bell_duration): flash the
+                    // window background toward the selection color. 0 disables.
+                    let ms = self
+                        .config
+                        .as_ref()
+                        .map_or(150, |c| c.terminal.visual_bell_ms);
+                    if ms > 0 {
+                        self.bell_flash = Some(BellFlash::new(ms));
+                    }
                 }
                 // ED 2/3 (clear / clear-scrollback) invalidates the viewport:
                 // snap back to the bottom so `clear` and Ctrl+L behave like
@@ -1237,13 +1302,34 @@ impl App {
         let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
             return Ok(());
         };
+        // kitty tab_bar_min_tabs=2: the bar only shows with more than one tab;
+        // sync before any chrome math so grids get the extra row.
+        renderer.set_tab_bar_visible(self.session.tabs.len() > 1);
         let win_size = window.inner_size();
         let tab_h = renderer.tab_bar_height();
         let status_h = renderer.status_bar_height();
         let content_h = (win_size.height as f32 - tab_h - status_h).max(0.0);
 
+        // In-buffer search highlight (kitty): all matches tinted in place. The
+        // matches are computed against the ACTIVE pane's screen, so they only
+        // render on the active pane — never on sibling panes.
+        let search = self.search.highlight();
+
         renderer.begin_frame()?;
-        renderer.draw_background(renderer.theme_bg())?;
+        // Visual bell: while the flash is active the background lerps toward
+        // the selection color (kitty visual_bell_duration/visual_bell_color).
+        let bg = match &self.bell_flash {
+            Some(flash) if !flash.done() => bell_flash_color(
+                renderer.theme_bg(),
+                renderer.selection_bg(),
+                flash.alpha(),
+            ),
+            _ => {
+                self.bell_flash = None;
+                renderer.theme_bg()
+            }
+        };
+        renderer.draw_background(bg)?;
 
         // One pill per CLASSIC tab (not per pane), in tab order. While
         // editing, the active tab shows the live buffer instead of the shell
@@ -1320,6 +1406,7 @@ impl App {
                         0
                     },
                     if is_active { self.selection } else { None },
+                    if is_active { search } else { None },
                 )?;
             }
         } else {
@@ -1341,6 +1428,7 @@ impl App {
                         0
                     },
                     if is_active { self.selection } else { None },
+                    if is_active { search } else { None },
                 )?;
             }
         }
@@ -1365,6 +1453,7 @@ impl App {
                         0
                     },
                     if is_active { self.selection } else { None },
+                    if is_active { search } else { None },
                 )?;
             }
         }
@@ -1427,9 +1516,13 @@ impl App {
 
     /// Resize every split-tree pane's parser + pty to its rect dims.
     fn resize_panes_to_rects(&mut self) {
-        let (Some(renderer), Some(window)) = (&self.renderer, &self.window) else {
+        let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) else {
             return;
         };
+        // Sync the tab-bar visibility (kitty tab_bar_min_tabs) at the single
+        // choke point every structural change funnels through, so chrome math
+        // and the renderer never disagree on the reserved row.
+        renderer.set_tab_bar_visible(self.session.tabs.len() > 1);
         let size = window.inner_size();
         let tab_h = renderer.tab_bar_height();
         let status_h = renderer.status_bar_height();
@@ -3414,10 +3507,39 @@ mod tests {
         // live: 946x501 at 10x22 cells -> 91 cols x 19 rows). Chrome = 2 rows
         // (1 tab + 1 status), padding 16px per side. If the shared constants
         // drift, this fails.
-        let (cols, rows) = cells_for_size(10.0, 22.0, PhysicalSize::new(946, 501));
+        let (cols, rows) = cells_for_size(1, 10.0, 22.0, PhysicalSize::new(946, 501));
         assert_eq!((cols, rows), (91, 19));
         // Degenerate windows clamp to >= 1 col/row like cols_for/rows_for.
-        assert_eq!(cells_for_size(10.0, 22.0, PhysicalSize::new(5, 5)), (1, 1));
+        assert_eq!(cells_for_size(1, 10.0, 22.0, PhysicalSize::new(5, 5)), (1, 1));
+    }
+
+    #[test]
+    fn bell_flash_lerps_toward_flash_color() {
+        let base = [0.0, 0.0, 0.0, 1.0];
+        let flash = [1.0, 0.0, 0.0, 1.0];
+        assert_eq!(bell_flash_color(base, flash, 0.0), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(bell_flash_color(base, flash, 1.0), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(bell_flash_color(base, flash, 0.5), [0.5, 0.0, 0.0, 1.0]);
+        // Alpha rides along unchanged (opacity is applied elsewhere).
+        assert_eq!(bell_flash_color(base, flash, 0.25)[3], 1.0);
+    }
+
+    #[test]
+    fn bell_flash_envelope_peaks_at_midpoint_and_expires() {
+        // At t=0 and t=duration the flash is fully off; at the midpoint it is
+        // fully on (kitty eases the visual bell the same way).
+        let flash = BellFlash::new(100);
+        assert!(flash.alpha() < 0.01, "starts at 0, got {}", flash.alpha());
+
+        let mut mid = BellFlash::new(100);
+        mid.start -= std::time::Duration::from_millis(50);
+        // A few microseconds of drift make this 0.9999…, not exactly 1.0.
+        assert!((mid.alpha() - 1.0).abs() < 0.001, "peaks at 1, got {}", mid.alpha());
+
+        let mut done = BellFlash::new(100);
+        done.start -= std::time::Duration::from_millis(200);
+        assert!(done.done());
+        assert_eq!(done.alpha(), 0.0);
     }
 
     #[test]

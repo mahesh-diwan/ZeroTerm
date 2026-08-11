@@ -12,6 +12,10 @@ pub struct Theme {
     pub border: Color,
     pub accent: Color,
     pub selection_bg: Color,
+    /// In-place search-match highlight (kitty `search_match_background`): a
+    /// muted tone for every match in the buffer while search is open. The
+    /// CURRENT match reuses `selection_bg` so it reads brighter.
+    pub search_match_bg: Color,
     pub ansi: [Color; 16],
 }
 
@@ -26,6 +30,7 @@ impl Theme {
             border: Color::rgb(0x24, 0x28, 0x3b),
             accent: Color::rgb(0x7a, 0xa2, 0xf7),
             selection_bg: Color::rgb(0x28, 0x34, 0x57),
+            search_match_bg: Color::rgb(0x4d, 0x44, 0x2e),
             ansi: [
                 Color::rgb(0x15, 0x16, 0x1e),
                 Color::rgb(0xf7, 0x76, 0x8e),
@@ -57,6 +62,7 @@ impl Theme {
             border: Color::rgb(0x45, 0x47, 0x5a),
             accent: Color::rgb(0x89, 0xb4, 0xfa),
             selection_bg: Color::rgb(0x45, 0x47, 0x5a),
+            search_match_bg: Color::rgb(0x4a, 0x43, 0x2e),
             ansi: [
                 Color::rgb(0x45, 0x47, 0x5a),
                 Color::rgb(0xf3, 0x8b, 0xa8),
@@ -88,6 +94,7 @@ impl Theme {
             border: Color::rgb(0x44, 0x44, 0x4a),
             accent: Color::rgb(0xbd, 0x93, 0xf9),
             selection_bg: Color::rgb(0x44, 0x44, 0x4a),
+            search_match_bg: Color::rgb(0x4a, 0x41, 0x2e),
             ansi: [
                 Color::rgb(0x00, 0x00, 0x00),
                 Color::rgb(0xff, 0x55, 0x55),
@@ -119,6 +126,7 @@ impl Theme {
             border: Color::rgb(0x50, 0x49, 0x45),
             accent: Color::rgb(0xfa, 0xbd, 0x2f),
             selection_bg: Color::rgb(0x50, 0x49, 0x45),
+            search_match_bg: Color::rgb(0x4a, 0x3a, 0x1c),
             ansi: [
                 Color::rgb(0x1d, 0x20, 0x21),
                 Color::rgb(0xfb, 0x49, 0x34),
@@ -150,6 +158,7 @@ impl Theme {
             border: Color::rgb(0x43, 0x48, 0x54),
             accent: Color::rgb(0x88, 0xc0, 0xd0),
             selection_bg: Color::rgb(0x43, 0x48, 0x54),
+            search_match_bg: Color::rgb(0x44, 0x42, 0x2e),
             ansi: [
                 Color::rgb(0x3b, 0x42, 0x52),
                 Color::rgb(0xbf, 0x61, 0x6a),
@@ -181,6 +190,7 @@ impl Theme {
             border: Color::rgb(0x55, 0x50, 0x80),
             accent: Color::rgb(0xc4, 0xa7, 0xe7),
             selection_bg: Color::rgb(0x55, 0x50, 0x80),
+            search_match_bg: Color::rgb(0x4a, 0x3d, 0x2e),
             ansi: [
                 Color::rgb(0x26, 0x23, 0x3a),
                 Color::rgb(0xeb, 0x6f, 0x92),
@@ -212,6 +222,7 @@ impl Theme {
             border: Color::rgb(0x42, 0x48, 0x53),
             accent: Color::rgb(0x61, 0xaf, 0xef),
             selection_bg: Color::rgb(0x42, 0x48, 0x53),
+            search_match_bg: Color::rgb(0x45, 0x40, 0x2e),
             ansi: [
                 Color::rgb(0x28, 0x2c, 0x34),
                 Color::rgb(0xe0, 0x6c, 0x75),
@@ -243,6 +254,7 @@ impl Theme {
             border: Color::rgb(0x58, 0x6e, 0x75),
             accent: Color::rgb(0x26, 0x8b, 0xd2),
             selection_bg: Color::rgb(0x58, 0x6e, 0x75),
+            search_match_bg: Color::rgb(0x4a, 0x3c, 0x10),
             ansi: [
                 Color::rgb(0x07, 0x36, 0x42),
                 Color::rgb(0xdc, 0x32, 0x2f),

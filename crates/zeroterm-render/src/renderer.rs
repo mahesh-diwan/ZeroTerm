@@ -47,6 +47,17 @@ pub struct Selection {
     pub active: bool,
 }
 
+/// One in-buffer search match: a column span on a GLOBAL row (0 = top of
+/// scrollback). While search is open the renderer tints every match cell
+/// with the theme's `search_match_bg` and the current match with
+/// `selection_bg` (kitty highlights all matches in the buffer in place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
 impl Selection {
     pub fn new() -> Self {
         Self::default()
@@ -177,6 +188,11 @@ pub struct Renderer {
     tab_bar_pass: Pass,
     status_bar_pass: Pass,
     scrollbar_pass: Pass,
+    /// Effective tab-bar height in cell rows: TAB_BAR_ROWS while more than one
+    /// tab exists, 0 with a single tab (kitty `tab_bar_min_tabs = 2` — the bar
+    /// only appears when it has something to show). Drives tab_bar_height()
+    /// and hence every content-area size computation.
+    tab_bar_rows: usize,
     atlas_bind_group: wgpu::BindGroup,
     glyph_atlas: GlyphAtlas,
     cell_size: [f32; 2],
@@ -654,6 +670,7 @@ impl Renderer {
             tab_bar_pass,
             status_bar_pass,
             scrollbar_pass,
+            tab_bar_rows: TAB_BAR_ROWS,
             atlas_bind_group_layout,
             atlas_bind_group,
             glyph_atlas,
@@ -863,6 +880,7 @@ impl Renderer {
         screen: &CoreScreen,
         scroll_offset: usize,
         selection: Option<Selection>,
+        search: Option<(&[SearchMatch], usize)>,
     ) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
             return Ok(());
@@ -915,7 +933,7 @@ impl Renderer {
 
         // Build and upload vertices for dirty cells only
         if !self.dirty_cells.is_empty() {
-            self.update_cell_data(screen, scroll_offset, selection)?;
+            self.update_cell_data(screen, scroll_offset, selection, search)?;
         }
 
         // Update uniforms
@@ -1004,6 +1022,11 @@ impl Renderer {
     /// bar-bg gap cell after each pill is the tab separator.
     pub fn draw_tab_bar(&mut self, tabs: &[TabInfo]) -> Result<()> {
         if self.current_view.is_none() || self.current_encoder.is_none() {
+            return Ok(());
+        }
+        // Hidden with a single tab (kitty tab_bar_min_tabs=2): drawing an
+        // empty bar would still consume a row of the batch.
+        if self.tab_bar_rows == 0 {
             return Ok(());
         }
 
@@ -1260,10 +1283,18 @@ impl Renderer {
         Ok(())
     }
 
-    /// Height of the tab bar in pixels (one cell row). main.rs uses this for
-    /// the content viewport offset; must stay in sync with draw_tab_bar.
+    /// Hide or show the tab bar (kitty `tab_bar_min_tabs`: with a single tab
+    /// the bar is hidden and the grid gets the row). Call before reading
+    /// `tab_bar_height` so every content-area computation follows.
+    pub fn set_tab_bar_visible(&mut self, visible: bool) {
+        self.tab_bar_rows = if visible { TAB_BAR_ROWS } else { 0 };
+    }
+
+    /// Height of the tab bar in pixels (one cell row while more than one tab
+    /// exists, zero with a single tab). main.rs uses this for the content
+    /// viewport offset; must stay in sync with draw_tab_bar.
     pub fn tab_bar_height(&self) -> f32 {
-        TAB_BAR_ROWS as f32 * self.cell_height
+        self.tab_bar_rows as f32 * self.cell_height
     }
 
     /// Height of the status bar in pixels (one cell row).
@@ -1469,6 +1500,7 @@ impl Renderer {
         screen: &CoreScreen,
         scroll_offset: usize,
         selection: Option<Selection>,
+        search: Option<(&[SearchMatch], usize)>,
     ) -> Result<()> {
         // The screen -> CellData mapping (scrollback math, capacity clamp,
         // cursor/selection, syntax colors, block overlays) lives in the pure
@@ -1482,6 +1514,7 @@ impl Renderer {
             screen,
             scroll_offset,
             selection,
+            search,
             self.content_pass.capacity(),
             &self.dirty_cells,
             self.blink_visible,
@@ -1596,6 +1629,17 @@ impl Renderer {
             self.theme.bg.r as f32 / 255.0,
             self.theme.bg.g as f32 / 255.0,
             self.theme.bg.b as f32 / 255.0,
+            1.0,
+        ]
+    }
+
+    /// Theme selection background as an RGBA float — the visual bell flash
+    /// color (kitty's `visual_bell_color` defaults to the selection color).
+    pub fn selection_bg(&self) -> [f32; 4] {
+        [
+            self.theme.selection_bg.r as f32 / 255.0,
+            self.theme.selection_bg.g as f32 / 255.0,
+            self.theme.selection_bg.b as f32 / 255.0,
             1.0,
         ]
     }

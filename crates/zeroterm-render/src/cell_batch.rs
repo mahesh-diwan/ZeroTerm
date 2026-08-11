@@ -10,7 +10,7 @@ use bytemuck::Zeroable;
 use zeroterm_core::cell::{CursorShape, UnderlineStyle};
 use zeroterm_core::screen::Screen;
 
-use crate::renderer::{CellData, Selection};
+use crate::renderer::{CellData, SearchMatch, Selection};
 use crate::theme::Theme;
 
 pub(crate) const ATTR_HAS_IMAGE: u32 = 0x400;
@@ -47,14 +47,18 @@ impl CellBatch {
     }
 
     /// Build the GPU cell batch for a view of `screen` at `scroll_offset` with
-    /// an optional selection. `capacity` is the GPU storage buffer's cell
-    /// count (window-sized); the batch is clamped so a resize race or split
-    /// pane math can never overrun it. `glyphs` maps a character to its quad.
+    /// an optional selection and optional in-buffer search matches. `capacity`
+    /// is the GPU storage buffer's cell count (window-sized); the batch is
+    /// clamped so a resize race or split pane math can never overrun it.
+    /// `search` is (matches, index of the current one); matches carry GLOBAL
+    /// rows (scrollback + visible), so they line up with `combined_idx`.
+    /// `glyphs` maps a character to its quad.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
         screen: &Screen,
         scroll_offset: usize,
         selection: Option<Selection>,
+        search: Option<(&[SearchMatch], usize)>,
         capacity: usize,
         dirty_cells: &[(usize, usize)],
         blink_visible: bool,
@@ -151,6 +155,29 @@ impl CellBatch {
 
             let is_selected = selection.is_some_and(|s| s.contains(combined_idx, dirty_col));
 
+            // In-buffer search highlight (kitty): every match cell is tinted
+            // with the theme's search_match_bg; the CURRENT match reuses
+            // selection_bg so it reads brighter. Selection wins over search;
+            // the cursor cell (fg/bg swapped above) is left untouched.
+            let mut bg_color = bg;
+            if !is_selected && !is_cursor_cell {
+                if let Some((matches, current)) = search {
+                    for (i, m) in matches.iter().enumerate() {
+                        if m.row == combined_idx
+                            && dirty_col >= m.start
+                            && dirty_col < m.end
+                        {
+                            bg_color = if i == current {
+                                theme.selection_bg
+                            } else {
+                                theme.search_match_bg
+                            };
+                            break;
+                        }
+                    }
+                }
+            }
+
             let mut attrs = (cell_attrs.bold as u32)
                 | ((cell_attrs.italic as u32) << 1)
                 | (((cell_attrs.underline != UnderlineStyle::None) as u32) << 2)
@@ -179,9 +206,9 @@ impl CellBatch {
                 1.0,
             ];
             let bg_color = [
-                bg.r as f32 / 255.0,
-                bg.g as f32 / 255.0,
-                bg.b as f32 / 255.0,
+                bg_color.r as f32 / 255.0,
+                bg_color.g as f32 / 255.0,
+                bg_color.b as f32 / 255.0,
                 // Background carries the window opacity: the shader mixes
                 // glyph alpha between bg (a=opacity) and fg (a=1), so text
                 // stays opaque while the terminal background shows the
@@ -305,6 +332,7 @@ mod tests {
             &screen,
             1,
             None,
+            None,
             12,
             &all_dirty(&screen),
             true,
@@ -332,6 +360,7 @@ mod tests {
             &screen,
             0,
             None,
+            None,
             4,
             &all_dirty(&screen),
             true,
@@ -357,6 +386,7 @@ mod tests {
             &screen,
             0,
             Some(sel),
+            None,
             12,
             &all_dirty(&screen),
             true,
@@ -374,6 +404,61 @@ mod tests {
     }
 
     #[test]
+    fn search_highlights_current_and_other_matches_in_place() {
+        let mut screen = Screen::new(4, 3);
+        fill(&mut screen, &["AB", "CD", "EF"]);
+        // Matches on GLOBAL rows: row 0 col 0 (current) and row 2 col 0.
+        let matches = [
+            SearchMatch {
+                row: 0,
+                start: 0,
+                end: 1,
+            },
+            SearchMatch {
+                row: 2,
+                start: 0,
+                end: 1,
+            },
+        ];
+        let batch = CellBatch::build(
+            &screen,
+            0,
+            None,
+            Some((&matches, 0)),
+            12,
+            &all_dirty(&screen),
+            true,
+            1.0,
+            &Theme::tokyo_night(),
+            probe_glyphs,
+        );
+        let sel: [f32; 4] = [
+            0x28 as f32 / 255.0,
+            0x34 as f32 / 255.0,
+            0x57 as f32 / 255.0,
+            1.0,
+        ];
+        let other: [f32; 4] = [
+            0x4d as f32 / 255.0,
+            0x44 as f32 / 255.0,
+            0x2e as f32 / 255.0,
+            1.0,
+        ];
+        // Current match (row 0 col 0) uses selection_bg; other match (row 2
+        // col 0) uses search_match_bg; unmatched neighbors keep theme bg.
+        assert_eq!(batch[0].bg, sel, "current match bright");
+        assert_eq!(batch[8].bg, other, "other match muted");
+        // Unmatched neighbor (row 0 col 1) keeps the plain theme background.
+        let theme_bg: [f32; 4] = [
+            0x1a as f32 / 255.0,
+            0x1b as f32 / 255.0,
+            0x26 as f32 / 255.0,
+            1.0,
+        ];
+        assert_eq!(batch[1].bg, theme_bg, "unmatched cell keeps bg");
+    }
+
+    #[test]
     fn dim_attr_survives_into_the_batch() {
         let mut screen = Screen::new(4, 3);
         screen.cursor_pos(1, 1);
@@ -382,6 +467,7 @@ mod tests {
         let batch = CellBatch::build(
             &screen,
             0,
+            None,
             None,
             12,
             &all_dirty(&screen),

@@ -9,7 +9,7 @@ pub mod theme;
 
 pub use atlas::estimate_cell_size;
 pub use renderer::{
-    tab_span, Renderer, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS,
+    tab_span, Renderer, SearchMatch, Selection, TabInfo, PADDING, STATUS_BAR_ROWS, TAB_BAR_ROWS,
 };
 
 pub struct RenderConfig {
