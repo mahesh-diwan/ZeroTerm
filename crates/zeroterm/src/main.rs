@@ -572,7 +572,10 @@ impl App {
 
         // Start config file watcher
         let config_path = Config::default_config_path();
-        let config_dir = config_path.parent().unwrap().to_path_buf();
+        let config_dir = config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
         #[cfg(feature = "plugins")]
         {
             self.plugins = load_plugins(&config_dir.join("plugins"));
@@ -597,7 +600,11 @@ impl App {
                     return;
                 }
             };
-            let _ = watcher.watch(&config_dir, RecursiveMode::NonRecursive);
+            if let Err(e) = watcher.watch(&config_dir, RecursiveMode::NonRecursive) {
+                // A dead watcher silently kills config hot-reload — exactly the
+                // "my config change didn't apply" failure this hardening targets.
+                error!("Failed to watch config dir {}: {}", config_dir.display(), e);
+            }
             while rx.recv().is_ok() {
                 changed.store(true, Ordering::SeqCst);
             }
@@ -1159,6 +1166,24 @@ impl App {
         self.apply_config_to_renderer();
     }
 
+    /// Reload the on-disk config, surfacing parse errors instead of silently
+    /// keeping the old config. Returns whether the reload succeeded so callers
+    /// can mirror the outcome in UI notices. A broken config.toml used to fail
+    /// invisibly — "my font/color change didn't apply" was usually a config
+    /// parse error.
+    fn reload_config_from_disk(&mut self) -> bool {
+        match &mut self.config {
+            Some(config) => match config.reload(None) {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Config reload failed (keeping previous config): {}", e);
+                    false
+                }
+            },
+            None => true,
+        }
+    }
+
     /// [ZTDIAG] Ground-truth screen probe: emits one line per render pass so
     /// a blank window can be attributed to an empty parser screen vs. a
     /// presentation failure. Gated on ZTDIAG=1 (see render()).
@@ -1203,9 +1228,7 @@ impl App {
         self.check_renderer_ready();
         if self.config_changed.load(Ordering::SeqCst) {
             self.config_changed.store(false, Ordering::SeqCst);
-            if let Some(config) = &mut self.config {
-                config.reload(None).ok();
-            }
+            self.reload_config_from_disk();
             self.apply_config_to_renderer();
         }
         if let Some(kind) = self.active_overlay() {
@@ -1470,9 +1493,12 @@ impl App {
     /// notify-send (or a headless session) is silently ignored.
     #[cfg(target_os = "linux")]
     fn desktop_notify(&self, msg: &str) {
-        let _ = std::process::Command::new("notify-send")
+        if let Err(e) = std::process::Command::new("notify-send")
             .args(["-a", "ZeroTerm", "-i", "utilities-terminal", msg])
-            .spawn();
+            .spawn()
+        {
+            warn!("notify-send failed: {}", e);
+        }
     }
     #[cfg(target_os = "macos")]
     fn desktop_notify(&self, msg: &str) {
@@ -1481,10 +1507,13 @@ impl App {
             "display notification \"{}\" with title \"ZeroTerm\"",
             escaped
         );
-        let _ = std::process::Command::new("osascript")
+        if let Err(e) = std::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
-            .spawn();
+            .spawn()
+        {
+            warn!("osascript failed: {}", e);
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn desktop_notify(&self, _msg: &str) {}
@@ -1523,7 +1552,9 @@ impl App {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = std::process::Command::new(cmd).arg(uri).spawn();
+            if let Err(e) = std::process::Command::new(cmd).arg(uri).spawn() {
+                warn!("Failed to open link '{}' with {}: {}", uri, cmd, e);
+            }
         }
     }
 
@@ -1805,7 +1836,9 @@ impl App {
         if !should_focus_follow(follows, self.selecting, self.session.active_pane, hovered) {
             return;
         }
-        let id = hovered.unwrap();
+        let Some(id) = hovered else {
+            return;
+        };
         self.session.set_active_pane(id);
         self.editor.cancel();
         if let Some(window) = &self.window {
@@ -2265,9 +2298,7 @@ impl App {
                 }
             }
             SettingsAction::ReloadConfig => {
-                if let Some(config) = &mut self.config {
-                    config.reload(None).ok();
-                }
+                self.reload_config_from_disk();
             }
             // Concurrent-WIP glue: the settings menu gained Export/Import items
             // (new notice field) before main.rs was wired. Minimal handlers so
@@ -2285,10 +2316,12 @@ impl App {
                 });
             }
             SettingsAction::ImportConfig => {
-                if let Some(config) = &mut self.config {
-                    config.reload(None).ok();
-                }
-                self.settings.notice = Some("Config reloaded".to_string());
+                let ok = self.reload_config_from_disk();
+                self.settings.notice = Some(if ok {
+                    "Config reloaded".to_string()
+                } else {
+                    "Config reload failed — see log".to_string()
+                });
             }
         }
         self.apply_config_to_renderer();

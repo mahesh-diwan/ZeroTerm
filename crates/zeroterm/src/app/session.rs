@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use anyhow::Result;
+use tracing::warn;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::KeyCode;
 
@@ -78,6 +79,39 @@ impl PaneState {
     }
 }
 
+/// Best-effort write of a shell bootstrap file. On failure we warn loudly
+/// and return false so the caller can fall back to a PLAIN shell invocation:
+/// passing `--rcfile` (bash) or `ZDOTDIR` (zsh) for a file that was never
+/// written would print an error at every prompt AND silently drop the user's
+/// real rcfile (zsh) or the starship/OSC-133 integration (both).
+fn write_bootstrap_file(path: &std::path::Path, content: &str) -> bool {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("Failed to create bootstrap dir {}: {}", parent.display(), e);
+            return false;
+        }
+    }
+    match std::fs::write(path, content) {
+        Ok(()) => true,
+        Err(e) if path.exists() => {
+            // Read-only dir but a bootstrap from a previous run is already on
+            // disk: keep using it — a (possibly stale) bootstrap still provides
+            // starship + OSC 133 integration, while dropping to a plain shell
+            // would lose both.
+            warn!(
+                "Failed to refresh bootstrap file {} (using existing): {}",
+                path.display(),
+                e
+            );
+            true
+        }
+        Err(e) => {
+            warn!("Failed to write bootstrap file {}: {}", path.display(), e);
+            false
+        }
+    }
+}
+
 pub fn starship_setup(
     shell: &str,
     shell_args: &[String],
@@ -102,11 +136,10 @@ pub fn starship_setup(
         });
     let user_starship = config_dir.join("starship.toml");
     let zt_starship = config_dir.join("zeroterm/starship.toml");
+    // The starship.toml copy is cosmetic-only (starship falls back to its own
+    // default config), so a write failure is logged but never fatal.
     if !user_starship.exists() && !zt_starship.exists() {
-        if let Some(parent) = zt_starship.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(&zt_starship, include_str!("../../assets/starship.toml"));
+        let _ = write_bootstrap_file(&zt_starship, include_str!("../../assets/starship.toml"));
     }
     let mut env = Vec::new();
     if zt_starship.exists() {
@@ -128,9 +161,6 @@ pub fn starship_setup(
         // immediately discarded it across exec — the fresh login shell never
         // saw starship, so users got the stock bash prompt no matter what.
         let boot = config_dir.join("zeroterm/bashrc");
-        if let Some(parent) = boot.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let content = r#"# ZeroTerm bootstrap: login-equivalent env + user rc + starship
 if [ -f /etc/profile ]; then . /etc/profile; fi
 profile_loaded=0
@@ -153,19 +183,21 @@ __zeroterm_precmd() {
 }
 PROMPT_COMMAND="__zeroterm_precmd;${PROMPT_COMMAND:-}"
 "#;
-        let _ = std::fs::write(&boot, content);
-        Some(vec![
-            r"--rcfile".into(),
-            boot.to_string_lossy().into_owned(),
-        ])
+        // Only pass --rcfile when the bootstrap actually landed: a failed
+        // write would make bash print an error and run with no integration.
+        if write_bootstrap_file(&boot, content) {
+            Some(vec![
+                r"--rcfile".into(),
+                boot.to_string_lossy().into_owned(),
+            ])
+        } else {
+            None
+        }
     } else if shell.ends_with("zsh") {
         // zsh has no --rcfile; ZDOTDIR points at a directory whose .zshrc
         // reproduces the login env (.zprofile), sources the user's real
         // .zshrc, then enables starship.
         let zdotdir = config_dir.join("zeroterm/zdotdir");
-        if let Some(parent) = zdotdir.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let content = r#"# ZeroTerm bootstrap: login-equivalent env + user rc + starship
 if [ -f /etc/zprofile ]; then . /etc/zprofile; fi
 if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile"; fi
@@ -183,9 +215,15 @@ __zeroterm_precmd() {
 # lets us capture the real exit status of the last command.
 precmd_functions=(__zeroterm_precmd $precmd_functions)
 "#;
-        let _ = std::fs::write(zdotdir.join(".zshrc"), content);
-        env.push(("ZDOTDIR", zdotdir.to_string_lossy().into_owned()));
-        Some(vec![])
+        // Only point ZDOTDIR at the bootstrap dir when its .zshrc actually
+        // landed — a failed write would leave zsh reading an empty rcfile and
+        // silently skip the user's real ~/.zshrc.
+        if write_bootstrap_file(&zdotdir.join(".zshrc"), content) {
+            env.push(("ZDOTDIR", zdotdir.to_string_lossy().into_owned()));
+            Some(vec![])
+        } else {
+            None
+        }
     } else {
         None
     };
