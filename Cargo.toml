@@ -41,7 +41,7 @@ wat = "1"
 image = { version = "0.25", default-features = false, features = ["png", "gif", "webp"] }
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 license = "MIT"
 
