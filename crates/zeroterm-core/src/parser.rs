@@ -608,11 +608,13 @@ impl Parser {
 
         // Kitty keyboard protocol: `CSI ? u` (query flags), `CSI > f u` (push
         // flags), `CSI < n u` (pop n), `CSI = f;m u` (set flags with mode).
-        if final_byte == 'u' && marker.is_some() {
-            let p0 = self.csi.get(0, 0);
-            let p1 = self.csi.get(1, 1);
-            self.handle_kitty_csi(marker.unwrap(), p0, p1);
-            return;
+        if final_byte == 'u' {
+            if let Some(marker) = marker {
+                let p0 = self.csi.get(0, 0);
+                let p1 = self.csi.get(1, 1);
+                self.handle_kitty_csi(marker, p0, p1);
+                return;
+            }
         }
 
         match (final_byte, private, intermediate.as_str()) {
@@ -857,7 +859,8 @@ impl Parser {
         match marker {
             '?' => {
                 let flags = self.kitty_flags | 1; // advertise disambiguate
-                self.pending_response = Some(format!("\x1b[?{}u", flags).into_bytes());
+                // Reply is `CSI ? flags;mode u` — mode 1 = basic protocol.
+                self.pending_response = Some(format!("\x1b[?{};1u", flags).into_bytes());
             }
             '>' => {
                 self.kitty_stack.push(self.kitty_flags);
@@ -899,9 +902,8 @@ impl Parser {
             self.screen.set_title(title);
         } else if osc.starts_with("4;") {
             // Color palette - ignored for now
-        } else if osc.starts_with("8;") {
+        } else if let Some(rest) = osc.strip_prefix("8;") {
             // OSC 8 hyperlink: `8;params;uri`. An empty uri closes the link.
-            let rest = &osc[2..];
             let uri = match rest.split_once(';') {
                 Some((_, uri)) => uri,
                 None => rest, // no params: `8;uri`

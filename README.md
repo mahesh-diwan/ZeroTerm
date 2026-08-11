@@ -30,6 +30,9 @@ Linux), and the project is organized as a Cargo workspace of eight crates.
 - 🖥️ Native SSH client with persistent sessions (Unix, feature-gated)
 - 🔒 End-to-end encrypted settings sync (ChaCha20-Poly1305)
 - 🔌 WASM plugin sandbox (wasmtime)
+- 🔗 OSC 8 hyperlinks — hover shows the URL, click opens it
+- ⌨️ Kitty keyboard protocol (CSI-u) for nvim/readline 8.2+/fish/zsh
+- 🔔 OSC 9 desktop notifications
 - ⚙️ TOML configuration with optional Lua scripting
 - ⌨️ Readline-style multi-line line editor with history
 

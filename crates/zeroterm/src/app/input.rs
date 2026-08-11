@@ -604,8 +604,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    #[test]
     fn toggle_mode_flips_and_vi_starts_normal() {
         let mut e = EditingState::from_line("x");
         assert_eq!(e.mode(), EditMode::Emacs);

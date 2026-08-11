@@ -310,6 +310,15 @@ impl Screen {
         }
 
         let width = ch.width().unwrap_or(1).max(1);
+        // A wide glyph occupies two columns; stamp the continuation cell with
+        // the same link id so hover/click hit-testing works on both halves.
+        if width >= 2 {
+            if let Some(row) = self.current_buffer_mut().get_mut(cursor_row) {
+                if let Some(cont) = row.get_mut(cursor_col + 1) {
+                    cont.link_id = cell.link_id;
+                }
+            }
+        }
         self.cursor.col = (self.cursor.col + width).min(self.size.cols);
 
         self.highlight_row(self.cursor.row);

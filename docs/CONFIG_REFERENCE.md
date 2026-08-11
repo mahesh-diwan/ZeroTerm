@@ -61,6 +61,11 @@ click_to_position = true
 
 [session]                    # optional section
 restore = false              # re-open last session's tabs on launch
+
+[terminal]                   # optional section; protocol / interaction features
+kitty_keyboard = true        # kitty keyboard protocol (CSI-u) for nvim/readline 8.2+
+notifications = true         # OSC 9 -> native desktop notifications
+hyperlinks = true            # OSC 8 hyperlinks: hover in status bar, click to open
 ```
 
 ## Section Reference
@@ -158,6 +163,24 @@ any stale `layout.json` from a previous session is discarded. Set `restore =
 true` to re-open the tabs and split panes you had open when you last closed
 the window.
 
+### `[terminal]`
+
+| Key              | Type | Default | Notes                                                                                          |
+| ---------------- | ---- | ------- | ---------------------------------------------------------------------------------------------- |
+| `kitty_keyboard` | bool | `true`  | Optional (serde-default); advertise + emit kitty keyboard protocol (CSI-u) sequences           |
+| `notifications`  | bool | `true`  | Optional (serde-default); OSC 9 desktop notifications (`notify-send` / `osascript`)             |
+| `hyperlinks`     | bool | `true`  | Optional (serde-default); OSC 8 hyperlinks — hover shows the URL, click opens it                |
+
+The whole `[terminal]` section is optional and may be omitted entirely; every key
+is opt-**out** (all default `true`). `kitty_keyboard` makes ZeroTerm answer
+the `CSI > 1 u` capability query and encode modified functional keys as CSI-u
+sequences for apps that push the protocol (nvim, readline ≥ 8.2, fish, zsh) —
+legacy apps are unaffected because the protocol is opt-in per-app. `notifications`
+routes OSC 9 (`ESC ] 9 ; <message>`) to the platform notification system.
+`hyperlinks` renders OSC 8 link text with an accent underline, shows the target
+URL in the status bar on hover, and a plain click (press + release without
+moving) opens it in the system handler; dragging selects text normally.
+
 ### `[keybindings]`
 
 | Key                   | Type | Default | Notes                                      |
@@ -214,6 +237,9 @@ Predefined globals:
 | `shift_arrows_select` | `keybindings.shift_arrows_select` | `keybindings.shift_arrows_select` | bool      |
 | `click_to_position`   | `keybindings.click_to_position`   | `keybindings.click_to_position`   | bool      |
 | `restore_session`     | `session.restore`                 | `session.restore`                 | bool      |
+| `kitty_keyboard`      | `terminal.kitty_keyboard`         | `terminal.kitty_keyboard`         | bool      |
+| `notifications`       | `terminal.notifications`          | `terminal.notifications`          | bool      |
+| `hyperlinks`          | `terminal.hyperlinks`             | `terminal.hyperlinks`             | bool      |
 
 Unrecognized keys are silently ignored. Not exposed to Lua: `shell.args`,
 `sync.server_url`, `window.blur`, `window.blur_radius`, the `[cursor]`/`[mouse]`

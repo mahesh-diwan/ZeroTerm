@@ -344,7 +344,13 @@ pub fn kitty_sequence(code: KeyCode, mods: Mods) -> Option<Vec<u8>> {
         // ctrl/alt + letter/digit -> CSI <lowercase cp>;<mods>u. This is what
         // lets nvim/readline/fish disambiguate ctrl+c from ctrl+shift+c etc.
         _ if mods.ctrl || mods.alt => {
-            let cp = key_codepoint(code)?;
+            let mut cp = key_codepoint(code)?;
+            // Shifted digits: per the kitty spec, when shift is active the
+            // keycode is the unshifted ASCII code plus 27 (Shift+1 -> 76),
+            // so apps can tell `1` from `Shift+1` apart from the modifiers.
+            if mods.shift && (48..=57).contains(&cp) {
+                cp += 27;
+            }
             format!("\x1b[{};{}u", cp, m).into_bytes()
         }
         _ => return None,
@@ -734,6 +740,13 @@ mod tests {
             None
         );
         assert_eq!(kitty_sequence(KeyCode::Enter, m(false, false, false)), None);
+    }
+
+    #[test]
+    fn kitty_shift_digit_adds_27_offset() {
+        // Shift+1 with ctrl -> keycode 49 + 27 = 76, modifiers shift|ctrl = 1+4+1.
+        let seq = kitty_sequence(KeyCode::Digit1, m(true, true, false)).unwrap();
+        assert_eq!(seq, b"\x1b[76;6u");
     }
 
     #[test]

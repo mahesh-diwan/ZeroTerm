@@ -1067,8 +1067,21 @@ impl App {
             }
         }
         self.resize_panes_to_rects();
-        for msg in notifications {
-            self.desktop_notify(&msg);
+        // Collapse OSC 9 bursts: dedupe consecutive duplicates and cap each
+        // drain pass at 3 messages, so a shell loop emitting hundreds of
+        // OSC 9s in one frame can't spawn hundreds of notify-send processes.
+        let mut fired = 0;
+        let mut prev: Option<&str> = None;
+        for msg in &notifications {
+            if Some(msg.as_str()) == prev {
+                continue;
+            }
+            prev = Some(msg.as_str());
+            if fired >= 3 {
+                break;
+            }
+            self.desktop_notify(msg);
+            fired += 1;
         }
         if let Some(title) = title_changed {
             if let Some(window) = &self.window {

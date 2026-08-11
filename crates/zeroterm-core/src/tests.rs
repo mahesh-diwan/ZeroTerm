@@ -243,7 +243,7 @@ fn test_kitty_query_reply_when_supported() {
     parser.parse(b"\x1b[?u");
     assert_eq!(
         parser.take_response().as_deref(),
-        Some(b"\x1b[?1u".as_slice())
+        Some(b"\x1b[?1;1u".as_slice())
     );
 }
 
@@ -256,6 +256,21 @@ fn test_kitty_push_sets_disambiguate() {
     assert!(parser.kitty_disambiguate());
     parser.parse(b"\x1b[<u"); // pop -> back to 0
     assert!(!parser.kitty_disambiguate());
+}
+
+#[test]
+fn test_osc8_link_registry_pruned_on_reset() {
+    let mut screen = Screen::new(80, 24);
+    screen.set_hyperlink("https://a.test/x");
+    screen.put_char('h');
+    let id = screen.cell(0, 0).unwrap().link_id;
+    assert_ne!(id, 0);
+    screen.reset();
+    // After a full terminal reset the registry is empty and the old id is
+    // gone, so cells no longer resolve to a (stale) uri.
+    assert_eq!(screen.link_uri(id), None);
+    let cell = screen.cell(0, 0).unwrap();
+    assert_eq!(cell.link_id, 0);
 }
 
 #[test]
