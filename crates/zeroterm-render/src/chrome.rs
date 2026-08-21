@@ -33,12 +33,7 @@ pub fn rows_for(cell_h: f32, height: f32) -> usize {
 /// from both axes, floor + clamp >= 1. This is the exact function the app
 /// crate's `cells_for_size` used to inline — now shared so the spawn
 /// estimate can never disagree with the renderer's own layout.
-pub fn content_dims(
-    cell_w: f32,
-    cell_h: f32,
-    tab_rows: usize,
-    size: [f32; 2],
-) -> (usize, usize) {
+pub fn content_dims(cell_w: f32, cell_h: f32, tab_rows: usize, size: [f32; 2]) -> (usize, usize) {
     let chrome = (tab_rows + STATUS_BAR_ROWS) as f32 * cell_h;
     let content_h = (size[1] - chrome).max(0.0);
     (cols_for(cell_w, size[0]), rows_for(cell_h, content_h))

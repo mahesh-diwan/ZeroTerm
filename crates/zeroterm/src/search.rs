@@ -195,8 +195,16 @@ mod tests {
         assert_eq!(
             s.matches,
             vec![
-                SearchMatch { row: 0, start: 0, end: 5 },
-                SearchMatch { row: 2, start: 0, end: 5 },
+                SearchMatch {
+                    row: 0,
+                    start: 0,
+                    end: 5
+                },
+                SearchMatch {
+                    row: 2,
+                    start: 0,
+                    end: 5
+                },
             ]
         );
         assert_eq!(s.current_row(), Some(0));
@@ -216,9 +224,21 @@ mod tests {
         assert_eq!(
             s.matches,
             vec![
-                SearchMatch { row: 0, start: 0, end: 2 },
-                SearchMatch { row: 0, start: 3, end: 5 },
-                SearchMatch { row: 0, start: 6, end: 8 },
+                SearchMatch {
+                    row: 0,
+                    start: 0,
+                    end: 2
+                },
+                SearchMatch {
+                    row: 0,
+                    start: 3,
+                    end: 5
+                },
+                SearchMatch {
+                    row: 0,
+                    start: 6,
+                    end: 8
+                },
             ]
         );
         assert_eq!(s.matches.len(), 3);

@@ -866,4 +866,3 @@ mod tests {
         assert_eq!(m.floating, Some(0));
     }
 }
-

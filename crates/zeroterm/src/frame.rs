@@ -96,7 +96,7 @@ pub fn status_left(
         format!("  {short}")
     };
     let exit_part = match exit {
-        Some(0) => "  \u{2713} 0".to_string(), // ✓
+        Some(0) => "  \u{2713} 0".to_string(),        // ✓
         Some(code) => format!("  \u{2717} {}", code), // ✗
         None => String::new(),
     };

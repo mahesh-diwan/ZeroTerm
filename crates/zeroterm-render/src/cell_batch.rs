@@ -163,10 +163,7 @@ impl CellBatch {
             if !is_selected && !is_cursor_cell {
                 if let Some((matches, current)) = search {
                     for (i, m) in matches.iter().enumerate() {
-                        if m.row == combined_idx
-                            && dirty_col >= m.start
-                            && dirty_col < m.end
-                        {
+                        if m.row == combined_idx && dirty_col >= m.start && dirty_col < m.end {
                             bg_color = if i == current {
                                 theme.selection_bg
                             } else {

@@ -296,9 +296,9 @@ impl Renderer {
             let cache_file = wgpu::util::pipeline_cache_key(&adapter.get_info())
                 .and_then(|key| dirs::cache_dir().map(|dir| dir.join("zeroterm").join(key)));
             let cache_data = cache_file.as_ref().and_then(|p| std::fs::read(p).ok());
+            // SAFETY: Pipeline cache data was produced by wgpu internally, and
+            // using fallback:true means outdated/invalid data becomes an empty cache
             let cache = unsafe {
-                // SAFETY: cache_data (if any) was produced by PipelineCache::get_data in a
-                // prior run; fallback:true makes invalid/outdated data degrade to an empty cache.
                 device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                     label: Some("ZeroTerm Pipeline Cache"),
                     data: cache_data.as_deref(),

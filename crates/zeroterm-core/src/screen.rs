@@ -1071,9 +1071,7 @@ impl Screen {
     /// has opened a new block since it started). Used for the running-block
     /// gutter marker and confirm-on-close decisions.
     pub fn has_running_block(&self) -> bool {
-        self.blocks
-            .last()
-            .is_some_and(|b| b.end_line.is_none())
+        self.blocks.last().is_some_and(|b| b.end_line.is_none())
     }
 
     /// Working directory announced via OSC 7 (`file://host/path`). The host

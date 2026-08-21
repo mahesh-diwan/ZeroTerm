@@ -859,7 +859,7 @@ impl Parser {
         match marker {
             '?' => {
                 let flags = self.kitty_flags | 1; // advertise disambiguate
-                // Reply is `CSI ? flags;mode u` — mode 1 = basic protocol.
+                                                  // Reply is `CSI ? flags;mode u` — mode 1 = basic protocol.
                 self.pending_response = Some(format!("\x1b[?{};1u", flags).into_bytes());
             }
             '>' => {
@@ -984,9 +984,7 @@ impl Parser {
             }
             Some(b'D') => {
                 // `D` or `D;127` — the exit code is everything after the ';'.
-                let code = payload
-                    .get(2..)
-                    .and_then(|s| s.trim().parse::<i32>().ok());
+                let code = payload.get(2..).and_then(|s| s.trim().parse::<i32>().ok());
                 if let Some(code) = code {
                     self.set_exit_code(code);
                 }

@@ -208,16 +208,23 @@ fn should_focus_follow(
 /// startup resize storm. (Split/SSH panes still receive one resize to their
 /// final, smaller rect after insertion — a single prompt reprint per pane
 /// creation, inherent to splits and acceptable.)
-fn cells_for_size(tab_rows: usize, cell_w: f32, cell_h: f32, size: PhysicalSize<u32>) -> (usize, usize) {
+fn cells_for_size(
+    tab_rows: usize,
+    cell_w: f32,
+    cell_h: f32,
+    size: PhysicalSize<u32>,
+) -> (usize, usize) {
     // Delegates to the render crate's chrome module — the single source of
     // truth for chrome geometry shared with the renderer's own layout, so the
     // spawn estimate can never drift from it (drift = startup resize storm =
     // "prompt printed twice"). `tab_rows` is the EFFECTIVE tab-bar height (0
     // with a single tab — kitty tab_bar_min_tabs=2 — else 1).
-    zeroterm_render::chrome::content_dims(cell_w, cell_h, tab_rows, [
-        size.width as f32,
-        size.height as f32,
-    ])
+    zeroterm_render::chrome::content_dims(
+        cell_w,
+        cell_h,
+        tab_rows,
+        [size.width as f32, size.height as f32],
+    )
 }
 
 /// Remove a stale session layout file, if present. Called when session
@@ -1235,11 +1242,9 @@ impl App {
         // Visual bell: while the flash is active the background lerps toward
         // the selection color (kitty visual_bell_duration/visual_bell_color).
         let bg = match &self.bell_flash {
-            Some(flash) if !flash.done() => bell_flash_color(
-                renderer.theme_bg(),
-                renderer.selection_bg(),
-                flash.alpha(),
-            ),
+            Some(flash) if !flash.done() => {
+                bell_flash_color(renderer.theme_bg(), renderer.selection_bg(), flash.alpha())
+            }
             _ => {
                 self.bell_flash = None;
                 renderer.theme_bg()
@@ -1267,15 +1272,12 @@ impl App {
         // reported a non-zero exit code (OSC 133;D). Unlike the bell latch,
         // it reflects live state — a successful command clears the dot.
         let failed = |id: usize| {
-            self.session
-                .tab_panes(id)
-                .iter()
-                .any(|&pid| {
-                    self.session
-                        .panes
-                        .get(&pid)
-                        .is_some_and(|p| p.parser.screen().last_exit().is_some_and(|c| c != 0))
-                })
+            self.session.tab_panes(id).iter().any(|&pid| {
+                self.session
+                    .panes
+                    .get(&pid)
+                    .is_some_and(|p| p.parser.screen().last_exit().is_some_and(|c| c != 0))
+            })
         };
         let tab_infos = frame::tab_infos(
             &tab_ids,
@@ -3426,7 +3428,10 @@ mod tests {
         let (cols, rows) = cells_for_size(1, 10.0, 22.0, PhysicalSize::new(946, 501));
         assert_eq!((cols, rows), (91, 19));
         // Degenerate windows clamp to >= 1 col/row like cols_for/rows_for.
-        assert_eq!(cells_for_size(1, 10.0, 22.0, PhysicalSize::new(5, 5)), (1, 1));
+        assert_eq!(
+            cells_for_size(1, 10.0, 22.0, PhysicalSize::new(5, 5)),
+            (1, 1)
+        );
     }
 
     #[test]
@@ -3450,7 +3455,11 @@ mod tests {
         let mut mid = BellFlash::new(100);
         mid.start -= std::time::Duration::from_millis(50);
         // A few microseconds of drift make this 0.9999…, not exactly 1.0.
-        assert!((mid.alpha() - 1.0).abs() < 0.001, "peaks at 1, got {}", mid.alpha());
+        assert!(
+            (mid.alpha() - 1.0).abs() < 0.001,
+            "peaks at 1, got {}",
+            mid.alpha()
+        );
 
         let mut done = BellFlash::new(100);
         done.start -= std::time::Duration::from_millis(200);

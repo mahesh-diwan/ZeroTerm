@@ -333,7 +333,6 @@ pub fn spawn_ssh_process(
     Ok((pty_rx, pty_tx))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

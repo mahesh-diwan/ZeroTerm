@@ -532,7 +532,10 @@ fn test_osc133_cmdline_url_prefix() {
     // C only sets the pending command; it lands on the NEXT block boundary.
     p.screen_mut().mark_block_boundary();
     let blocks = p.screen().blocks();
-    assert_eq!(blocks.last().map(|b| b.command.as_str()), Some("git status"));
+    assert_eq!(
+        blocks.last().map(|b| b.command.as_str()),
+        Some("git status")
+    );
 }
 
 #[test]

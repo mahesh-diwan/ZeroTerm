@@ -419,9 +419,10 @@ mod tests {
     #[test]
     fn terminal_visual_bell_override_applies() {
         let mut config = Config::default();
-        config.apply_overrides(HashMap::from([
-            ("terminal.visual_bell_ms".to_string(), "0".into()),
-        ]));
+        config.apply_overrides(HashMap::from([(
+            "terminal.visual_bell_ms".to_string(),
+            "0".into(),
+        )]));
         assert_eq!(config.terminal.visual_bell_ms, 0);
     }
 

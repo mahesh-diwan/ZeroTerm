@@ -189,12 +189,24 @@ mod tests {
     #[test]
     fn failure_at_max_attempts_gives_up() {
         assert_eq!(
-            retry_policy(MAX_ATTEMPTS, MAX_ATTEMPTS, instant(90), Instant::now(), Some(false)),
+            retry_policy(
+                MAX_ATTEMPTS,
+                MAX_ATTEMPTS,
+                instant(90),
+                Instant::now(),
+                Some(false)
+            ),
             BootStep::GiveUp
         );
         // Timed-out attempt at the cap must give up too, not spin forever.
         assert_eq!(
-            retry_policy(MAX_ATTEMPTS, MAX_ATTEMPTS, instant(90), Instant::now(), None),
+            retry_policy(
+                MAX_ATTEMPTS,
+                MAX_ATTEMPTS,
+                instant(90),
+                Instant::now(),
+                None
+            ),
             BootStep::GiveUp
         );
     }

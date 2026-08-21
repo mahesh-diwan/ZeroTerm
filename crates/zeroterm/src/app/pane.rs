@@ -72,8 +72,6 @@ impl PaneState {
     }
 }
 
-
-
 /// What one drain pass of a pane produced, typed so the app's `drain_pty`
 /// loop can apply side effects without reaching into the parser. One event per
 /// side effect: the app decides (config gates, active-pane guards) what to do
@@ -137,7 +135,6 @@ impl PaneState {
         (got, events)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
