@@ -226,6 +226,8 @@ pub struct Renderer {
     /// Env-gated diagnostics (ZTDIAG=1): frame dumps + probes for attributing
     /// blank-window reports to the framebuffer vs the compositor.
     diag: Diag,
+    /// Whether the surface uses an sRGB format for gamma-correct blending.
+    gamma_correct: bool,
 }
 
 impl Renderer {
@@ -703,11 +705,16 @@ impl Renderer {
             cursor_blink_enabled: true,
             surface_failures: 0,
             diag,
+            gamma_correct: surface_format.is_srgb(),
         })
     }
 
     pub fn cell_size(&self) -> [f32; 2] {
         self.cell_size
+    }
+
+    pub fn gamma_correct(&self) -> bool {
+        self.gamma_correct
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

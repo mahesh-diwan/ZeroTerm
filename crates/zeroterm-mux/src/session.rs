@@ -5,6 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::split::SplitNode;
+use crate::tab::Winlink;
 
 /// Serializable descriptor for one pane: enough to respawn it on restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,16 +103,54 @@ impl SessionLayout {
 pub struct Session {
     pub id: usize,
     pub layout: SessionLayout,
+    /// Winlinks: shared window references across tabs.
+    pub winlinks: Vec<Winlink>,
 }
 
 impl Session {
     pub fn new(id: usize, layout: SessionLayout) -> Self {
-        Self { id, layout }
+        Self {
+            id,
+            layout,
+            winlinks: vec![],
+        }
     }
 
     /// Persist this session's layout to `path`.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         self.layout.save(path)
+    }
+
+    /// Link a tab to appear as a shared window at a new tab index.
+    /// Returns the new tab index (position in the tabs list).
+    pub fn link_window(&mut self, source_tab_index: usize) -> Option<usize> {
+        if source_tab_index >= self.layout.tabs.len() {
+            return None;
+        }
+        let new_index = self.layout.tabs.len();
+        let source = self.layout.tabs[source_tab_index].clone();
+        self.layout.tabs.push(source);
+
+        self.winlinks.push(Winlink {
+            window_id: source_tab_index,
+            tab_index: new_index,
+            active: false,
+        });
+        // Also mark the source as having a shared link
+        self.winlinks.push(Winlink {
+            window_id: source_tab_index,
+            tab_index: source_tab_index,
+            active: true,
+        });
+
+        Some(new_index)
+    }
+
+    /// Check if a tab at the given index is shared (has a winlink pointing at it).
+    pub fn is_tab_shared(&self, tab_index: usize) -> bool {
+        self.winlinks
+            .iter()
+            .any(|w| w.window_id == tab_index && w.tab_index != tab_index)
     }
 }
 
@@ -242,5 +281,29 @@ mod tests {
         session.save(&path).unwrap();
         assert!(SessionLayout::restore(&path).is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_window_creates_shared_tab() {
+        let mut session = Session::new(0, sample_layout());
+        let new_idx = session.link_window(0).unwrap();
+        assert_eq!(new_idx, 2, "new tab appears after existing tabs");
+        assert_eq!(session.layout.tabs.len(), 3);
+        // The new tab is a clone of tab 0
+        assert_eq!(session.layout.tabs[new_idx].panes.len(), 4);
+        assert!(session.is_tab_shared(0));
+    }
+
+    #[test]
+    fn is_tab_shared_false_for_standalone() {
+        let session = Session::new(0, sample_layout());
+        assert!(!session.is_tab_shared(0));
+        assert!(!session.is_tab_shared(1));
+    }
+
+    #[test]
+    fn link_window_returns_none_for_invalid_index() {
+        let mut session = Session::new(0, sample_layout());
+        assert!(session.link_window(99).is_none());
     }
 }
