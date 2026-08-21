@@ -422,6 +422,7 @@ impl App {
                 pty_dead: false,
                 bell_rung: false,
                 last_resize: Some((cols, rows)),
+                has_pending: false,
             },
         );
 
@@ -477,6 +478,7 @@ impl App {
                                     pty_dead: false,
                                     bell_rung: false,
                                     last_resize: Some((cols, rows)),
+                                    has_pending: false,
                                 },
                             );
                             ids.push(id);
@@ -509,6 +511,7 @@ impl App {
                     panes: ids.clone(),
                     tree,
                     active_pane: active,
+                    shared_with: vec![],
                 });
             }
             self.session.active_tab = saved
@@ -679,6 +682,7 @@ impl App {
                     pty_dead: false,
                     bell_rung: false,
                     last_resize: Some((cols, rows)),
+                    has_pending: false,
                 },
                 SplitDir::Vertical,
                 true,
@@ -743,6 +747,7 @@ impl App {
                     pty_dead: false,
                     bell_rung: false,
                     last_resize: Some((cols, rows)),
+                    has_pending: false,
                 },
                 dir,
                 false,
@@ -896,6 +901,7 @@ impl App {
                     pty_dead: false,
                     bell_rung: false,
                     last_resize: Some((cols, rows)),
+                    has_pending: false,
                 },
                 SplitDir::Vertical,
                 true,
@@ -3479,6 +3485,7 @@ mod tests {
             pty_dead: false,
             bell_rung: false,
             last_resize: None,
+            has_pending: false,
         };
         tx.send(b"abc".to_vec()).unwrap();
         drop(tx);
@@ -3505,6 +3512,7 @@ mod tests {
                 pty_dead: false,
                 bell_rung: false,
                 last_resize: None,
+                has_pending: false,
             },
         );
         app.session.active_pane = 0;

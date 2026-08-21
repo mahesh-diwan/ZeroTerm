@@ -669,6 +669,7 @@ mod tests {
             pty_dead: false,
             bell_rung: false,
             last_resize: None,
+            has_pending: false,
         }
     }
 

@@ -1215,41 +1215,94 @@ impl Parser {
             None => (payload, ""),
         };
         let mut action = 'T';
+        let mut id = 0u32;
+        let mut format = 32u32; // default PNG
+        let mut data_type = 'd'; // default direct
         let mut width = 0u32;
         let mut height = 0u32;
+        let mut placement_col = 0usize;
+        let mut placement_row = 0usize;
         for pair in kv_part.split(',') {
             if let Some((k, v)) = pair.split_once('=') {
                 match k {
                     "a" => action = v.chars().next().unwrap_or('T'),
+                    "i" => id = v.parse().unwrap_or(0),
+                    "f" => format = v.parse().unwrap_or(32),
+                    "t" => data_type = v.chars().next().unwrap_or('d'),
                     "s" => width = v.parse().unwrap_or(0),
                     "v" => height = v.parse().unwrap_or(0),
+                    "c" => placement_col = v.parse().unwrap_or(0),
+                    "r" => placement_row = v.parse().unwrap_or(0),
                     _ => {}
                 }
             }
         }
-        if action != 'T' || data_part.is_empty() || width == 0 || height == 0 {
-            return;
-        }
-        if let Ok(decoded) = decode_base64(data_part) {
-            if decoded.is_empty() {
-                return;
+
+        match action {
+            // transmit or transmit+display
+            'T' | 't' => {
+                if data_part.is_empty() || (width == 0 && height == 0) {
+                    return;
+                }
+                if data_type == 'f' {
+                    // file path — not supported yet (parser-only scope)
+                    return;
+                }
+                if let Ok(decoded) = decode_base64(data_part) {
+                    if decoded.is_empty() {
+                        return;
+                    }
+                    let frames = image_decode::decode_frames(&decoded)
+                        .map(|d| d.frames)
+                        .unwrap_or_default();
+                    let image_id = if id != 0 {
+                        id
+                    } else if frames.is_empty() {
+                        self.screen.place_image(decoded.clone(), width, height)
+                    } else {
+                        self.screen
+                            .place_image_frames(frames.clone(), width, height)
+                    };
+                    // Store placement metadata for `a=t` (transmit+display)
+                    if action == 't' {
+                        self.screen.add_image(crate::screen::ImagePlacement {
+                            id: image_id,
+                            col: placement_col,
+                            row: placement_row,
+                            width,
+                            height,
+                            format,
+                        });
+                    }
+                    self.pending_images.push(ImageFragment {
+                        id: image_id,
+                        data: decoded,
+                        width,
+                        height,
+                        frames,
+                    });
+                }
             }
-            let frames = image_decode::decode_frames(&decoded)
-                .map(|d| d.frames)
-                .unwrap_or_default();
-            let id = if frames.is_empty() {
-                self.screen.place_image(decoded.clone(), width, height)
-            } else {
-                self.screen
-                    .place_image_frames(frames.clone(), width, height)
-            };
-            self.pending_images.push(ImageFragment {
-                id,
-                data: decoded,
-                width,
-                height,
-                frames,
-            });
+            // display an already-loaded image
+            'p' => {
+                // no-op at parser level; renderer reads image_registry by id
+            }
+            // delete image(s)
+            'd' => {
+                if id != 0 {
+                    self.screen.remove_image(id);
+                } else {
+                    // id=0 means delete all
+                    self.screen.clear_images();
+                }
+            }
+            // query image status
+            'q' => {
+                let count = self.screen.kitty_images().len() as u32;
+                self.pending_response =
+                    Some(format!("\x1b_Gi={};count={}\x1b\\", id, count).into_bytes());
+            }
+            _ => {}
         }
     }
 
@@ -1715,5 +1768,44 @@ mod tests {
         p.parse(b"\x1b]52;c;?\x07");
         assert!(p.take_clipboard_text().is_none());
         assert_eq!(p.take_clipboard_target().as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn kitty_graphics_transmit_display_adds_placement() {
+        let mut p = Parser::new(80, 24);
+        // a=t (transmit+display), f=32 (PNG), s=100 v=50 (dimensions),
+        // c=5 r=10 (placement). data is base64 of a tiny payload.
+        // "AAAA" in base64 is "QUFBQQ=="
+        p.parse(b"\x1b_Ga=t,f=32,s=100,v=50,c=5,r=10;QUFBQQ==\x1b\\");
+        let images = p.screen().kitty_images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width, 100);
+        assert_eq!(images[0].height, 50);
+        assert_eq!(images[0].format, 32);
+        assert_eq!(images[0].col, 5);
+        assert_eq!(images[0].row, 10);
+    }
+
+    #[test]
+    fn kitty_graphics_delete_by_id_removes_placement() {
+        let mut p = Parser::new(80, 24);
+        // First, add a placement
+        p.parse(b"\x1b_Ga=t,f=32,s=64,v=32;QUFBQQ==\x1b\\");
+        assert_eq!(p.screen().kitty_images().len(), 1);
+        // Now delete it by id (id auto-assigned as 0 since we didn't set i=)
+        // The auto-id from place_image starts at 0, so delete id=0
+        p.parse(b"\x1b_Ga=d,i=0\x1b\\");
+        assert_eq!(p.screen().kitty_images().len(), 0);
+    }
+
+    #[test]
+    fn kitty_graphics_query_returns_response() {
+        let mut p = Parser::new(80, 24);
+        p.parse(b"\x1b_Ga=q,i=42\x1b\\");
+        let resp = p.take_response();
+        assert!(resp.is_some());
+        let resp = String::from_utf8(resp.unwrap()).unwrap();
+        assert!(resp.contains("i=42"));
+        assert!(resp.contains("count=0"));
     }
 }

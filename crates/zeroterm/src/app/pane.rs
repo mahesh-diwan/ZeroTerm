@@ -30,6 +30,10 @@ pub struct PaneState {
     /// prompt on each — the startup spawn-estimate → renderer-ready → Resized
     /// storm used to stack three prompts on top of each other.
     pub last_resize: Option<(usize, usize)>,
+    /// Set by the reader thread wakeup (user_event) before drain_pty runs.
+    /// Cleared when drain() finds no data. Lets drain_pty skip panes with no
+    /// pending output — a no-op try_recv is still a syscall on some platforms.
+    pub has_pending: bool,
 }
 impl PaneState {
     /// Drain available pty output into the parser. Returns true if any bytes
@@ -151,6 +155,7 @@ mod tests {
             pty_dead: false,
             bell_rung: false,
             last_resize: None,
+            has_pending: false,
         }
     }
 

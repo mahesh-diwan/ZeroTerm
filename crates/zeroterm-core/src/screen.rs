@@ -47,6 +47,17 @@ pub struct ImageData {
     pub frames: Vec<FrameData>,
 }
 
+/// A placed image in the terminal grid (Kitty graphics protocol).
+#[derive(Debug, Clone)]
+pub struct ImagePlacement {
+    pub id: u32,
+    pub col: usize,
+    pub row: usize,
+    pub width: u32,  // pixel width
+    pub height: u32, // pixel height
+    pub format: u32, // 32=PNG, 24=RGB
+}
+
 pub struct Screen {
     size: Size,
     buffer: Vec<Vec<Cell>>,
@@ -87,6 +98,8 @@ pub struct Screen {
     pub image_registry: HashMap<u32, ImageData>,
     pub image_cells: HashMap<(usize, usize), u32>,
     next_image_id: u32,
+    /// Kitty graphics protocol image placements (metadata only, no pixel data).
+    pub images: Vec<ImagePlacement>,
     /// OSC 8 hyperlink registry: link_id -> uri (id 0 = none).
     links: Vec<Option<String>>,
     link_ids: HashMap<String, u32>,
@@ -150,6 +163,7 @@ impl Screen {
             image_registry: HashMap::new(),
             image_cells: HashMap::new(),
             next_image_id: 0,
+            images: Vec::new(),
             links: Vec::new(),
             link_ids: HashMap::new(),
             current_link: 0,
@@ -1160,5 +1174,25 @@ impl Screen {
 
     pub fn image_cells(&self) -> &HashMap<(usize, usize), u32> {
         &self.image_cells
+    }
+
+    /// Add a Kitty graphics protocol image placement (metadata only).
+    pub fn add_image(&mut self, placement: ImagePlacement) {
+        self.images.push(placement);
+    }
+
+    /// All current image placements.
+    pub fn kitty_images(&self) -> &[ImagePlacement] {
+        &self.images
+    }
+
+    /// Remove all image placements (e.g. on screen clear).
+    pub fn clear_images(&mut self) {
+        self.images.clear();
+    }
+
+    /// Remove image placements by id (Kitty `a=d` delete).
+    pub fn remove_image(&mut self, id: u32) {
+        self.images.retain(|img| img.id != id);
     }
 }
