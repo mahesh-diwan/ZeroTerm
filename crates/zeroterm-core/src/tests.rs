@@ -281,3 +281,21 @@ fn test_kitty_ignored_when_unsupported() {
     parser.parse(b"\x1b[>1u");
     assert!(!parser.kitty_disambiguate());
 }
+
+#[test]
+fn test_kitty_flags_accessor_returns_bitmask() {
+    let mut parser = Parser::new(80, 24);
+    parser.set_kitty_supported(true);
+    assert_eq!(parser.kitty_flags(), 0);
+    // Push flag 1 (disambiguate) → bitmask = 1
+    parser.parse(b"\x1b[>1u");
+    assert_eq!(parser.kitty_flags(), 1);
+    // Push flag 5 (disambiguate | report-all) → bitmask = 1 | 8 = 9
+    parser.parse(b"\x1b[>9u");
+    assert_eq!(parser.kitty_flags(), 9);
+    assert!(parser.kitty_report_all());
+    // Pop back to flag 1
+    parser.parse(b"\x1b[<u");
+    assert_eq!(parser.kitty_flags(), 1);
+    assert!(!parser.kitty_report_all());
+}

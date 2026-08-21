@@ -118,6 +118,9 @@ pub struct Parser {
     pub pending_images: Vec<ImageFragment>,
     apc_buffer: String,
     clipboard_text: Option<String>,
+    /// OSC 52 target selection (e.g. "c" for clipboard, "p" for primary).
+    /// Set when the parser encounters a valid OSC 52 sequence.
+    clipboard_target: Option<String>,
     /// Kitty keyboard protocol: current enhancement flags (bit 0 = disambiguate)
     /// plus a push/pop stack. Apps enable the protocol with `CSI > flags u`;
     /// while bit 0 is set the app expects CSI-u key encodings.
@@ -165,6 +168,7 @@ impl Parser {
             pending_images: Vec::new(),
             apc_buffer: String::new(),
             clipboard_text: None,
+            clipboard_target: None,
             kitty_flags: 0,
             kitty_stack: Vec::new(),
             kitty_supported: false,
@@ -223,6 +227,17 @@ impl Parser {
     /// ctrl/alt letters to arrive as CSI-u sequences.
     pub fn kitty_disambiguate(&self) -> bool {
         self.kitty_flags & 1 != 0
+    }
+
+    /// Raw kitty keyboard protocol flags as a bitmask.
+    /// Bit 0 = flag 1 (disambiguate), bit 3 = flag 4 (report all keys).
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_flags as u8
+    }
+
+    /// Flag 4 (bit 3): report all keys even without modifiers.
+    pub fn kitty_report_all(&self) -> bool {
+        self.kitty_flags & 8 != 0
     }
 
     pub fn take_response(&mut self) -> Option<Vec<u8>> {
@@ -1092,10 +1107,34 @@ impl Parser {
                 self.notification = Some(text.to_string());
             }
         } else if let Some(payload) = osc.strip_prefix("52;") {
+            // OSC 52: `52;TARGETS;DATA` where TARGETS is a string of
+            // characters from {c,p,s,0-9} and DATA is base64 or `?` (query).
             if let Some(semicolon) = payload.find(';') {
-                let base64_data = &payload[semicolon + 1..];
-                if !base64_data.is_empty() {
-                    if let Ok(data) = decode_base64(base64_data) {
+                let targets = &payload[..semicolon];
+                let data_part = &payload[semicolon + 1..];
+
+                // Validate target characters: must be non-empty and each
+                // char in {c,p,s,0-9}. Commas are allowed for multi-target
+                // (e.g. "c,p").
+                if targets.is_empty()
+                    || !targets
+                        .chars()
+                        .all(|c| matches!(c, 'c' | 'p' | 's' | '0'..='9' | ','))
+                {
+                    return; // invalid target — ignore sequence
+                }
+
+                self.clipboard_target = Some(targets.to_string());
+
+                // Query (`?`): app is asking for clipboard contents.
+                // We don't have read access here, but record the request.
+                if data_part == "?" {
+                    return;
+                }
+
+                // Set: validate base64 payload (reject invalid characters).
+                if !data_part.is_empty() && is_valid_base64(data_part) {
+                    if let Ok(data) = decode_base64(data_part) {
                         self.clipboard_text = Some(String::from_utf8_lossy(&data).to_string());
                     }
                 }
@@ -1446,6 +1485,9 @@ impl Parser {
     pub fn take_clipboard_text(&mut self) -> Option<String> {
         self.clipboard_text.take()
     }
+    pub fn take_clipboard_target(&mut self) -> Option<String> {
+        self.clipboard_target.take()
+    }
 }
 
 // 8 positional args is the natural sixel-state signature; clippy's 7-arg cap
@@ -1516,6 +1558,16 @@ fn percent_decode(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Check that every character in `input` is valid base64 (A-Z, a-z, 0-9, +, /,
+/// or trailing `=`). Used by OSC 52 to reject sequences with garbage payloads.
+fn is_valid_base64(input: &str) -> bool {
+    let input = input.trim_end_matches('=');
+    !input.is_empty()
+        && input
+            .chars()
+            .all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '/'))
 }
 
 fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
@@ -1611,5 +1663,57 @@ mod tests {
         // Exit with the real \x1b[201~
         p.parse(b"\x1b[201~");
         assert!(!p.bracketed_paste_active());
+    }
+
+    #[test]
+    fn osc52_valid_target_c_sets_clipboard() {
+        let mut p = Parser::new(80, 24);
+        // "hello" in base64 is "aGVsbG8="
+        p.parse(b"\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(p.take_clipboard_text().as_deref(), Some("hello"));
+        assert_eq!(p.take_clipboard_target().as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn osc52_valid_target_p_sets_clipboard() {
+        let mut p = Parser::new(80, 24);
+        // "world" in base64 is "d29ybGQ="
+        p.parse(b"\x1b]52;p;d29ybGQ=\x07");
+        assert_eq!(p.take_clipboard_text().as_deref(), Some("world"));
+        assert_eq!(p.take_clipboard_target().as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn osc52_invalid_target_rejected() {
+        let mut p = Parser::new(80, 24);
+        // "x" is not a valid target character
+        p.parse(b"\x1b]52;x;aGVsbG8=\x07");
+        assert!(p.take_clipboard_text().is_none());
+        assert!(p.take_clipboard_target().is_none());
+    }
+
+    #[test]
+    fn osc52_invalid_base64_rejected() {
+        let mut p = Parser::new(80, 24);
+        // "!!!@#$" contains invalid base64 characters
+        p.parse(b"\x1b]52;c;!!!@#$\x07");
+        assert!(p.take_clipboard_text().is_none());
+    }
+
+    #[test]
+    fn osc52_empty_target_rejected() {
+        let mut p = Parser::new(80, 24);
+        // Empty target after 52; before the semicolon
+        p.parse(b"\x1b]52;;aGVsbG8=\x07");
+        assert!(p.take_clipboard_text().is_none());
+        assert!(p.take_clipboard_target().is_none());
+    }
+
+    #[test]
+    fn osc52_query_stores_target_but_no_text() {
+        let mut p = Parser::new(80, 24);
+        p.parse(b"\x1b]52;c;?\x07");
+        assert!(p.take_clipboard_text().is_none());
+        assert_eq!(p.take_clipboard_target().as_deref(), Some("c"));
     }
 }

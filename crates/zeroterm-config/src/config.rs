@@ -65,6 +65,11 @@ pub struct TerminalConfig {
     /// in and out. 0 disables. On by default so a bell is never silent.
     #[serde(default = "default_visual_bell_ms")]
     pub visual_bell_ms: u64,
+    /// OSC 52 clipboard access from terminal applications. When false, OSC 52
+    /// sequences are ignored (security: prevents remote apps from writing to
+    /// the system clipboard). Default: true.
+    #[serde(default = "default_true")]
+    pub osc52: bool,
     /// Hex color for the visual bell flash (e.g., "#ffffff" for white flash).
     /// Empty string means use the selection color (existing behavior).
     #[serde(default = "default_visual_bell_color")]
@@ -95,6 +100,7 @@ impl Default for TerminalConfig {
             visual_bell_ms: default_visual_bell_ms(),
             visual_bell_color: default_visual_bell_color(),
             visual_bell_tab_bar: default_visual_bell_tab_bar(),
+            osc52: true,
         }
     }
 }
@@ -233,6 +239,9 @@ impl Config {
                 }
                 "visual_bell_tab_bar" | "terminal.visual_bell_tab_bar" => {
                     self.terminal.visual_bell_tab_bar = value.parse().unwrap_or(true);
+                }
+                "osc52" | "terminal.osc52" => {
+                    self.terminal.osc52 = value.parse().unwrap_or(true);
                 }
                 _ => {}
             }
@@ -417,6 +426,7 @@ mod tests {
         let parsed: Config = table.try_into().unwrap();
         assert!(parsed.terminal.kitty_keyboard);
         assert!(parsed.terminal.hyperlinks);
+        assert!(parsed.terminal.osc52);
     }
 
     #[test]

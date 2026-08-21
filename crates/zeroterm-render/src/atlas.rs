@@ -54,11 +54,17 @@ fn info_to_uv(info: &GlyphInfo) -> (f32, f32, f32, f32) {
     (u0, v0, u1, v1)
 }
 
+/// Cache entry wrapping a glyph's placement info with a usage counter.
+struct CachedGlyph {
+    info: GlyphInfo,
+    hits: u32,
+}
+
 pub(crate) struct GlyphAtlas {
     texture: wgpu::Texture,
     pub(crate) view: wgpu::TextureView,
     pub(crate) sampler: wgpu::Sampler,
-    glyph_cache: HashMap<u32, GlyphInfo>,
+    glyph_cache: HashMap<u32, CachedGlyph>,
     font_data: Vec<u8>,
     scale_context: ScaleContext,
     cursor_x: u32,
@@ -230,8 +236,9 @@ impl GlyphAtlas {
         queue: &wgpu::Queue,
     ) -> GlyphInfo {
         let key = ch as u32;
-        if let Some(info) = self.glyph_cache.get(&key) {
-            return *info;
+        if let Some(cached) = self.glyph_cache.get_mut(&key) {
+            cached.hits = cached.hits.saturating_add(1);
+            return cached.info;
         }
 
         let font = match FontRef::from_index(&self.font_data, 0) {
@@ -266,7 +273,7 @@ impl GlyphAtlas {
         match image {
             Some(img) if img.placement.width > 0 && img.placement.height > 0 => {
                 let info = self.pack_glyph(&img, device, queue);
-                self.glyph_cache.insert(key, info);
+                self.glyph_cache.insert(key, CachedGlyph { info, hits: 1 });
                 info
             }
             _ => GlyphInfo {
@@ -358,6 +365,29 @@ impl GlyphAtlas {
 
     pub(crate) fn cell_metrics(&self) -> (f32, f32) {
         (self.cell_width, self.cell_height)
+    }
+
+    /// Returns `(total_entries, total_hits)` across all cached glyphs.
+    pub(crate) fn cache_stats(&self) -> (usize, u64) {
+        let total_entries = self.glyph_cache.len();
+        let total_hits: u64 = self.glyph_cache.values().map(|c| c.hits as u64).sum();
+        (total_entries, total_hits)
+    }
+
+    /// Remove the lowest-usage glyphs when the cache exceeds `target` entries.
+    /// Keeps the highest-hit glyphs; evicts from the bottom up.
+    pub(crate) fn evict_low_usage(&mut self, target: usize) {
+        if self.glyph_cache.len() <= target {
+            return;
+        }
+        let mut entries: Vec<(u32, u32)> =
+            self.glyph_cache.iter().map(|(&k, c)| (k, c.hits)).collect();
+        entries.sort_by_key(|&(_, hits)| hits);
+        let to_remove = self.glyph_cache.len() - target;
+        let keys: Vec<u32> = entries[..to_remove].iter().map(|&(k, _)| k).collect();
+        for k in keys {
+            self.glyph_cache.remove(&k);
+        }
     }
 
     fn clear_atlas(&mut self, queue: &wgpu::Queue) {

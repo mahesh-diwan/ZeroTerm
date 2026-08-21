@@ -758,6 +758,46 @@ mod tests {
     }
 
     #[test]
+    fn kitty_alt_arrow_encodes_modifier() {
+        // Alt+ArrowUp → CSI 1;3A (alt = bit 1 → modifier = 1+2 = 3)
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowUp, m(false, false, true)),
+            Some(b"\x1b[1;3A".to_vec())
+        );
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowLeft, m(false, false, true)),
+            Some(b"\x1b[1;3D".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_arrow_encodes_modifier() {
+        // Ctrl+ArrowUp → CSI 1;5A (ctrl = bit 2 → modifier = 1+4 = 5)
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowUp, m(true, false, false)),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ctrl_shift_arrow_encodes_modifier() {
+        // Ctrl+Shift+ArrowUp → CSI 1;6A (shift+ctrl = bits 0+2 → 1+1+4 = 6)
+        assert_eq!(
+            kitty_sequence(KeyCode::ArrowUp, m(true, true, false)),
+            Some(b"\x1b[1;6A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_alt_letter_is_csi_u() {
+        // Alt+a → CSI 97;3u (alt = modifier 3)
+        assert_eq!(
+            kitty_sequence(KeyCode::KeyA, m(false, false, true)),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+    }
+
+    #[test]
     fn search_printable_text_appends() {
         assert_eq!(
             search_key(KeyCode::KeyA, m(false, false, false), Some("a")),
