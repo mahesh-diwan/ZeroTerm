@@ -100,6 +100,10 @@ pub struct Screen {
     /// the PTY wait fallback). Independent of the block list so a failed
     /// command stays visible after a new block opens.
     last_exit_code: Option<i32>,
+    /// Whether we're currently inside a `\x1b[200~`…`\x1b[201~` bracketed-paste
+    /// sequence. Set by the parser; exposed here so external code can query it
+    /// through the Screen reference.
+    bracketed_paste_active: bool,
 }
 
 impl Screen {
@@ -152,6 +156,7 @@ impl Screen {
             next_link_id: 1,
             cwd: None,
             last_exit_code: None,
+            bracketed_paste_active: false,
         }
     }
 
@@ -940,6 +945,12 @@ impl Screen {
         self.insert_mode = v;
     }
     pub fn set_send_receive_mode(&mut self, _v: bool) { /* ignored */
+    }
+    pub fn set_bracketed_paste_active(&mut self, v: bool) {
+        self.bracketed_paste_active = v;
+    }
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.bracketed_paste_active
     }
     pub fn set_alternate_screen(&mut self, enable: bool) {
         if enable && !self.use_alt_screen {

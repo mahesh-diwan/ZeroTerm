@@ -31,6 +31,9 @@ enum ParserState {
     DcsIntermediate,
     DcsPassthrough,
     SosPmApcString,
+    BracketedPaste,
+    BracketedPasteEsc,
+    BracketedPasteCsi,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +137,12 @@ pub struct Parser {
     /// the bottom — without it, `clear`/`Ctrl+L` leave the viewport stranded in
     /// the (now-blank or deleted) history, unlike kitty or other terminals.
     clear_flag: bool,
+    /// Whether we're inside a `\x1b[200~`…`\x1b[201~` bracketed-paste sequence.
+    /// Distinct from `bracketed_paste` (the DECSET 2004 config flag).
+    bracketed_paste_active: bool,
+    /// Raw bytes accumulated during BracketedPasteEsc / BracketedPasteCsi
+    /// sub-states, flushed as literal text when the sequence isn't `[201~`.
+    paste_buf: Vec<u8>,
     // Incomplete UTF-8 sequence accumulation (streaming PTY reads split code points)
     utf8_pending: Vec<u8>,
 }
@@ -162,6 +171,8 @@ impl Parser {
             pending_response: None,
             notification: None,
             clear_flag: false,
+            bracketed_paste_active: false,
+            paste_buf: Vec::new(),
             utf8_pending: Vec::new(),
         }
     }
@@ -195,6 +206,12 @@ impl Parser {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether we're currently inside a `\x1b[200~`…`\x1b[201~` bracketed-paste
+    /// sequence (runtime state, distinct from the DECSET 2004 config flag).
+    pub fn bracketed_paste_active(&self) -> bool {
+        self.bracketed_paste_active
     }
 
     pub fn sync_output(&self) -> bool {
@@ -238,6 +255,9 @@ impl Parser {
             ParserState::DcsIntermediate => self.handle_dcs_intermediate(byte),
             ParserState::DcsPassthrough => self.handle_dcs_passthrough(byte),
             ParserState::SosPmApcString => self.handle_sos_pm_apc(byte),
+            ParserState::BracketedPaste => self.handle_bracketed_paste(byte),
+            ParserState::BracketedPasteEsc => self.handle_bracketed_paste_esc(byte),
+            ParserState::BracketedPasteCsi => self.handle_bracketed_paste_csi(byte),
         }
     }
 
@@ -385,8 +405,13 @@ impl Parser {
             0x40..=0x7E => {
                 let intermediates = self.csi.intermediates.clone();
                 self.csi.commit_param();
+                let state_before = self.state;
                 self.handle_csi(byte as char, &intermediates);
-                self.state = ParserState::Ground;
+                // Respect state changes made by handle_csi (e.g. entering
+                // BracketedPaste); only default to Ground if unchanged.
+                if self.state == state_before {
+                    self.state = ParserState::Ground;
+                }
             }
             _ => self.state = ParserState::Ground,
         }
@@ -404,8 +429,11 @@ impl Parser {
             0x40..=0x7E => {
                 let intermediates = self.csi.intermediates.clone();
                 self.csi.commit_param();
+                let state_before = self.state;
                 self.handle_csi(byte as char, &intermediates);
-                self.state = ParserState::Ground;
+                if self.state == state_before {
+                    self.state = ParserState::Ground;
+                }
             }
             _ => self.state = ParserState::Ground,
         }
@@ -417,8 +445,11 @@ impl Parser {
             0x40..=0x7E => {
                 let intermediates = self.csi.intermediates.clone();
                 self.csi.commit_param();
+                let state_before = self.state;
                 self.handle_csi(byte as char, &intermediates);
-                self.state = ParserState::Ground;
+                if self.state == state_before {
+                    self.state = ParserState::Ground;
+                }
             }
             _ => self.state = ParserState::Ground,
         }
@@ -547,6 +578,130 @@ impl Parser {
                 self.apc_buffer.push(byte as char);
             }
             _ => {}
+        }
+    }
+
+    /// Inside bracketed paste: all bytes are literal except ESC which starts
+    /// end-marker detection. Control characters (LF, HT, etc.) execute normally
+    /// — the paste content includes them as-is.
+    fn handle_bracketed_paste(&mut self, byte: u8) {
+        match byte {
+            0x1B => {
+                self.utf8_pending.clear();
+                self.paste_buf.clear();
+                self.paste_buf.push(byte);
+                self.state = ParserState::BracketedPasteEsc;
+            }
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F | 0x18 | 0x1A | 0x7F => {
+                self.utf8_pending.clear();
+                self.execute_control(byte);
+            }
+            0x20..=0x7E => {
+                self.utf8_pending.clear();
+                self.screen.put_char(byte as char);
+            }
+            0x80..=0xFF => {
+                self.utf8_pending.push(byte);
+                if self.utf8_pending.len() > 4 {
+                    self.utf8_pending.clear();
+                    self.screen.put_char('\u{FFFD}');
+                    return;
+                }
+                match std::str::from_utf8(&self.utf8_pending) {
+                    Ok(s) => {
+                        let chars: Vec<char> = s.chars().collect();
+                        self.utf8_pending.clear();
+                        for ch in chars {
+                            self.screen.put_char(ch);
+                        }
+                    }
+                    Err(e) if e.error_len().is_some() => {
+                        self.utf8_pending.clear();
+                        self.screen.put_char('\u{FFFD}');
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    /// Saw ESC inside bracketed paste. If next byte is `[`, start CSI
+    /// accumulation for end-marker detection; otherwise flush ESC + byte as
+    /// literal and return to paste content.
+    fn handle_bracketed_paste_esc(&mut self, byte: u8) {
+        self.paste_buf.push(byte);
+        match byte {
+            0x5B => {
+                // '[' — start CSI accumulation
+                self.csi.reset();
+                self.state = ParserState::BracketedPasteCsi;
+            }
+            _ => {
+                self.flush_paste_buf();
+                self.state = ParserState::BracketedPaste;
+            }
+        }
+    }
+
+    /// Accumulate CSI params inside bracketed paste. On '~':
+    ///   - param 201 → exit paste
+    ///   - anything else → flush accumulated bytes as literal
+    fn handle_bracketed_paste_csi(&mut self, byte: u8) {
+        match byte {
+            0x30..=0x39 => {
+                self.paste_buf.push(byte);
+                self.csi.add_digit(byte as char);
+            }
+            0x3B => {
+                self.paste_buf.push(byte);
+                self.csi.commit_param();
+            }
+            0x3C..=0x3F => {
+                self.paste_buf.push(byte);
+                self.csi.add_intermediate(byte as char);
+            }
+            0x20..=0x2F => {
+                self.paste_buf.push(byte);
+                self.csi.add_intermediate(byte as char);
+            }
+            0x7E => {
+                // '~' — potential end marker. Commit accumulated digits so
+                // csi.get() reflects the full param (e.g. "201").
+                self.csi.commit_param();
+                let param = self.csi.get(0, 0);
+                if param == 201 {
+                    // Exit bracketed paste
+                    self.bracketed_paste_active = false;
+                    self.screen.set_bracketed_paste_active(false);
+                    self.paste_buf.clear();
+                    self.state = ParserState::Ground;
+                } else {
+                    // Not the exit — flush everything as literal
+                    self.paste_buf.push(byte);
+                    self.flush_paste_buf();
+                    self.state = ParserState::BracketedPaste;
+                }
+            }
+            0x40..=0x7E => {
+                // Other final byte — not a ~ sequence, flush as literal
+                self.paste_buf.push(byte);
+                self.flush_paste_buf();
+                self.state = ParserState::BracketedPaste;
+            }
+            _ => {
+                // Invalid byte — flush as literal
+                self.paste_buf.push(byte);
+                self.flush_paste_buf();
+                self.state = ParserState::BracketedPaste;
+            }
+        }
+    }
+
+    /// Drain `paste_buf` as literal characters and clear it.
+    fn flush_paste_buf(&mut self) {
+        let buf = std::mem::take(&mut self.paste_buf);
+        for b in buf {
+            self.screen.put_char(b as char);
         }
     }
 
@@ -691,6 +846,19 @@ impl Parser {
             ('c', false, "") | ('c', true, "") => self.screen.identify(), // DA
 
             // Title (OSC handled separately)
+            ('~', false, "") => {
+                // Bracketed paste: CSI 200~ enters, CSI 201~ exits.
+                let param = self.csi.get(0, 0);
+                if param == 200 && self.bracketed_paste && !self.bracketed_paste_active {
+                    self.bracketed_paste_active = true;
+                    self.screen.set_bracketed_paste_active(true);
+                    self.paste_buf.clear();
+                    self.state = ParserState::BracketedPaste;
+                } else if param == 201 && self.bracketed_paste_active {
+                    self.bracketed_paste_active = false;
+                    self.screen.set_bracketed_paste_active(false);
+                }
+            }
             _ => {}
         }
     }
@@ -1373,4 +1541,75 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a parser with bracketed paste enabled (DECSET 2004).
+    fn parser_with_paste() -> Parser {
+        let mut p = Parser::new(80, 24);
+        // Enable DECSET 2004 via a CSI `?2004h`
+        p.parse(b"\x1b[?2004h");
+        p
+    }
+
+    #[test]
+    fn bracketed_paste_mode_ignores_esc_sequences_inside() {
+        let mut p = parser_with_paste();
+        assert!(!p.bracketed_paste_active());
+
+        // Enter bracketed paste
+        p.parse(b"\x1b[200~");
+        assert!(p.bracketed_paste_active());
+
+        // \x1b[5;10H inside paste should be written as 7 literal chars, NOT
+        // interpreted as CUP (which would move cursor to row 4, col 9).
+        let cursor_before = p.screen().cursor();
+        assert_eq!(cursor_before.row, 0);
+        assert_eq!(cursor_before.col, 0);
+
+        p.parse(b"\x1b[5;10H");
+        let cursor_after = p.screen().cursor();
+        // 7 literal bytes written: cursor advanced by 7 columns
+        assert_eq!(cursor_after.row, 0);
+        assert_eq!(
+            cursor_after.col, 7,
+            "escape sequence inside paste must be literal, not interpreted as CUP"
+        );
+
+        // Exit bracketed paste
+        p.parse(b"\x1b[201~");
+        assert!(!p.bracketed_paste_active());
+
+        // After exiting, \x1b[5;10H is interpreted normally
+        p.parse(b"\x1b[5;10H");
+        let cursor_final = p.screen().cursor();
+        assert_eq!(cursor_final.row, 4); // 1-indexed row 5 → 0-indexed 4
+        assert_eq!(cursor_final.col, 9); // 1-indexed col 10 → 0-indexed 9
+    }
+
+    #[test]
+    fn bracketed_paste_nested_200h_is_literal() {
+        let mut p = parser_with_paste();
+
+        // Enter bracketed paste
+        p.parse(b"\x1b[200~");
+        assert!(p.bracketed_paste_active());
+
+        // Nested \x1b[200~ should be treated as literal text, not re-enter paste
+        p.parse(b"before");
+        p.parse(b"\x1b[200~");
+        assert!(
+            p.bracketed_paste_active(),
+            "nested \\x1b[200~ must not cause re-entry or exit"
+        );
+
+        p.parse(b"after");
+
+        // Exit with the real \x1b[201~
+        p.parse(b"\x1b[201~");
+        assert!(!p.bracketed_paste_active());
+    }
 }

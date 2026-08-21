@@ -43,6 +43,8 @@ pub struct Config {
     pub sync: SyncConfig,
     pub ssh: SshConfig,
     pub keybindings: KeybindingsConfig,
+    #[serde(default)]
+    pub features: FeaturesConfig,
 }
 
 /// Protocol / interaction features.
@@ -63,10 +65,25 @@ pub struct TerminalConfig {
     /// in and out. 0 disables. On by default so a bell is never silent.
     #[serde(default = "default_visual_bell_ms")]
     pub visual_bell_ms: u64,
+    /// Hex color for the visual bell flash (e.g., "#ffffff" for white flash).
+    /// Empty string means use the selection color (existing behavior).
+    #[serde(default = "default_visual_bell_color")]
+    pub visual_bell_color: String,
+    /// Whether to also flash the tab bar on bell activity.
+    #[serde(default = "default_visual_bell_tab_bar")]
+    pub visual_bell_tab_bar: bool,
 }
 
 fn default_visual_bell_ms() -> u64 {
     150
+}
+
+fn default_visual_bell_color() -> String {
+    String::new()
+}
+
+fn default_visual_bell_tab_bar() -> bool {
+    true
 }
 
 impl Default for TerminalConfig {
@@ -76,6 +93,8 @@ impl Default for TerminalConfig {
             notifications: true,
             hyperlinks: true,
             visual_bell_ms: default_visual_bell_ms(),
+            visual_bell_color: default_visual_bell_color(),
+            visual_bell_tab_bar: default_visual_bell_tab_bar(),
         }
     }
 }
@@ -209,6 +228,12 @@ impl Config {
                 "visual_bell_ms" | "terminal.visual_bell_ms" => {
                     self.terminal.visual_bell_ms = value.parse().unwrap_or(150);
                 }
+                "visual_bell_color" | "terminal.visual_bell_color" => {
+                    self.terminal.visual_bell_color = value;
+                }
+                "visual_bell_tab_bar" | "terminal.visual_bell_tab_bar" => {
+                    self.terminal.visual_bell_tab_bar = value.parse().unwrap_or(true);
+                }
                 _ => {}
             }
         }
@@ -251,6 +276,7 @@ impl Config {
         self.sync = new_config.sync;
         self.ssh = new_config.ssh;
         self.keybindings = new_config.keybindings;
+        self.features = new_config.features;
         Ok(())
     }
 }
@@ -478,6 +504,62 @@ mod tests {
         )]));
         assert!(!config.session.restore);
     }
+
+    #[test]
+    fn features_config_defaults_all_true() {
+        let f = FeaturesConfig::default();
+        assert!(f.enable_bell);
+        assert!(f.enable_scrollbar);
+        assert!(f.enable_tab_bar);
+        assert!(f.enable_status_bar);
+        assert!(f.enable_search);
+        assert!(f.enable_notifications);
+    }
+
+    #[test]
+    fn features_config_absent_in_toml_uses_defaults() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        table.remove("features");
+        let parsed: Config = table.try_into().unwrap();
+        assert!(parsed.features.enable_bell);
+        assert!(parsed.features.enable_scrollbar);
+        assert!(parsed.features.enable_tab_bar);
+        assert!(parsed.features.enable_status_bar);
+        assert!(parsed.features.enable_search);
+        assert!(parsed.features.enable_notifications);
+    }
+
+    #[test]
+    fn features_config_deserializes_roundtrip() {
+        let mut config = Config::default();
+        config.features.enable_bell = false;
+        config.features.enable_search = false;
+        config.features.enable_notifications = false;
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert!(!parsed.features.enable_bell);
+        assert!(parsed.features.enable_scrollbar);
+        assert!(parsed.features.enable_tab_bar);
+        assert!(parsed.features.enable_status_bar);
+        assert!(!parsed.features.enable_search);
+        assert!(!parsed.features.enable_notifications);
+    }
+
+    #[test]
+    fn features_config_partial_toml_uses_defaults_for_missing() {
+        let mut table =
+            toml::from_str::<toml::Table>(&toml::to_string(&Config::default()).unwrap()).unwrap();
+        let features = table.get_mut("features").unwrap().as_table_mut().unwrap();
+        features.insert("enable_bell".into(), toml::Value::Boolean(false));
+        let parsed: Config = table.try_into().unwrap();
+        assert!(!parsed.features.enable_bell);
+        assert!(parsed.features.enable_scrollbar);
+        assert!(parsed.features.enable_tab_bar);
+        assert!(parsed.features.enable_status_bar);
+        assert!(parsed.features.enable_search);
+        assert!(parsed.features.enable_notifications);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,4 +712,47 @@ impl Default for SessionConfig {
 
 fn default_session_restore() -> bool {
     false
+}
+
+/// Runtime feature flags — enable/disable optional UI behaviors via `[features]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeaturesConfig {
+    /// Terminal bell (BEL). When off, BEL is silently ignored.
+    #[serde(default = "default_true")]
+    pub enable_bell: bool,
+    /// Vertical scrollbar overlay on the right edge.
+    #[serde(default = "default_true")]
+    pub enable_scrollbar: bool,
+    /// Top tab bar. Hidden automatically when only one tab exists regardless
+    /// of this flag (kitty `tab_bar_min_tabs` behavior).
+    #[serde(default = "default_true")]
+    pub enable_tab_bar: bool,
+    /// Bottom status bar (active pane title, exit chip, hover URI, scroll
+    /// indicator).
+    #[serde(default = "default_true")]
+    pub enable_status_bar: bool,
+    /// Ctrl+Shift+F search overlay.
+    #[serde(default = "default_true")]
+    pub enable_search: bool,
+    /// Desktop notifications (OSC 9). Also gated by `terminal.notifications`;
+    /// both must be true for a notification to fire.
+    #[serde(default = "default_true")]
+    pub enable_notifications: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            enable_bell: true,
+            enable_scrollbar: true,
+            enable_tab_bar: true,
+            enable_status_bar: true,
+            enable_search: true,
+            enable_notifications: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
